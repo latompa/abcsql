@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::{self, Write as IoWrite, BufWriter, BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::fmt;
 use crate::parser::{CreateTableStatement, ColumnDefinition, DataType, InsertStatement, Value};
 
 /// Storage engine for persisting tables to disk
@@ -22,6 +23,33 @@ pub enum StorageError {
 impl From<io::Error> for StorageError {
     fn from(error: io::Error) -> Self {
         StorageError::IoError(error)
+    }
+}
+
+impl fmt::Display for StorageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StorageError::IoError(e) => write!(f, "IO error: {}", e),
+            StorageError::TableAlreadyExists(name) => write!(f, "Table '{}' already exists", name),
+            StorageError::TableNotFound(name) => write!(f, "Table '{}' not found", name),
+            StorageError::InvalidSchema(msg) => write!(f, "Invalid schema: {}", msg),
+            StorageError::ColumnCountMismatch { expected, got } => {
+                write!(f, "Column count mismatch: expected {}, got {}", expected, got)
+            }
+            StorageError::TypeMismatch { column, expected, got } => {
+                write!(f, "Type mismatch in column '{}': expected {}, got {}", column, expected, got)
+            }
+            StorageError::InvalidData(msg) => write!(f, "Invalid data: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for StorageError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            StorageError::IoError(e) => Some(e),
+            _ => None,
+        }
     }
 }
 
@@ -80,7 +108,7 @@ impl Storage {
         }
 
         // Validate types (basic validation)
-        for (i, (value, col_def)) in stmt.values.iter().zip(schema.columns.iter()).enumerate() {
+        for (value, col_def) in stmt.values.iter().zip(schema.columns.iter()) {
             validate_value_type(value, &col_def.data_type, &col_def.name)?;
         }
 
@@ -212,6 +240,7 @@ impl Storage {
     }
 
     /// Delete a table (removes both schema and data files)
+    #[allow(dead_code)]
     pub fn drop_table(&self, table_name: &str) -> Result<(), StorageError> {
         let schema_path = self.schema_path(table_name);
         let data_path = self.data_path(table_name);

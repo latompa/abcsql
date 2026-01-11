@@ -29,7 +29,7 @@ fn main() {
     for sql in test_cases {
         println!("Testing: {}", sql);
         match parse_sql(sql) {
-            Ok((remaining, stmt)) => {
+            Ok((remaining, _stmt)) => {
                 println!("✓ Parsed successfully!");
                 if !remaining.is_empty() {
                     println!("  Remaining: '{}'", remaining);
@@ -63,7 +63,7 @@ fn main() {
                                 println!("  Data file: ./data/{}.data", create_stmt.table_name);
                             }
                             Err(e) => {
-                                println!("✗ Storage error: {:?}", e);
+                                println!("✗ Storage error: {}", e);
                             }
                         }
                     }
@@ -99,7 +99,7 @@ fn main() {
                                 println!("✓ Inserted row into '{}' table", insert_stmt.table_name);
                             }
                             Err(e) => {
-                                println!("✗ Insert error: {:?}", e);
+                                println!("✗ Insert error: {}", e);
                             }
                         }
                     }
@@ -153,7 +153,7 @@ fn main() {
                             }
                         }
                         Err(e) => {
-                            println!("    Error reading data: {:?}", e);
+                            println!("    Error reading data: {}", e);
                         }
                     }
                 }

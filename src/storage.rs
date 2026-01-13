@@ -2,7 +2,7 @@ use std::fs;
 use std::io::{self, Write as IoWrite, BufWriter, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::fmt;
-use crate::parser::{CreateTableStatement, ColumnDefinition, DataType, InsertStatement, Value};
+use crate::parser::{CreateTableStatement, ColumnDefinition, DataType, InsertStatement, UpdateStatement, DeleteStatement, Value, Condition, Expression, Operator};
 
 /// Storage engine for persisting tables to disk
 pub struct Storage {
@@ -18,6 +18,7 @@ pub enum StorageError {
     ColumnCountMismatch { expected: usize, got: usize },
     TypeMismatch { column: String, expected: String, got: String },
     InvalidData(String),
+    ColumnNotFound(String),
 }
 
 impl From<io::Error> for StorageError {
@@ -40,6 +41,7 @@ impl fmt::Display for StorageError {
                 write!(f, "Type mismatch in column '{}': expected {}, got {}", column, expected, got)
             }
             StorageError::InvalidData(msg) => write!(f, "Invalid data: {}", msg),
+            StorageError::ColumnNotFound(name) => write!(f, "Column '{}' not found", name),
         }
     }
 }
@@ -125,6 +127,87 @@ impl Storage {
         writer.flush()?;
 
         Ok(())
+    }
+
+    /// Update rows in a table matching the WHERE condition
+    pub fn update_rows(&self, stmt: &UpdateStatement) -> Result<usize, StorageError> {
+        let schema = self.load_schema(&stmt.table_name)?;
+
+        // Validate that all columns in assignments exist and have correct types
+        for assignment in &stmt.assignments {
+            let col_def = schema.columns.iter()
+                .find(|c| c.name == assignment.column)
+                .ok_or_else(|| StorageError::ColumnNotFound(assignment.column.clone()))?;
+            validate_value_type(&assignment.value, &col_def.data_type, &col_def.name)?;
+        }
+
+        // Read all existing rows
+        let mut rows = self.read_rows(&stmt.table_name)?;
+        let mut updated_count = 0;
+
+        // Update matching rows
+        for row in &mut rows {
+            let matches = match &stmt.where_clause {
+                Some(wc) => evaluate_condition(&wc.condition, row, &schema.columns),
+                None => true, // No WHERE clause means update all rows
+            };
+
+            if matches {
+                // Apply assignments
+                for assignment in &stmt.assignments {
+                    if let Some(col_idx) = schema.columns.iter().position(|c| c.name == assignment.column) {
+                        row[col_idx] = assignment.value.clone();
+                    }
+                }
+                updated_count += 1;
+            }
+        }
+
+        // Write all rows back to file (overwrite)
+        let data_path = self.data_path(&stmt.table_name);
+        let file = fs::File::create(data_path)?;
+        let mut writer = BufWriter::new(file);
+        for row in &rows {
+            let row_str = serialize_row(row);
+            writeln!(writer, "{}", row_str)?;
+        }
+        writer.flush()?;
+
+        Ok(updated_count)
+    }
+
+    /// Delete rows from a table matching the WHERE condition
+    pub fn delete_rows(&self, stmt: &DeleteStatement) -> Result<usize, StorageError> {
+        let schema = self.load_schema(&stmt.table_name)?;
+
+        // Read all existing rows
+        let rows = self.read_rows(&stmt.table_name)?;
+        let original_count = rows.len();
+
+        // Filter out rows that match the condition (keep non-matching rows)
+        let remaining_rows: Vec<Vec<Value>> = rows
+            .into_iter()
+            .filter(|row| {
+                match &stmt.where_clause {
+                    Some(wc) => !evaluate_condition(&wc.condition, row, &schema.columns),
+                    None => false, // No WHERE clause means delete all rows
+                }
+            })
+            .collect();
+
+        let deleted_count = original_count - remaining_rows.len();
+
+        // Write remaining rows back to file
+        let data_path = self.data_path(&stmt.table_name);
+        let file = fs::File::create(data_path)?;
+        let mut writer = BufWriter::new(file);
+        for row in &remaining_rows {
+            let row_str = serialize_row(row);
+            writeln!(writer, "{}", row_str)?;
+        }
+        writer.flush()?;
+
+        Ok(deleted_count)
     }
 
     /// Read all rows from a table
@@ -305,6 +388,63 @@ fn validate_value_type(value: &Value, data_type: &DataType, column_name: &str) -
             expected: format!("{:?}", data_type),
             got: format!("{:?}", value),
         }),
+    }
+}
+
+/// Evaluate a WHERE condition against a row
+fn evaluate_condition(condition: &Condition, row: &[Value], schema: &[ColumnDefinition]) -> bool {
+    let left_val = resolve_expression(&condition.left, row, schema);
+    let right_val = resolve_expression(&condition.right, row, schema);
+
+    match (&left_val, &right_val) {
+        (Some(l), Some(r)) => compare_values(l, &condition.operator, r),
+        _ => false, // If we can't resolve either side, condition fails
+    }
+}
+
+/// Resolve an expression to a Value
+fn resolve_expression(expr: &Expression, row: &[Value], schema: &[ColumnDefinition]) -> Option<Value> {
+    match expr {
+        Expression::Literal(v) => Some(v.clone()),
+        Expression::Column(name) => {
+            schema.iter()
+                .position(|c| c.name == *name)
+                .map(|idx| row[idx].clone())
+        }
+        Expression::QualifiedColumn(_, col) => {
+            // For now, ignore table qualifier and just match column name
+            schema.iter()
+                .position(|c| c.name == *col)
+                .map(|idx| row[idx].clone())
+        }
+    }
+}
+
+/// Compare two values using the given operator
+fn compare_values(left: &Value, op: &Operator, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Int(l), Value::Int(r)) => match op {
+            Operator::Equals => l == r,
+            Operator::NotEquals => l != r,
+            Operator::GreaterThan => l > r,
+            Operator::LessThan => l < r,
+            Operator::GreaterThanOrEqual => l >= r,
+            Operator::LessThanOrEqual => l <= r,
+        },
+        (Value::String(l), Value::String(r)) => match op {
+            Operator::Equals => l == r,
+            Operator::NotEquals => l != r,
+            Operator::GreaterThan => l > r,
+            Operator::LessThan => l < r,
+            Operator::GreaterThanOrEqual => l >= r,
+            Operator::LessThanOrEqual => l <= r,
+        },
+        (Value::Null, Value::Null) => match op {
+            Operator::Equals => true,
+            Operator::NotEquals => false,
+            _ => false,
+        },
+        _ => false, // Type mismatch or NULL comparison
     }
 }
 
@@ -750,5 +890,481 @@ mod tests {
         let deserialized = deserialize_row(&serialized).unwrap();
 
         assert_eq!(values, deserialized);
+    }
+
+    #[test]
+    fn test_update_single_row() {
+        use crate::parser::{UpdateStatement, Assignment, WhereClause, Condition, Expression, Operator};
+
+        let temp_dir = std::env::temp_dir().join("abcsql_test_update_single");
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        // Create table and insert data
+        let create_stmt = CreateTableStatement {
+            table_name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int },
+                ColumnDefinition { name: "name".to_string(), data_type: DataType::Varchar(Some(255)) },
+            ],
+        };
+        storage.create_table(&create_stmt).unwrap();
+
+        let insert1 = crate::parser::InsertStatement {
+            table_name: "users".to_string(),
+            values: vec![Value::Int(1), Value::String("Alice".to_string())],
+        };
+        let insert2 = crate::parser::InsertStatement {
+            table_name: "users".to_string(),
+            values: vec![Value::Int(2), Value::String("Bob".to_string())],
+        };
+        storage.insert_row(&insert1).unwrap();
+        storage.insert_row(&insert2).unwrap();
+
+        // Update single row
+        let update_stmt = UpdateStatement {
+            table_name: "users".to_string(),
+            assignments: vec![Assignment {
+                column: "name".to_string(),
+                value: Value::String("Alice Updated".to_string()),
+            }],
+            where_clause: Some(WhereClause {
+                condition: Condition {
+                    left: Expression::Column("id".to_string()),
+                    operator: Operator::Equals,
+                    right: Expression::Literal(Value::Int(1)),
+                },
+            }),
+        };
+
+        let updated = storage.update_rows(&update_stmt).unwrap();
+        assert_eq!(updated, 1);
+
+        let rows = storage.read_rows("users").unwrap();
+        assert_eq!(rows[0][1], Value::String("Alice Updated".to_string()));
+        assert_eq!(rows[1][1], Value::String("Bob".to_string())); // Unchanged
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_update_multiple_rows() {
+        use crate::parser::{UpdateStatement, Assignment, WhereClause, Condition, Expression, Operator};
+
+        let temp_dir = std::env::temp_dir().join("abcsql_test_update_multi");
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        let create_stmt = CreateTableStatement {
+            table_name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int },
+                ColumnDefinition { name: "active".to_string(), data_type: DataType::Int },
+            ],
+        };
+        storage.create_table(&create_stmt).unwrap();
+
+        // Insert 3 rows with active = 1
+        for i in 1..=3 {
+            let insert = crate::parser::InsertStatement {
+                table_name: "users".to_string(),
+                values: vec![Value::Int(i), Value::Int(1)],
+            };
+            storage.insert_row(&insert).unwrap();
+        }
+
+        // Update all rows where active = 1
+        let update_stmt = UpdateStatement {
+            table_name: "users".to_string(),
+            assignments: vec![Assignment {
+                column: "active".to_string(),
+                value: Value::Int(0),
+            }],
+            where_clause: Some(WhereClause {
+                condition: Condition {
+                    left: Expression::Column("active".to_string()),
+                    operator: Operator::Equals,
+                    right: Expression::Literal(Value::Int(1)),
+                },
+            }),
+        };
+
+        let updated = storage.update_rows(&update_stmt).unwrap();
+        assert_eq!(updated, 3);
+
+        let rows = storage.read_rows("users").unwrap();
+        for row in rows {
+            assert_eq!(row[1], Value::Int(0));
+        }
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_update_all_rows_no_where() {
+        use crate::parser::{UpdateStatement, Assignment};
+
+        let temp_dir = std::env::temp_dir().join("abcsql_test_update_all");
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        let create_stmt = CreateTableStatement {
+            table_name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int },
+                ColumnDefinition { name: "status".to_string(), data_type: DataType::Varchar(None) },
+            ],
+        };
+        storage.create_table(&create_stmt).unwrap();
+
+        for i in 1..=3 {
+            let insert = crate::parser::InsertStatement {
+                table_name: "users".to_string(),
+                values: vec![Value::Int(i), Value::String("old".to_string())],
+            };
+            storage.insert_row(&insert).unwrap();
+        }
+
+        // Update all rows (no WHERE clause)
+        let update_stmt = UpdateStatement {
+            table_name: "users".to_string(),
+            assignments: vec![Assignment {
+                column: "status".to_string(),
+                value: Value::String("new".to_string()),
+            }],
+            where_clause: None,
+        };
+
+        let updated = storage.update_rows(&update_stmt).unwrap();
+        assert_eq!(updated, 3);
+
+        let rows = storage.read_rows("users").unwrap();
+        for row in rows {
+            assert_eq!(row[1], Value::String("new".to_string()));
+        }
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_update_no_matches() {
+        use crate::parser::{UpdateStatement, Assignment, WhereClause, Condition, Expression, Operator};
+
+        let temp_dir = std::env::temp_dir().join("abcsql_test_update_none");
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        let create_stmt = CreateTableStatement {
+            table_name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int },
+            ],
+        };
+        storage.create_table(&create_stmt).unwrap();
+
+        let insert = crate::parser::InsertStatement {
+            table_name: "users".to_string(),
+            values: vec![Value::Int(1)],
+        };
+        storage.insert_row(&insert).unwrap();
+
+        // Update with non-matching condition
+        let update_stmt = UpdateStatement {
+            table_name: "users".to_string(),
+            assignments: vec![Assignment {
+                column: "id".to_string(),
+                value: Value::Int(99),
+            }],
+            where_clause: Some(WhereClause {
+                condition: Condition {
+                    left: Expression::Column("id".to_string()),
+                    operator: Operator::Equals,
+                    right: Expression::Literal(Value::Int(999)),
+                },
+            }),
+        };
+
+        let updated = storage.update_rows(&update_stmt).unwrap();
+        assert_eq!(updated, 0);
+
+        let rows = storage.read_rows("users").unwrap();
+        assert_eq!(rows[0][0], Value::Int(1)); // Unchanged
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_update_invalid_column() {
+        use crate::parser::{UpdateStatement, Assignment};
+
+        let temp_dir = std::env::temp_dir().join("abcsql_test_update_invalid_col");
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        let create_stmt = CreateTableStatement {
+            table_name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int },
+            ],
+        };
+        storage.create_table(&create_stmt).unwrap();
+
+        let update_stmt = UpdateStatement {
+            table_name: "users".to_string(),
+            assignments: vec![Assignment {
+                column: "nonexistent".to_string(),
+                value: Value::Int(1),
+            }],
+            where_clause: None,
+        };
+
+        let result = storage.update_rows(&update_stmt);
+        assert!(matches!(result, Err(StorageError::ColumnNotFound(_))));
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_update_type_mismatch() {
+        use crate::parser::{UpdateStatement, Assignment};
+
+        let temp_dir = std::env::temp_dir().join("abcsql_test_update_type");
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        let create_stmt = CreateTableStatement {
+            table_name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int },
+            ],
+        };
+        storage.create_table(&create_stmt).unwrap();
+
+        // Try to update INT column with STRING value
+        let update_stmt = UpdateStatement {
+            table_name: "users".to_string(),
+            assignments: vec![Assignment {
+                column: "id".to_string(),
+                value: Value::String("not a number".to_string()),
+            }],
+            where_clause: None,
+        };
+
+        let result = storage.update_rows(&update_stmt);
+        assert!(matches!(result, Err(StorageError::TypeMismatch { .. })));
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_delete_single_row() {
+        use crate::parser::{DeleteStatement, WhereClause, Condition, Expression, Operator};
+
+        let temp_dir = std::env::temp_dir().join("abcsql_test_delete_single");
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        let create_stmt = CreateTableStatement {
+            table_name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int },
+                ColumnDefinition { name: "name".to_string(), data_type: DataType::Varchar(Some(255)) },
+            ],
+        };
+        storage.create_table(&create_stmt).unwrap();
+
+        // Insert 3 rows
+        for (id, name) in [(1, "Alice"), (2, "Bob"), (3, "Charlie")] {
+            let insert = crate::parser::InsertStatement {
+                table_name: "users".to_string(),
+                values: vec![Value::Int(id), Value::String(name.to_string())],
+            };
+            storage.insert_row(&insert).unwrap();
+        }
+
+        // Delete where id = 2
+        let delete_stmt = DeleteStatement {
+            table_name: "users".to_string(),
+            where_clause: Some(WhereClause {
+                condition: Condition {
+                    left: Expression::Column("id".to_string()),
+                    operator: Operator::Equals,
+                    right: Expression::Literal(Value::Int(2)),
+                },
+            }),
+        };
+
+        let deleted = storage.delete_rows(&delete_stmt).unwrap();
+        assert_eq!(deleted, 1);
+
+        let rows = storage.read_rows("users").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], Value::Int(1));
+        assert_eq!(rows[1][0], Value::Int(3));
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_delete_multiple_rows() {
+        use crate::parser::{DeleteStatement, WhereClause, Condition, Expression, Operator};
+
+        let temp_dir = std::env::temp_dir().join("abcsql_test_delete_multi");
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        let create_stmt = CreateTableStatement {
+            table_name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int },
+                ColumnDefinition { name: "active".to_string(), data_type: DataType::Int },
+            ],
+        };
+        storage.create_table(&create_stmt).unwrap();
+
+        // Insert rows: 1-active, 2-inactive, 3-active, 4-inactive
+        for (id, active) in [(1, 1), (2, 0), (3, 1), (4, 0)] {
+            let insert = crate::parser::InsertStatement {
+                table_name: "users".to_string(),
+                values: vec![Value::Int(id), Value::Int(active)],
+            };
+            storage.insert_row(&insert).unwrap();
+        }
+
+        // Delete inactive users (active = 0)
+        let delete_stmt = DeleteStatement {
+            table_name: "users".to_string(),
+            where_clause: Some(WhereClause {
+                condition: Condition {
+                    left: Expression::Column("active".to_string()),
+                    operator: Operator::Equals,
+                    right: Expression::Literal(Value::Int(0)),
+                },
+            }),
+        };
+
+        let deleted = storage.delete_rows(&delete_stmt).unwrap();
+        assert_eq!(deleted, 2);
+
+        let rows = storage.read_rows("users").unwrap();
+        assert_eq!(rows.len(), 2);
+        // Only active users remain
+        for row in rows {
+            assert_eq!(row[1], Value::Int(1));
+        }
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_delete_all_rows() {
+        use crate::parser::DeleteStatement;
+
+        let temp_dir = std::env::temp_dir().join("abcsql_test_delete_all");
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        let create_stmt = CreateTableStatement {
+            table_name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int },
+            ],
+        };
+        storage.create_table(&create_stmt).unwrap();
+
+        for i in 1..=5 {
+            let insert = crate::parser::InsertStatement {
+                table_name: "users".to_string(),
+                values: vec![Value::Int(i)],
+            };
+            storage.insert_row(&insert).unwrap();
+        }
+
+        // Delete all (no WHERE clause)
+        let delete_stmt = DeleteStatement {
+            table_name: "users".to_string(),
+            where_clause: None,
+        };
+
+        let deleted = storage.delete_rows(&delete_stmt).unwrap();
+        assert_eq!(deleted, 5);
+
+        let rows = storage.read_rows("users").unwrap();
+        assert_eq!(rows.len(), 0);
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_delete_no_matches() {
+        use crate::parser::{DeleteStatement, WhereClause, Condition, Expression, Operator};
+
+        let temp_dir = std::env::temp_dir().join("abcsql_test_delete_none");
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        let create_stmt = CreateTableStatement {
+            table_name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int },
+            ],
+        };
+        storage.create_table(&create_stmt).unwrap();
+
+        let insert = crate::parser::InsertStatement {
+            table_name: "users".to_string(),
+            values: vec![Value::Int(1)],
+        };
+        storage.insert_row(&insert).unwrap();
+
+        // Delete with non-matching condition
+        let delete_stmt = DeleteStatement {
+            table_name: "users".to_string(),
+            where_clause: Some(WhereClause {
+                condition: Condition {
+                    left: Expression::Column("id".to_string()),
+                    operator: Operator::Equals,
+                    right: Expression::Literal(Value::Int(999)),
+                },
+            }),
+        };
+
+        let deleted = storage.delete_rows(&delete_stmt).unwrap();
+        assert_eq!(deleted, 0);
+
+        let rows = storage.read_rows("users").unwrap();
+        assert_eq!(rows.len(), 1);
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_delete_table_not_found() {
+        use crate::parser::DeleteStatement;
+
+        let temp_dir = std::env::temp_dir().join("abcsql_test_delete_notfound");
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        let delete_stmt = DeleteStatement {
+            table_name: "nonexistent".to_string(),
+            where_clause: None,
+        };
+
+        let result = storage.delete_rows(&delete_stmt);
+        assert!(matches!(result, Err(StorageError::TableNotFound(_))));
+
+        fs::remove_dir_all(&temp_dir).unwrap();
     }
 }

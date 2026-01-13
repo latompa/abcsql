@@ -14,6 +14,8 @@ pub enum SqlStatement {
     CreateTable(CreateTableStatement),
     Insert(InsertStatement),
     Select(SelectStatement),
+    Update(UpdateStatement),
+    Delete(DeleteStatement),
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -38,6 +40,25 @@ pub enum DataType {
 pub struct InsertStatement {
     pub table_name: String,
     pub values: Vec<Value>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct UpdateStatement {
+    pub table_name: String,
+    pub assignments: Vec<Assignment>,
+    pub where_clause: Option<WhereClause>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct Assignment {
+    pub column: String,
+    pub value: Value,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct DeleteStatement {
+    pub table_name: String,
+    pub where_clause: Option<WhereClause>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -115,6 +136,8 @@ pub fn parse_sql(input: &str) -> IResult<&str, SqlStatement> {
         parse_insert,
         parse_create_table,
         parse_select,
+        parse_update,
+        parse_delete,
     ))(input)?;
     let (input, _) = multispace0(input)?;
     Ok((input, stmt))
@@ -204,6 +227,62 @@ pub fn parse_insert(input: &str) -> IResult<&str, SqlStatement> {
     Ok((input, SqlStatement::Insert(InsertStatement {
         table_name: table_name.to_string(),
         values,
+    })))
+}
+
+/// Parse UPDATE statement
+pub fn parse_update(input: &str) -> IResult<&str, SqlStatement> {
+    let (input, _) = tag("UPDATE")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, table_name) = parse_identifier(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, _) = tag("SET")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, assignments) = separated_list0(
+        delimited(multispace0, nom_char(','), multispace0),
+        parse_assignment
+    )(input)?;
+    let (input, where_clause) = nom::combinator::opt(parse_where)(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
+
+    Ok((input, SqlStatement::Update(UpdateStatement {
+        table_name: table_name.to_string(),
+        assignments,
+        where_clause,
+    })))
+}
+
+/// Parse assignment: column = value
+fn parse_assignment(input: &str) -> IResult<&str, Assignment> {
+    let (input, _) = multispace0(input)?;
+    let (input, column) = parse_identifier(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('=')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, value) = parse_value(input)?;
+    let (input, _) = multispace0(input)?;
+
+    Ok((input, Assignment {
+        column: column.to_string(),
+        value,
+    }))
+}
+
+/// Parse DELETE statement
+pub fn parse_delete(input: &str) -> IResult<&str, SqlStatement> {
+    let (input, _) = tag("DELETE")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, _) = tag("FROM")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, table_name) = parse_identifier(input)?;
+    let (input, where_clause) = nom::combinator::opt(parse_where)(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
+
+    Ok((input, SqlStatement::Delete(DeleteStatement {
+        table_name: table_name.to_string(),
+        where_clause,
     })))
 }
 
@@ -787,6 +866,147 @@ mod tests {
         // For now, we expect this might fail or parse incorrectly
         // This test documents current behavior
         assert!(result.is_ok() || result.is_err());
+    }
+
+    #[test]
+    fn test_parse_update_single_column() {
+        let sql = "UPDATE users SET name = 'Bob' WHERE id = 1;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Update(upd) => {
+                assert_eq!(upd.table_name, "users");
+                assert_eq!(upd.assignments.len(), 1);
+                assert_eq!(upd.assignments[0].column, "name");
+                assert_eq!(upd.assignments[0].value, Value::String("Bob".to_string()));
+                assert!(upd.where_clause.is_some());
+            }
+            _ => panic!("Expected Update"),
+        }
+    }
+
+    #[test]
+    fn test_parse_update_multiple_columns() {
+        let sql = "UPDATE users SET name = 'Bob', email = 'bob@example.com' WHERE id = 1;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Update(upd) => {
+                assert_eq!(upd.table_name, "users");
+                assert_eq!(upd.assignments.len(), 2);
+                assert_eq!(upd.assignments[0].column, "name");
+                assert_eq!(upd.assignments[1].column, "email");
+            }
+            _ => panic!("Expected Update"),
+        }
+    }
+
+    #[test]
+    fn test_parse_update_no_where() {
+        let sql = "UPDATE users SET active = 0;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Update(upd) => {
+                assert_eq!(upd.table_name, "users");
+                assert_eq!(upd.assignments.len(), 1);
+                assert_eq!(upd.assignments[0].column, "active");
+                assert_eq!(upd.assignments[0].value, Value::Int(0));
+                assert!(upd.where_clause.is_none());
+            }
+            _ => panic!("Expected Update"),
+        }
+    }
+
+    #[test]
+    fn test_parse_update_no_semicolon() {
+        let sql = "UPDATE users SET name = 'Alice' WHERE id = 5";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Update(upd) => {
+                assert_eq!(upd.table_name, "users");
+                assert!(upd.where_clause.is_some());
+            }
+            _ => panic!("Expected Update"),
+        }
+    }
+
+    #[test]
+    fn test_parse_update_with_null() {
+        let sql = "UPDATE users SET email = NULL WHERE id = 1;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Update(upd) => {
+                assert_eq!(upd.assignments[0].value, Value::Null);
+            }
+            _ => panic!("Expected Update"),
+        }
+    }
+
+    #[test]
+    fn test_parse_delete_with_where() {
+        let sql = "DELETE FROM users WHERE id = 1;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Delete(del) => {
+                assert_eq!(del.table_name, "users");
+                assert!(del.where_clause.is_some());
+                let wc = del.where_clause.unwrap();
+                match wc.condition.left {
+                    Expression::Column(name) => assert_eq!(name, "id"),
+                    _ => panic!("Expected Column"),
+                }
+            }
+            _ => panic!("Expected Delete"),
+        }
+    }
+
+    #[test]
+    fn test_parse_delete_all() {
+        let sql = "DELETE FROM users;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Delete(del) => {
+                assert_eq!(del.table_name, "users");
+                assert!(del.where_clause.is_none());
+            }
+            _ => panic!("Expected Delete"),
+        }
+    }
+
+    #[test]
+    fn test_parse_delete_no_semicolon() {
+        let sql = "DELETE FROM products WHERE price > 100";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Delete(del) => {
+                assert_eq!(del.table_name, "products");
+                assert!(del.where_clause.is_some());
+            }
+            _ => panic!("Expected Delete"),
+        }
+    }
+
+    #[test]
+    fn test_parse_delete_with_string_condition() {
+        let sql = "DELETE FROM users WHERE name = 'Bob';";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Delete(del) => {
+                let wc = del.where_clause.unwrap();
+                match wc.condition.right {
+                    Expression::Literal(Value::String(s)) => assert_eq!(s, "Bob"),
+                    _ => panic!("Expected String literal"),
+                }
+            }
+            _ => panic!("Expected Delete"),
+        }
     }
 }
 

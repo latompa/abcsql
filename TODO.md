@@ -12,7 +12,7 @@
 - [x] LIMIT clause
 - [x] GROUP BY clause
 - [x] Aggregate functions (COUNT, SUM, AVG, MIN, MAX)
-- [ ] DISTINCT keyword
+- [x] DISTINCT keyword
 - [ ] LIKE operator for string matching
 - [ ] Arithmetic operators in expressions
 - [ ] Subqueries

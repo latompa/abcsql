@@ -284,9 +284,9 @@ fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) {
     let has_group_by = !stmt.group_by.is_empty();
 
     if has_aggregates || has_group_by {
-        execute_aggregate(&stmt.columns, &filtered_rows, &combined_cols, &stmt.group_by, &stmt.order_by, stmt.limit);
+        execute_aggregate(&stmt.columns, &filtered_rows, &combined_cols, &stmt.group_by, &stmt.order_by, stmt.limit, stmt.distinct);
     } else {
-        execute_normal_select(&stmt.columns, filtered_rows, &combined_cols, &stmt.order_by, stmt.limit);
+        execute_normal_select(&stmt.columns, filtered_rows, &combined_cols, &stmt.order_by, stmt.limit, stmt.distinct);
     }
 }
 
@@ -357,6 +357,7 @@ fn execute_aggregate(
     group_by: &[parser::SelectColumn],
     order_by: &[parser::OrderByClause],
     limit: Option<u64>,
+    distinct: bool,
 ) {
     // Build header
     let header_names: Vec<String> = columns.iter()
@@ -415,6 +416,19 @@ fn execute_aggregate(
                 }
             }
             std::cmp::Ordering::Equal
+        });
+    }
+
+    // Apply DISTINCT
+    if distinct {
+        let mut seen: Vec<Vec<String>> = Vec::new();
+        result_rows.retain(|row| {
+            if seen.contains(row) {
+                false
+            } else {
+                seen.push(row.clone());
+                true
+            }
         });
     }
 
@@ -535,6 +549,7 @@ fn execute_normal_select(
     combined_cols: &[ResultColumn],
     order_by: &[parser::OrderByClause],
     limit: Option<u64>,
+    distinct: bool,
 ) {
     // Apply ORDER BY
     if !order_by.is_empty() {
@@ -550,11 +565,6 @@ fn execute_normal_select(
             }
             std::cmp::Ordering::Equal
         });
-    }
-
-    // Apply LIMIT
-    if let Some(n) = limit {
-        rows.truncate(n as usize);
     }
 
     // Determine which columns to display
@@ -580,6 +590,25 @@ fn execute_normal_select(
             }).collect()
         }
     };
+
+    // Apply DISTINCT — deduplicate based on projected column values
+    if distinct {
+        let mut seen: Vec<Vec<Value>> = Vec::new();
+        rows.retain(|row| {
+            let projected: Vec<Value> = display_columns.iter().map(|(idx, _)| row[*idx].clone()).collect();
+            if seen.contains(&projected) {
+                false
+            } else {
+                seen.push(projected);
+                true
+            }
+        });
+    }
+
+    // Apply LIMIT
+    if let Some(n) = limit {
+        rows.truncate(n as usize);
+    }
 
     if rows.is_empty() {
         println!("(0 rows)");

@@ -64,6 +64,7 @@ pub struct DeleteStatement {
 #[derive(Debug, PartialEq, Clone)]
 pub struct SelectStatement {
     pub columns: Vec<SelectColumn>,
+    pub distinct: bool,
     pub from: String,
     pub from_alias: Option<String>,
     pub where_clause: Option<WhereClause>,
@@ -309,6 +310,8 @@ pub fn parse_delete(input: &str) -> IResult<&str, SqlStatement> {
 pub fn parse_select(input: &str) -> IResult<&str, SqlStatement> {
     let (input, _) = tag("SELECT")(input)?;
     let (input, _) = multispace1(input)?;
+    let (input, distinct) = nom::combinator::opt(nom::sequence::terminated(tag("DISTINCT"), multispace1))(input)?;
+    let distinct = distinct.is_some();
     let (input, columns) = separated_list0(
         delimited(multispace0, nom_char(','), multispace0),
         parse_select_column
@@ -331,6 +334,7 @@ pub fn parse_select(input: &str) -> IResult<&str, SqlStatement> {
 
     Ok((input, SqlStatement::Select(SelectStatement {
         columns,
+        distinct,
         from: from.to_string(),
         from_alias,
         where_clause,
@@ -1411,6 +1415,48 @@ mod tests {
         match stmt {
             SqlStatement::Select(sel) => {
                 assert!(sel.group_by.is_empty());
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_distinct() {
+        let sql = "SELECT DISTINCT name FROM users;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert!(sel.distinct);
+                assert_eq!(sel.columns.len(), 1);
+                assert_eq!(sel.columns[0], SelectColumn::Column("name".to_string()));
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_distinct_star() {
+        let sql = "SELECT DISTINCT * FROM users;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert!(sel.distinct);
+                assert_eq!(sel.columns[0], SelectColumn::All);
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_no_distinct() {
+        let sql = "SELECT name FROM users;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert!(!sel.distinct);
             }
             _ => panic!("Expected Select"),
         }

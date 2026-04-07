@@ -68,6 +68,7 @@ pub struct SelectStatement {
     pub from_alias: Option<String>,
     pub where_clause: Option<WhereClause>,
     pub joins: Vec<JoinClause>,
+    pub group_by: Vec<SelectColumn>,
     pub order_by: Vec<OrderByClause>,
     pub limit: Option<u64>,
 }
@@ -321,6 +322,7 @@ pub fn parse_select(input: &str) -> IResult<&str, SqlStatement> {
     // Parse JOIN clauses, then WHERE, then ORDER BY
     let (input, joins) = nom::multi::many0(parse_join)(input)?;
     let (input, where_clause) = nom::combinator::opt(parse_where)(input)?;
+    let (input, group_by) = parse_group_by_clause(input)?;
     let (input, order_by) = parse_order_by_clause(input)?;
     let (input, limit) = parse_limit_clause(input)?;
 
@@ -333,6 +335,7 @@ pub fn parse_select(input: &str) -> IResult<&str, SqlStatement> {
         from_alias,
         where_clause,
         joins,
+        group_by,
         order_by,
         limit,
     })))
@@ -407,6 +410,23 @@ fn parse_where(input: &str) -> IResult<&str, WhereClause> {
     let (input, _) = multispace1(input)?;
     let (input, condition) = parse_condition(input)?;
     Ok((input, WhereClause { condition }))
+}
+
+/// Parse GROUP BY clause (returns empty vec if not present)
+fn parse_group_by_clause(input: &str) -> IResult<&str, Vec<SelectColumn>> {
+    let (input, _) = multispace0(input)?;
+    let result = nom::sequence::pair(tag("GROUP"), nom::sequence::preceded(multispace1::<&str, nom::error::Error<&str>>, tag("BY")))(input);
+    match result {
+        Ok((input, _)) => {
+            let (input, _) = multispace1(input)?;
+            let (input, cols) = separated_list0(
+                delimited(multispace0, nom_char(','), multispace0),
+                nom::branch::alt((parse_qualified_column, parse_simple_column)),
+            )(input)?;
+            Ok((input, cols))
+        }
+        Err(_) => Ok((input, Vec::new())),
+    }
 }
 
 /// Parse ORDER BY clause (returns empty vec if not present)
@@ -1321,6 +1341,76 @@ mod tests {
                 assert_eq!(sel.order_by.len(), 1);
                 assert!(sel.order_by[0].descending);
                 assert_eq!(sel.limit, Some(3));
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_group_by_single() {
+        let sql = "SELECT name, COUNT(*) FROM users GROUP BY name;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert_eq!(sel.group_by.len(), 1);
+                assert_eq!(sel.group_by[0], SelectColumn::Column("name".to_string()));
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_group_by_multiple() {
+        let sql = "SELECT name, email, COUNT(*) FROM users GROUP BY name, email;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert_eq!(sel.group_by.len(), 2);
+                assert_eq!(sel.group_by[0], SelectColumn::Column("name".to_string()));
+                assert_eq!(sel.group_by[1], SelectColumn::Column("email".to_string()));
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_group_by_with_order_by() {
+        let sql = "SELECT name, COUNT(*) FROM users GROUP BY name ORDER BY name;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert_eq!(sel.group_by.len(), 1);
+                assert_eq!(sel.order_by.len(), 1);
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_group_by_qualified() {
+        let sql = "SELECT users.name, COUNT(*) FROM users GROUP BY users.name;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert_eq!(sel.group_by.len(), 1);
+                assert_eq!(sel.group_by[0], SelectColumn::QualifiedColumn("users".to_string(), "name".to_string()));
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_no_group_by() {
+        let sql = "SELECT * FROM users;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert!(sel.group_by.is_empty());
             }
             _ => panic!("Expected Select"),
         }

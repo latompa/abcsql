@@ -279,11 +279,12 @@ fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) {
         })
         .collect();
 
-    // Check if any column is an aggregate
+    // Check if any column is an aggregate or GROUP BY is present
     let has_aggregates = stmt.columns.iter().any(|c| matches!(c, parser::SelectColumn::Aggregate(_, _)));
+    let has_group_by = !stmt.group_by.is_empty();
 
-    if has_aggregates {
-        execute_aggregate(&stmt.columns, &filtered_rows, &combined_cols);
+    if has_aggregates || has_group_by {
+        execute_aggregate(&stmt.columns, &filtered_rows, &combined_cols, &stmt.group_by, &stmt.order_by, stmt.limit);
     } else {
         execute_normal_select(&stmt.columns, filtered_rows, &combined_cols, &stmt.order_by, stmt.limit);
     }
@@ -302,63 +303,140 @@ fn resolve_column_index(col: &parser::SelectColumn, combined_cols: &[ResultColum
     }
 }
 
-/// Execute a SELECT with aggregate functions
+/// Build the header name for a select column
+fn column_header(col: &parser::SelectColumn) -> String {
+    match col {
+        parser::SelectColumn::Aggregate(func, inner) => {
+            let func_name = match func {
+                parser::AggregateFunc::Count => "COUNT",
+                parser::AggregateFunc::Sum => "SUM",
+                parser::AggregateFunc::Avg => "AVG",
+                parser::AggregateFunc::Min => "MIN",
+                parser::AggregateFunc::Max => "MAX",
+            };
+            let inner_name = match inner.as_ref() {
+                parser::SelectColumn::All => "*".to_string(),
+                parser::SelectColumn::Column(n) => n.clone(),
+                parser::SelectColumn::QualifiedColumn(t, n) => format!("{}.{}", t, n),
+                _ => "?".to_string(),
+            };
+            format!("{}({})", func_name, inner_name)
+        }
+        parser::SelectColumn::Column(name) => name.clone(),
+        parser::SelectColumn::QualifiedColumn(_, name) => name.clone(),
+        parser::SelectColumn::All => "*".to_string(),
+    }
+}
+
+/// Compute one result value for a column given a group of rows
+fn compute_column_value(
+    col: &parser::SelectColumn,
+    group: &[Vec<Value>],
+    combined_cols: &[ResultColumn],
+) -> String {
+    match col {
+        parser::SelectColumn::Aggregate(func, inner) => {
+            compute_aggregate(func, inner, group, combined_cols)
+        }
+        parser::SelectColumn::Column(_) | parser::SelectColumn::QualifiedColumn(_, _) => {
+            if let Some(idx) = resolve_column_index(col, combined_cols) {
+                group.first().map(|r| format_value(&r[idx])).unwrap_or_else(|| "NULL".to_string())
+            } else {
+                "NULL".to_string()
+            }
+        }
+        parser::SelectColumn::All => "".to_string(),
+    }
+}
+
+/// Execute a SELECT with aggregate functions, with optional GROUP BY
 fn execute_aggregate(
     columns: &[parser::SelectColumn],
     rows: &[Vec<Value>],
     combined_cols: &[ResultColumn],
+    group_by: &[parser::SelectColumn],
+    order_by: &[parser::OrderByClause],
+    limit: Option<u64>,
 ) {
-    let mut header_names: Vec<String> = Vec::new();
-    let mut result_values: Vec<String> = Vec::new();
+    // Build header
+    let header_names: Vec<String> = columns.iter()
+        .filter(|c| !matches!(c, parser::SelectColumn::All))
+        .map(|c| column_header(c))
+        .collect();
 
-    for col in columns {
-        match col {
-            parser::SelectColumn::Aggregate(func, inner) => {
-                let func_name = match func {
-                    parser::AggregateFunc::Count => "COUNT",
-                    parser::AggregateFunc::Sum => "SUM",
-                    parser::AggregateFunc::Avg => "AVG",
-                    parser::AggregateFunc::Min => "MIN",
-                    parser::AggregateFunc::Max => "MAX",
-                };
-                let inner_name = match inner.as_ref() {
-                    parser::SelectColumn::All => "*".to_string(),
-                    parser::SelectColumn::Column(n) => n.clone(),
-                    parser::SelectColumn::QualifiedColumn(t, n) => format!("{}.{}", t, n),
-                    _ => "?".to_string(),
-                };
-                header_names.push(format!("{}({})", func_name, inner_name));
-
-                let value = compute_aggregate(func, inner, rows, combined_cols);
-                result_values.push(value);
+    // Group the rows
+    let groups: Vec<Vec<&Vec<Value>>> = if group_by.is_empty() {
+        // No GROUP BY: all rows are one group
+        vec![rows.iter().collect()]
+    } else {
+        // Resolve GROUP BY column indices
+        let group_indices: Vec<usize> = group_by.iter()
+            .filter_map(|c| resolve_column_index(c, combined_cols))
+            .collect();
+        // Build groups preserving insertion order
+        let mut group_keys: Vec<Vec<Value>> = Vec::new();
+        let mut group_map: Vec<Vec<&Vec<Value>>> = Vec::new();
+        for row in rows {
+            let key: Vec<Value> = group_indices.iter().map(|&i| row[i].clone()).collect();
+            if let Some(pos) = group_keys.iter().position(|k| k == &key) {
+                group_map[pos].push(row);
+            } else {
+                group_keys.push(key);
+                group_map.push(vec![row]);
             }
-            parser::SelectColumn::Column(name) => {
-                header_names.push(name.clone());
-                // For non-aggregate columns without GROUP BY, just show first row value
-                if let Some(idx) = resolve_column_index(col, combined_cols) {
-                    let val = rows.first().map(|r| format_value(&r[idx])).unwrap_or_else(|| "NULL".to_string());
-                    result_values.push(val);
-                } else {
-                    result_values.push("NULL".to_string());
-                }
-            }
-            parser::SelectColumn::QualifiedColumn(_, name) => {
-                header_names.push(name.clone());
-                if let Some(idx) = resolve_column_index(col, combined_cols) {
-                    let val = rows.first().map(|r| format_value(&r[idx])).unwrap_or_else(|| "NULL".to_string());
-                    result_values.push(val);
-                } else {
-                    result_values.push("NULL".to_string());
-                }
-            }
-            parser::SelectColumn::All => {}
         }
+        group_map
+    };
+
+    // Compute result rows from groups
+    let active_columns: Vec<&parser::SelectColumn> = columns.iter()
+        .filter(|c| !matches!(c, parser::SelectColumn::All))
+        .collect();
+
+    let mut result_rows: Vec<Vec<String>> = groups.iter().map(|group| {
+        // Convert &Vec<&Vec<Value>> to &[Vec<Value>] by collecting owned copies
+        let owned: Vec<Vec<Value>> = group.iter().map(|r| (*r).clone()).collect();
+        active_columns.iter()
+            .map(|col| compute_column_value(col, &owned, combined_cols))
+            .collect()
+    }).collect();
+
+    // Apply ORDER BY on result rows using header names to find sort column
+    if !order_by.is_empty() {
+        result_rows.sort_by(|a, b| {
+            for ob in order_by {
+                let col_name = column_header(&ob.column);
+                if let Some(idx) = header_names.iter().position(|h| *h == col_name) {
+                    let ord = a[idx].cmp(&b[idx]);
+                    let ord = if ob.descending { ord.reverse() } else { ord };
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
     }
 
-    // Print single result row
-    let widths: Vec<usize> = header_names.iter().zip(result_values.iter())
-        .map(|(h, v)| h.len().max(v.len()))
-        .collect();
+    // Apply LIMIT
+    if let Some(n) = limit {
+        result_rows.truncate(n as usize);
+    }
+
+    if result_rows.is_empty() {
+        println!("(0 rows)");
+        return;
+    }
+
+    // Calculate column widths and print
+    let mut widths: Vec<usize> = header_names.iter().map(|h| h.len()).collect();
+    for row in &result_rows {
+        for (i, val) in row.iter().enumerate() {
+            if val.len() > widths[i] {
+                widths[i] = val.len();
+            }
+        }
+    }
 
     let header: Vec<String> = header_names.iter().enumerate()
         .map(|(i, name)| format!("{:width$}", name, width = widths[i]))
@@ -368,11 +446,14 @@ fn execute_aggregate(
     let sep: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
     println!("{}", sep.join("-+-"));
 
-    let vals: Vec<String> = result_values.iter().enumerate()
-        .map(|(i, v)| format!("{:width$}", v, width = widths[i]))
-        .collect();
-    println!("{}", vals.join(" | "));
-    println!("(1 row)");
+    for row in &result_rows {
+        let vals: Vec<String> = row.iter().enumerate()
+            .map(|(i, v)| format!("{:width$}", v, width = widths[i]))
+            .collect();
+        println!("{}", vals.join(" | "));
+    }
+
+    println!("({} rows)", result_rows.len());
 }
 
 /// Compute a single aggregate value

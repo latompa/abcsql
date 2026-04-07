@@ -10,7 +10,7 @@
 
 - [x] ORDER BY clause
 - [x] LIMIT clause
-- [ ] GROUP BY clause
+- [x] GROUP BY clause
 - [x] Aggregate functions (COUNT, SUM, AVG, MIN, MAX)
 - [ ] DISTINCT keyword
 - [ ] LIKE operator for string matching

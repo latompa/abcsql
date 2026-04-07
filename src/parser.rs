@@ -69,6 +69,7 @@ pub struct SelectStatement {
     pub where_clause: Option<WhereClause>,
     pub joins: Vec<JoinClause>,
     pub order_by: Vec<OrderByClause>,
+    pub limit: Option<u64>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -321,6 +322,7 @@ pub fn parse_select(input: &str) -> IResult<&str, SqlStatement> {
     let (input, joins) = nom::multi::many0(parse_join)(input)?;
     let (input, where_clause) = nom::combinator::opt(parse_where)(input)?;
     let (input, order_by) = parse_order_by_clause(input)?;
+    let (input, limit) = parse_limit_clause(input)?;
 
     let (input, _) = multispace0(input)?;
     let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
@@ -332,6 +334,7 @@ pub fn parse_select(input: &str) -> IResult<&str, SqlStatement> {
         where_clause,
         joins,
         order_by,
+        limit,
     })))
 }
 
@@ -437,6 +440,20 @@ fn parse_order_by_item(input: &str) -> IResult<&str, OrderByClause> {
     )))(input)?;
     let descending = dir == Some("DESC");
     Ok((input, OrderByClause { column, descending }))
+}
+
+/// Parse LIMIT clause (returns None if not present)
+fn parse_limit_clause(input: &str) -> IResult<&str, Option<u64>> {
+    let (input, _) = multispace0(input)?;
+    let result = tag::<&str, &str, nom::error::Error<&str>>("LIMIT")(input);
+    match result {
+        Ok((input, _)) => {
+            let (input, _) = multispace1(input)?;
+            let (input, n) = nom::character::complete::u64(input)?;
+            Ok((input, Some(n)))
+        }
+        Err(_) => Ok((input, None)),
+    }
 }
 
 /// Check if identifier is a reserved keyword that can't be used as an alias
@@ -1248,6 +1265,62 @@ mod tests {
                 assert!(sel.where_clause.is_some());
                 assert_eq!(sel.order_by.len(), 1);
                 assert!(sel.order_by[0].descending);
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_limit() {
+        let sql = "SELECT * FROM users LIMIT 10;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert_eq!(sel.limit, Some(10));
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_order_by_with_limit() {
+        let sql = "SELECT * FROM users ORDER BY name LIMIT 5;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert_eq!(sel.order_by.len(), 1);
+                assert_eq!(sel.limit, Some(5));
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_no_limit() {
+        let sql = "SELECT * FROM users;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert_eq!(sel.limit, None);
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_where_order_by_limit() {
+        let sql = "SELECT * FROM users WHERE id > 1 ORDER BY name DESC LIMIT 3;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert!(sel.where_clause.is_some());
+                assert_eq!(sel.order_by.len(), 1);
+                assert!(sel.order_by[0].descending);
+                assert_eq!(sel.limit, Some(3));
             }
             _ => panic!("Expected Select"),
         }

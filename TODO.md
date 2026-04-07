@@ -9,7 +9,7 @@
 ## SQL Features
 
 - [x] ORDER BY clause
-- [ ] LIMIT clause
+- [x] LIMIT clause
 - [ ] GROUP BY clause
 - [x] Aggregate functions (COUNT, SUM, AVG, MIN, MAX)
 - [ ] DISTINCT keyword

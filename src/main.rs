@@ -285,7 +285,7 @@ fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) {
     if has_aggregates {
         execute_aggregate(&stmt.columns, &filtered_rows, &combined_cols);
     } else {
-        execute_normal_select(&stmt.columns, filtered_rows, &combined_cols, &stmt.order_by);
+        execute_normal_select(&stmt.columns, filtered_rows, &combined_cols, &stmt.order_by, stmt.limit);
     }
 }
 
@@ -453,6 +453,7 @@ fn execute_normal_select(
     mut rows: Vec<Vec<Value>>,
     combined_cols: &[ResultColumn],
     order_by: &[parser::OrderByClause],
+    limit: Option<u64>,
 ) {
     // Apply ORDER BY
     if !order_by.is_empty() {
@@ -468,6 +469,11 @@ fn execute_normal_select(
             }
             std::cmp::Ordering::Equal
         });
+    }
+
+    // Apply LIMIT
+    if let Some(n) = limit {
+        rows.truncate(n as usize);
     }
 
     // Determine which columns to display

@@ -65,6 +65,7 @@ pub struct DeleteStatement {
 pub struct SelectStatement {
     pub columns: Vec<SelectColumn>,
     pub from: String,
+    pub from_alias: Option<String>,
     pub where_clause: Option<WhereClause>,
     pub joins: Vec<JoinClause>,
 }
@@ -298,17 +299,19 @@ pub fn parse_select(input: &str) -> IResult<&str, SqlStatement> {
     let (input, _) = tag("FROM")(input)?;
     let (input, _) = multispace1(input)?;
     let (input, from) = parse_identifier(input)?;
-    
+    let (input, from_alias) = nom::combinator::opt(parse_table_alias)(input)?;
+
     // Parse JOIN clauses first (they come after FROM), then WHERE
     let (input, joins) = nom::multi::many0(parse_join)(input)?;
     let (input, where_clause) = nom::combinator::opt(parse_where)(input)?;
-    
+
     let (input, _) = multispace0(input)?;
     let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
-    
+
     Ok((input, SqlStatement::Select(SelectStatement {
         columns,
         from: from.to_string(),
+        from_alias,
         where_clause,
         joins,
     })))
@@ -355,6 +358,21 @@ fn parse_where(input: &str) -> IResult<&str, WhereClause> {
     Ok((input, WhereClause { condition }))
 }
 
+/// Check if identifier is a reserved keyword that can't be used as an alias
+fn is_reserved_keyword(s: &str) -> bool {
+    matches!(s.to_uppercase().as_str(), "ON" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "WHERE" | "ORDER" | "GROUP" | "LIMIT" | "HAVING")
+}
+
+/// Parse optional table alias, rejecting reserved keywords
+fn parse_table_alias(input: &str) -> IResult<&str, String> {
+    let (input, _) = multispace1(input)?;
+    let (input, alias) = parse_identifier(input)?;
+    if is_reserved_keyword(alias) {
+        return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)));
+    }
+    Ok((input, alias.to_string()))
+}
+
 /// Parse JOIN clause
 pub fn parse_join(input: &str) -> IResult<&str, JoinClause> {
     let (input, _) = multispace1(input)?;
@@ -366,11 +384,8 @@ pub fn parse_join(input: &str) -> IResult<&str, JoinClause> {
     ))(input)?;
     let (input, _) = multispace1(input)?;
     let (input, table) = parse_identifier(input)?;
-    let (input, alias) = nom::combinator::opt(|input| {
-        let (input, _) = multispace1(input)?;
-        let (input, alias) = parse_identifier(input)?;
-        Ok((input, alias.to_string()))
-    })(input)?;
+    // Parse optional alias, but don't consume reserved keywords like ON
+    let (input, alias) = nom::combinator::opt(parse_table_alias)(input)?;
     let (input, _) = multispace1(input)?;
     let (input, _) = tag("ON")(input)?;
     let (input, _) = multispace1(input)?;
@@ -706,7 +721,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: Fix JOIN parsing
     fn test_parse_select_with_join() {
         let sql = "SELECT * FROM users JOIN orders ON users.id = orders.user_id;";
         let result = parse_sql(sql);
@@ -735,7 +749,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: Fix JOIN parsing
     fn test_parse_select_with_join_types() {
         let test_cases = vec![
             ("INNER JOIN", JoinType::Inner),
@@ -758,7 +771,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: Fix JOIN parsing
     fn test_parse_select_with_join_alias() {
         let sql = "SELECT * FROM users u JOIN orders o ON u.id = o.user_id;";
         let (_, stmt) = parse_sql(sql).unwrap();
@@ -800,7 +812,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: Fix JOIN parsing
     fn test_parse_select_multiple_joins() {
         let sql = "SELECT * FROM users JOIN orders ON users.id = orders.user_id JOIN products ON orders.product_id = products.id;";
         let (_, stmt) = parse_sql(sql).unwrap();
@@ -816,7 +827,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: Fix JOIN parsing
     fn test_parse_select_where_and_join() {
         let sql = "SELECT * FROM users JOIN orders ON users.id = orders.user_id WHERE users.name = 'Alice';";
         let (_, stmt) = parse_sql(sql).unwrap();

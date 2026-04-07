@@ -165,18 +165,22 @@ fn execute_sql(sql: &str, storage: &Storage) {
     }
 }
 
+/// A column in the combined result set, tracked by table name and column name
+struct ResultColumn {
+    table: String,
+    name: String,
+}
+
 fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) {
-    // Load schema to get column names
-    let schema = match storage.load_schema(&stmt.from) {
+    // Load the FROM table
+    let from_schema = match storage.load_schema(&stmt.from) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Error: {}", e);
             return;
         }
     };
-
-    // Read all rows
-    let rows = match storage.read_rows(&stmt.from) {
+    let from_rows = match storage.read_rows(&stmt.from) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -184,28 +188,114 @@ fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) {
         }
     };
 
-    // Filter rows by WHERE clause if present
-    let filtered_rows: Vec<&Vec<Value>> = rows.iter()
+    // Build the combined column list and row set, starting with the FROM table
+    let from_alias = stmt.from_alias.as_deref().unwrap_or(&stmt.from);
+    let mut combined_cols: Vec<ResultColumn> = from_schema.columns.iter()
+        .map(|c| ResultColumn { table: from_alias.to_string(), name: c.name.clone() })
+        .collect();
+    let mut combined_rows: Vec<Vec<Value>> = from_rows;
+
+    // Process each JOIN
+    for join in &stmt.joins {
+        let join_schema = match storage.load_schema(&join.table) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                return;
+            }
+        };
+        let join_rows = match storage.read_rows(&join.table) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                return;
+            }
+        };
+
+        let join_alias = join.alias.as_deref().unwrap_or(&join.table);
+        let join_result_cols: Vec<ResultColumn> = join_schema.columns.iter()
+            .map(|c| ResultColumn { table: join_alias.to_string(), name: c.name.clone() })
+            .collect();
+
+        let mut new_rows: Vec<Vec<Value>> = Vec::new();
+        let left_col_count = combined_cols.len();
+
+        for left_row in &combined_rows {
+            let mut matched = false;
+            for right_row in &join_rows {
+                // Build a candidate combined row to evaluate the ON condition
+                let mut candidate: Vec<Value> = left_row.clone();
+                candidate.extend(right_row.iter().cloned());
+
+                let all_cols: Vec<ResultColumn> = combined_cols.iter()
+                    .chain(join_result_cols.iter())
+                    .map(|c| ResultColumn { table: c.table.clone(), name: c.name.clone() })
+                    .collect();
+
+                if evaluate_join_condition(&join.on, &candidate, &all_cols) {
+                    new_rows.push(candidate);
+                    matched = true;
+                }
+            }
+            // LEFT JOIN: include unmatched left rows with NULLs for right side
+            if !matched && join.join_type == parser::JoinType::Left {
+                let mut row = left_row.clone();
+                row.extend(std::iter::repeat(Value::Null).take(join_result_cols.len()));
+                new_rows.push(row);
+            }
+        }
+
+        // RIGHT JOIN: include unmatched right rows with NULLs for left side
+        if join.join_type == parser::JoinType::Right {
+            for right_row in &join_rows {
+                let has_match = combined_rows.iter().any(|left_row| {
+                    let mut candidate: Vec<Value> = left_row.clone();
+                    candidate.extend(right_row.iter().cloned());
+                    let all_cols: Vec<ResultColumn> = combined_cols.iter()
+                        .chain(join_result_cols.iter())
+                        .map(|c| ResultColumn { table: c.table.clone(), name: c.name.clone() })
+                        .collect();
+                    evaluate_join_condition(&join.on, &candidate, &all_cols)
+                });
+                if !has_match {
+                    let mut row: Vec<Value> = std::iter::repeat(Value::Null).take(left_col_count).collect();
+                    row.extend(right_row.iter().cloned());
+                    new_rows.push(row);
+                }
+            }
+        }
+
+        combined_cols.extend(join_result_cols);
+        combined_rows = new_rows;
+    }
+
+    // Filter by WHERE clause
+    let filtered_rows: Vec<&Vec<Value>> = combined_rows.iter()
         .filter(|row| {
             match &stmt.where_clause {
-                Some(wc) => evaluate_condition(&wc.condition, row, &schema.columns),
+                Some(wc) => evaluate_join_condition(&wc.condition, row, &combined_cols),
                 None => true,
             }
         })
         .collect();
 
     // Determine which columns to display
-    let display_columns: Vec<(usize, &str)> = match &stmt.columns[..] {
+    let display_columns: Vec<(usize, String)> = match &stmt.columns[..] {
         [parser::SelectColumn::All] => {
-            schema.columns.iter().enumerate().map(|(i, c)| (i, c.name.as_str())).collect()
+            combined_cols.iter().enumerate()
+                .map(|(i, c)| (i, c.name.clone()))
+                .collect()
         }
         cols => {
             cols.iter().filter_map(|col| {
                 match col {
-                    parser::SelectColumn::Column(name) |
-                    parser::SelectColumn::QualifiedColumn(_, name) => {
-                        schema.columns.iter().position(|c| &c.name == name)
-                            .map(|idx| (idx, name.as_str()))
+                    parser::SelectColumn::Column(name) => {
+                        combined_cols.iter().position(|c| c.name == *name)
+                            .map(|idx| (idx, name.clone()))
+                    }
+                    parser::SelectColumn::QualifiedColumn(table, name) => {
+                        combined_cols.iter().position(|c| c.table == *table && c.name == *name)
+                            .map(|idx| (idx, name.clone()))
                     }
                     parser::SelectColumn::All => None,
                 }
@@ -262,13 +352,13 @@ fn format_value(value: &Value) -> String {
     }
 }
 
-fn evaluate_condition(
+fn evaluate_join_condition(
     condition: &parser::Condition,
     row: &[Value],
-    schema: &[parser::ColumnDefinition],
+    cols: &[ResultColumn],
 ) -> bool {
-    let left_val = resolve_expression(&condition.left, row, schema);
-    let right_val = resolve_expression(&condition.right, row, schema);
+    let left_val = resolve_join_expression(&condition.left, row, cols);
+    let right_val = resolve_join_expression(&condition.right, row, cols);
 
     match (&left_val, &right_val) {
         (Some(l), Some(r)) => compare_values(l, &condition.operator, r),
@@ -276,21 +366,21 @@ fn evaluate_condition(
     }
 }
 
-fn resolve_expression(
+fn resolve_join_expression(
     expr: &parser::Expression,
     row: &[Value],
-    schema: &[parser::ColumnDefinition],
+    cols: &[ResultColumn],
 ) -> Option<Value> {
     match expr {
         parser::Expression::Literal(v) => Some(v.clone()),
         parser::Expression::Column(name) => {
-            schema.iter()
+            cols.iter()
                 .position(|c| c.name == *name)
                 .map(|idx| row[idx].clone())
         }
-        parser::Expression::QualifiedColumn(_, col) => {
-            schema.iter()
-                .position(|c| c.name == *col)
+        parser::Expression::QualifiedColumn(table, col) => {
+            cols.iter()
+                .position(|c| c.table == *table && c.name == *col)
                 .map(|idx| row[idx].clone())
         }
     }

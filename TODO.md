@@ -8,10 +8,10 @@
 
 ## SQL Features
 
-- [ ] ORDER BY clause
+- [x] ORDER BY clause
 - [ ] LIMIT clause
 - [ ] GROUP BY clause
-- [ ] Aggregate functions (COUNT, SUM, AVG, MIN, MAX)
+- [x] Aggregate functions (COUNT, SUM, AVG, MIN, MAX)
 - [ ] DISTINCT keyword
 - [ ] LIKE operator for string matching
 - [ ] Arithmetic operators in expressions

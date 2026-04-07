@@ -68,6 +68,7 @@ pub struct SelectStatement {
     pub from_alias: Option<String>,
     pub where_clause: Option<WhereClause>,
     pub joins: Vec<JoinClause>,
+    pub order_by: Vec<OrderByClause>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -75,8 +76,23 @@ pub enum SelectColumn {
     All, // *
     Column(String),
     QualifiedColumn(String, String), // table.column
+    Aggregate(AggregateFunc, Box<SelectColumn>), // COUNT(*), SUM(col), etc.
 }
 
+#[derive(Debug, PartialEq, Clone)]
+pub enum AggregateFunc {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct OrderByClause {
+    pub column: SelectColumn,
+    pub descending: bool,
+}
 #[derive(Debug, PartialEq, Clone)]
 pub struct WhereClause {
     pub condition: Condition,
@@ -301,9 +317,10 @@ pub fn parse_select(input: &str) -> IResult<&str, SqlStatement> {
     let (input, from) = parse_identifier(input)?;
     let (input, from_alias) = nom::combinator::opt(parse_table_alias)(input)?;
 
-    // Parse JOIN clauses first (they come after FROM), then WHERE
+    // Parse JOIN clauses, then WHERE, then ORDER BY
     let (input, joins) = nom::multi::many0(parse_join)(input)?;
     let (input, where_clause) = nom::combinator::opt(parse_where)(input)?;
+    let (input, order_by) = parse_order_by_clause(input)?;
 
     let (input, _) = multispace0(input)?;
     let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
@@ -314,19 +331,50 @@ pub fn parse_select(input: &str) -> IResult<&str, SqlStatement> {
         from_alias,
         where_clause,
         joins,
+        order_by,
     })))
 }
 
-/// Parse SELECT column: * or column or table.column
+/// Parse SELECT column: aggregate, *, table.column, or column
 fn parse_select_column(input: &str) -> IResult<&str, SelectColumn> {
     let (input, _) = multispace0(input)?;
     let (input, col) = nom::branch::alt((
+        parse_aggregate_column,
         parse_all_column,
         parse_qualified_column,
         parse_simple_column,
     ))(input)?;
-    // Don't consume trailing whitespace - let the caller handle it
     Ok((input, col))
+}
+
+/// Parse aggregate function: COUNT(*), SUM(col), AVG(col), MIN(col), MAX(col)
+fn parse_aggregate_column(input: &str) -> IResult<&str, SelectColumn> {
+    let (input, func_name) = nom::branch::alt((
+        tag("COUNT"),
+        tag("SUM"),
+        tag("AVG"),
+        tag("MIN"),
+        tag("MAX"),
+    ))(input)?;
+    let func = match func_name {
+        "COUNT" => AggregateFunc::Count,
+        "SUM" => AggregateFunc::Sum,
+        "AVG" => AggregateFunc::Avg,
+        "MIN" => AggregateFunc::Min,
+        "MAX" => AggregateFunc::Max,
+        _ => unreachable!(),
+    };
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, inner) = nom::branch::alt((
+        parse_all_column,
+        parse_qualified_column,
+        parse_simple_column,
+    ))(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, SelectColumn::Aggregate(func, Box::new(inner))))
 }
 
 fn parse_all_column(input: &str) -> IResult<&str, SelectColumn> {
@@ -356,6 +404,39 @@ fn parse_where(input: &str) -> IResult<&str, WhereClause> {
     let (input, _) = multispace1(input)?;
     let (input, condition) = parse_condition(input)?;
     Ok((input, WhereClause { condition }))
+}
+
+/// Parse ORDER BY clause (returns empty vec if not present)
+fn parse_order_by_clause(input: &str) -> IResult<&str, Vec<OrderByClause>> {
+    let (input, _) = multispace0(input)?;
+    let result = nom::sequence::pair(tag("ORDER"), nom::sequence::preceded(multispace1::<&str, nom::error::Error<&str>>, tag("BY")))(input);
+    match result {
+        Ok((input, _)) => {
+            let (input, _) = multispace1(input)?;
+            let (input, clauses) = separated_list0(
+                delimited(multispace0, nom_char(','), multispace0),
+                parse_order_by_item,
+            )(input)?;
+            Ok((input, clauses))
+        }
+        Err(_) => Ok((input, Vec::new())),
+    }
+}
+
+/// Parse a single ORDER BY item: column [ASC|DESC]
+fn parse_order_by_item(input: &str) -> IResult<&str, OrderByClause> {
+    let (input, _) = multispace0(input)?;
+    let (input, column) = nom::branch::alt((
+        parse_qualified_column,
+        parse_simple_column,
+    ))(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, dir) = nom::combinator::opt(nom::branch::alt((
+        tag("ASC"),
+        tag("DESC"),
+    )))(input)?;
+    let descending = dir == Some("DESC");
+    Ok((input, OrderByClause { column, descending }))
 }
 
 /// Check if identifier is a reserved keyword that can't be used as an alias
@@ -1016,6 +1097,159 @@ mod tests {
                 }
             }
             _ => panic!("Expected Delete"),
+        }
+    }
+
+    #[test]
+    fn test_parse_order_by_asc() {
+        let sql = "SELECT * FROM users ORDER BY name ASC;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert_eq!(sel.order_by.len(), 1);
+                assert_eq!(sel.order_by[0].column, SelectColumn::Column("name".to_string()));
+                assert!(!sel.order_by[0].descending);
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_order_by_desc() {
+        let sql = "SELECT * FROM users ORDER BY id DESC;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert_eq!(sel.order_by.len(), 1);
+                assert!(sel.order_by[0].descending);
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_order_by_default_asc() {
+        let sql = "SELECT * FROM users ORDER BY name;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert_eq!(sel.order_by.len(), 1);
+                assert!(!sel.order_by[0].descending);
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_order_by_multiple() {
+        let sql = "SELECT * FROM users ORDER BY name ASC, id DESC;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert_eq!(sel.order_by.len(), 2);
+                assert_eq!(sel.order_by[0].column, SelectColumn::Column("name".to_string()));
+                assert!(!sel.order_by[0].descending);
+                assert_eq!(sel.order_by[1].column, SelectColumn::Column("id".to_string()));
+                assert!(sel.order_by[1].descending);
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_order_by_qualified() {
+        let sql = "SELECT * FROM users ORDER BY users.name DESC;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert_eq!(sel.order_by.len(), 1);
+                assert_eq!(sel.order_by[0].column, SelectColumn::QualifiedColumn("users".to_string(), "name".to_string()));
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_count_star() {
+        let sql = "SELECT COUNT(*) FROM users;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert_eq!(sel.columns.len(), 1);
+                match &sel.columns[0] {
+                    SelectColumn::Aggregate(AggregateFunc::Count, inner) => {
+                        assert_eq!(**inner, SelectColumn::All);
+                    }
+                    _ => panic!("Expected COUNT(*)"),
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_aggregate_functions() {
+        let test_cases = vec![
+            ("SELECT SUM(price) FROM products;", AggregateFunc::Sum, "price"),
+            ("SELECT AVG(price) FROM products;", AggregateFunc::Avg, "price"),
+            ("SELECT MIN(id) FROM users;", AggregateFunc::Min, "id"),
+            ("SELECT MAX(id) FROM users;", AggregateFunc::Max, "id"),
+            ("SELECT COUNT(name) FROM users;", AggregateFunc::Count, "name"),
+        ];
+
+        for (sql, expected_func, expected_col) in test_cases {
+            let (_, stmt) = parse_sql(sql).unwrap();
+            match stmt {
+                SqlStatement::Select(sel) => {
+                    match &sel.columns[0] {
+                        SelectColumn::Aggregate(func, inner) => {
+                            assert_eq!(*func, expected_func, "Failed for: {}", sql);
+                            assert_eq!(**inner, SelectColumn::Column(expected_col.to_string()));
+                        }
+                        _ => panic!("Expected aggregate for: {}", sql),
+                    }
+                }
+                _ => panic!("Expected Select"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_mixed_aggregate_and_columns() {
+        let sql = "SELECT name, COUNT(*) FROM users;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert_eq!(sel.columns.len(), 2);
+                assert_eq!(sel.columns[0], SelectColumn::Column("name".to_string()));
+                match &sel.columns[1] {
+                    SelectColumn::Aggregate(AggregateFunc::Count, _) => {}
+                    _ => panic!("Expected COUNT(*)"),
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_where_with_order_by() {
+        let sql = "SELECT * FROM users WHERE id > 1 ORDER BY name DESC;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert!(sel.where_clause.is_some());
+                assert_eq!(sel.order_by.len(), 1);
+                assert!(sel.order_by[0].descending);
+            }
+            _ => panic!("Expected Select"),
         }
     }
 }

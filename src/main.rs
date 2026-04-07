@@ -270,7 +270,7 @@ fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) {
     }
 
     // Filter by WHERE clause
-    let filtered_rows: Vec<&Vec<Value>> = combined_rows.iter()
+    let filtered_rows: Vec<Vec<Value>> = combined_rows.into_iter()
         .filter(|row| {
             match &stmt.where_clause {
                 Some(wc) => evaluate_join_condition(&wc.condition, row, &combined_cols),
@@ -279,8 +279,199 @@ fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) {
         })
         .collect();
 
+    // Check if any column is an aggregate
+    let has_aggregates = stmt.columns.iter().any(|c| matches!(c, parser::SelectColumn::Aggregate(_, _)));
+
+    if has_aggregates {
+        execute_aggregate(&stmt.columns, &filtered_rows, &combined_cols);
+    } else {
+        execute_normal_select(&stmt.columns, filtered_rows, &combined_cols, &stmt.order_by);
+    }
+}
+
+/// Resolve a SelectColumn to a column index in the combined result set
+fn resolve_column_index(col: &parser::SelectColumn, combined_cols: &[ResultColumn]) -> Option<usize> {
+    match col {
+        parser::SelectColumn::Column(name) => {
+            combined_cols.iter().position(|c| c.name == *name)
+        }
+        parser::SelectColumn::QualifiedColumn(table, name) => {
+            combined_cols.iter().position(|c| c.table == *table && c.name == *name)
+        }
+        _ => None,
+    }
+}
+
+/// Execute a SELECT with aggregate functions
+fn execute_aggregate(
+    columns: &[parser::SelectColumn],
+    rows: &[Vec<Value>],
+    combined_cols: &[ResultColumn],
+) {
+    let mut header_names: Vec<String> = Vec::new();
+    let mut result_values: Vec<String> = Vec::new();
+
+    for col in columns {
+        match col {
+            parser::SelectColumn::Aggregate(func, inner) => {
+                let func_name = match func {
+                    parser::AggregateFunc::Count => "COUNT",
+                    parser::AggregateFunc::Sum => "SUM",
+                    parser::AggregateFunc::Avg => "AVG",
+                    parser::AggregateFunc::Min => "MIN",
+                    parser::AggregateFunc::Max => "MAX",
+                };
+                let inner_name = match inner.as_ref() {
+                    parser::SelectColumn::All => "*".to_string(),
+                    parser::SelectColumn::Column(n) => n.clone(),
+                    parser::SelectColumn::QualifiedColumn(t, n) => format!("{}.{}", t, n),
+                    _ => "?".to_string(),
+                };
+                header_names.push(format!("{}({})", func_name, inner_name));
+
+                let value = compute_aggregate(func, inner, rows, combined_cols);
+                result_values.push(value);
+            }
+            parser::SelectColumn::Column(name) => {
+                header_names.push(name.clone());
+                // For non-aggregate columns without GROUP BY, just show first row value
+                if let Some(idx) = resolve_column_index(col, combined_cols) {
+                    let val = rows.first().map(|r| format_value(&r[idx])).unwrap_or_else(|| "NULL".to_string());
+                    result_values.push(val);
+                } else {
+                    result_values.push("NULL".to_string());
+                }
+            }
+            parser::SelectColumn::QualifiedColumn(_, name) => {
+                header_names.push(name.clone());
+                if let Some(idx) = resolve_column_index(col, combined_cols) {
+                    let val = rows.first().map(|r| format_value(&r[idx])).unwrap_or_else(|| "NULL".to_string());
+                    result_values.push(val);
+                } else {
+                    result_values.push("NULL".to_string());
+                }
+            }
+            parser::SelectColumn::All => {}
+        }
+    }
+
+    // Print single result row
+    let widths: Vec<usize> = header_names.iter().zip(result_values.iter())
+        .map(|(h, v)| h.len().max(v.len()))
+        .collect();
+
+    let header: Vec<String> = header_names.iter().enumerate()
+        .map(|(i, name)| format!("{:width$}", name, width = widths[i]))
+        .collect();
+    println!("{}", header.join(" | "));
+
+    let sep: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
+    println!("{}", sep.join("-+-"));
+
+    let vals: Vec<String> = result_values.iter().enumerate()
+        .map(|(i, v)| format!("{:width$}", v, width = widths[i]))
+        .collect();
+    println!("{}", vals.join(" | "));
+    println!("(1 row)");
+}
+
+/// Compute a single aggregate value
+fn compute_aggregate(
+    func: &parser::AggregateFunc,
+    inner: &parser::SelectColumn,
+    rows: &[Vec<Value>],
+    combined_cols: &[ResultColumn],
+) -> String {
+    // COUNT(*) counts all rows
+    if *func == parser::AggregateFunc::Count && *inner == parser::SelectColumn::All {
+        return rows.len().to_string();
+    }
+
+    let col_idx = match resolve_column_index(inner, combined_cols) {
+        Some(idx) => idx,
+        None => return "NULL".to_string(),
+    };
+
+    // Collect non-null values
+    let values: Vec<&Value> = rows.iter()
+        .map(|r| &r[col_idx])
+        .filter(|v| !matches!(v, Value::Null))
+        .collect();
+
+    match func {
+        parser::AggregateFunc::Count => values.len().to_string(),
+        parser::AggregateFunc::Sum => {
+            let sum: i64 = values.iter().filter_map(|v| match v {
+                Value::Int(n) => Some(*n),
+                _ => None,
+            }).sum();
+            sum.to_string()
+        }
+        parser::AggregateFunc::Avg => {
+            let nums: Vec<i64> = values.iter().filter_map(|v| match v {
+                Value::Int(n) => Some(*n),
+                _ => None,
+            }).collect();
+            if nums.is_empty() {
+                "NULL".to_string()
+            } else {
+                let avg = nums.iter().sum::<i64>() as f64 / nums.len() as f64;
+                // Show integer if whole number, otherwise 2 decimal places
+                if avg == avg.floor() {
+                    format!("{}", avg as i64)
+                } else {
+                    format!("{:.2}", avg)
+                }
+            }
+        }
+        parser::AggregateFunc::Min => {
+            values.iter().min_by(|a, b| cmp_values(a, b)).map(|v| format_value(v)).unwrap_or_else(|| "NULL".to_string())
+        }
+        parser::AggregateFunc::Max => {
+            values.iter().max_by(|a, b| cmp_values(a, b)).map(|v| format_value(v)).unwrap_or_else(|| "NULL".to_string())
+        }
+    }
+}
+
+/// Compare two Values for ordering
+fn cmp_values(a: &Value, b: &Value) -> std::cmp::Ordering {
+    match (a, b) {
+        (Value::Int(a), Value::Int(b)) => a.cmp(b),
+        (Value::String(a), Value::String(b)) => a.cmp(b),
+        (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+        (Value::Null, _) => std::cmp::Ordering::Less,
+        (_, Value::Null) => std::cmp::Ordering::Greater,
+        // Mixed types: ints before strings
+        (Value::Int(_), Value::String(_)) => std::cmp::Ordering::Less,
+        (Value::String(_), Value::Int(_)) => std::cmp::Ordering::Greater,
+    }
+}
+
+/// Execute a normal (non-aggregate) SELECT with optional ORDER BY
+fn execute_normal_select(
+    columns: &[parser::SelectColumn],
+    mut rows: Vec<Vec<Value>>,
+    combined_cols: &[ResultColumn],
+    order_by: &[parser::OrderByClause],
+) {
+    // Apply ORDER BY
+    if !order_by.is_empty() {
+        rows.sort_by(|a, b| {
+            for ob in order_by {
+                if let Some(idx) = resolve_column_index(&ob.column, combined_cols) {
+                    let ord = cmp_values(&a[idx], &b[idx]);
+                    let ord = if ob.descending { ord.reverse() } else { ord };
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+    }
+
     // Determine which columns to display
-    let display_columns: Vec<(usize, String)> = match &stmt.columns[..] {
+    let display_columns: Vec<(usize, String)> = match columns {
         [parser::SelectColumn::All] => {
             combined_cols.iter().enumerate()
                 .map(|(i, c)| (i, c.name.clone()))
@@ -290,27 +481,27 @@ fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) {
             cols.iter().filter_map(|col| {
                 match col {
                     parser::SelectColumn::Column(name) => {
-                        combined_cols.iter().position(|c| c.name == *name)
+                        resolve_column_index(col, combined_cols)
                             .map(|idx| (idx, name.clone()))
                     }
-                    parser::SelectColumn::QualifiedColumn(table, name) => {
-                        combined_cols.iter().position(|c| c.table == *table && c.name == *name)
+                    parser::SelectColumn::QualifiedColumn(_, name) => {
+                        resolve_column_index(col, combined_cols)
                             .map(|idx| (idx, name.clone()))
                     }
-                    parser::SelectColumn::All => None,
+                    parser::SelectColumn::All | parser::SelectColumn::Aggregate(_, _) => None,
                 }
             }).collect()
         }
     };
 
-    if filtered_rows.is_empty() {
+    if rows.is_empty() {
         println!("(0 rows)");
         return;
     }
 
     // Calculate column widths
     let mut widths: Vec<usize> = display_columns.iter().map(|(_, name)| name.len()).collect();
-    for row in &filtered_rows {
+    for row in &rows {
         for (i, (col_idx, _)) in display_columns.iter().enumerate() {
             let val_len = format_value(&row[*col_idx]).len();
             if val_len > widths[i] {
@@ -331,7 +522,7 @@ fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) {
     println!("{}", sep.join("-+-"));
 
     // Print rows
-    for row in &filtered_rows {
+    for row in &rows {
         let values: Vec<String> = display_columns.iter()
             .enumerate()
             .map(|(i, (col_idx, _))| {
@@ -341,7 +532,7 @@ fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) {
         println!("{}", values.join(" | "));
     }
 
-    println!("({} rows)", filtered_rows.len());
+    println!("({} rows)", rows.len());
 }
 
 fn format_value(value: &Value) -> String {

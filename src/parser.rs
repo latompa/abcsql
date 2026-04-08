@@ -128,6 +128,7 @@ pub enum Expression {
     Column(String),
     QualifiedColumn(String, String), // table.column
     Literal(Value),
+    Subquery(Box<SelectStatement>),
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -139,6 +140,7 @@ pub enum Operator {
     GreaterThanOrEqual,
     LessThanOrEqual,
     Like,
+    In,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -307,8 +309,8 @@ pub fn parse_delete(input: &str) -> IResult<&str, SqlStatement> {
     })))
 }
 
-/// Parse SELECT statement
-pub fn parse_select(input: &str) -> IResult<&str, SqlStatement> {
+/// Parse SELECT into a SelectStatement (used by both top-level and subqueries)
+pub fn parse_select_statement(input: &str) -> IResult<&str, SelectStatement> {
     let (input, _) = tag("SELECT")(input)?;
     let (input, _) = multispace1(input)?;
     let (input, distinct) = nom::combinator::opt(nom::sequence::terminated(tag("DISTINCT"), multispace1))(input)?;
@@ -323,17 +325,13 @@ pub fn parse_select(input: &str) -> IResult<&str, SqlStatement> {
     let (input, from) = parse_identifier(input)?;
     let (input, from_alias) = nom::combinator::opt(parse_table_alias)(input)?;
 
-    // Parse JOIN clauses, then WHERE, then ORDER BY
     let (input, joins) = nom::multi::many0(parse_join)(input)?;
     let (input, where_clause) = nom::combinator::opt(parse_where)(input)?;
     let (input, group_by) = parse_group_by_clause(input)?;
     let (input, order_by) = parse_order_by_clause(input)?;
     let (input, limit) = parse_limit_clause(input)?;
 
-    let (input, _) = multispace0(input)?;
-    let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
-
-    Ok((input, SqlStatement::Select(SelectStatement {
+    Ok((input, SelectStatement {
         columns,
         distinct,
         from: from.to_string(),
@@ -343,7 +341,15 @@ pub fn parse_select(input: &str) -> IResult<&str, SqlStatement> {
         group_by,
         order_by,
         limit,
-    })))
+    }))
+}
+
+/// Parse SELECT statement (top-level, consumes optional semicolon)
+pub fn parse_select(input: &str) -> IResult<&str, SqlStatement> {
+    let (input, stmt) = parse_select_statement(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
+    Ok((input, SqlStatement::Select(stmt)))
 }
 
 /// Parse SELECT column: aggregate, *, table.column, or column
@@ -522,15 +528,31 @@ pub fn parse_join(input: &str) -> IResult<&str, JoinClause> {
     }))
 }
 
-/// Parse condition: expression operator expression
+/// Parse condition: expression operator expression, or expression IN (SELECT ...)
 pub fn parse_condition(input: &str) -> IResult<&str, Condition> {
     let (input, _) = multispace0(input)?;
     let (input, left) = parse_expression(input)?;
     let (input, _) = multispace0(input)?;
+
+    // Try parsing IN (SELECT ...) first
+    if let Ok((input, _)) = tag::<&str, &str, nom::error::Error<&str>>("IN")(input) {
+        let (input, _) = multispace0(input)?;
+        let (input, _) = nom_char('(')(input)?;
+        let (input, _) = multispace0(input)?;
+        let (input, subquery) = parse_select_statement(input)?;
+        let (input, _) = multispace0(input)?;
+        let (input, _) = nom_char(')')(input)?;
+        return Ok((input, Condition {
+            left,
+            operator: Operator::In,
+            right: Expression::Subquery(Box::new(subquery)),
+        }));
+    }
+
     let (input, operator) = parse_operator(input)?;
     let (input, _) = multispace0(input)?;
     let (input, right) = parse_expression(input)?;
-    
+
     Ok((input, Condition { left, operator, right }))
 }
 
@@ -1491,6 +1513,51 @@ mod tests {
             SqlStatement::Select(sel) => {
                 let wc = sel.where_clause.unwrap();
                 assert_eq!(wc.condition.operator, Operator::Like);
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_in_subquery() {
+        let sql = "SELECT * FROM users WHERE id IN (SELECT user_id FROM orders);";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                let wc = sel.where_clause.unwrap();
+                assert_eq!(wc.condition.operator, Operator::In);
+                match &wc.condition.left {
+                    Expression::Column(name) => assert_eq!(name, "id"),
+                    _ => panic!("Expected column"),
+                }
+                match &wc.condition.right {
+                    Expression::Subquery(sub) => {
+                        assert_eq!(sub.from, "orders");
+                        assert_eq!(sub.columns.len(), 1);
+                    }
+                    _ => panic!("Expected subquery"),
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_in_subquery_with_where() {
+        let sql = "SELECT * FROM users WHERE id IN (SELECT user_id FROM orders WHERE status = 'active');";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                let wc = sel.where_clause.unwrap();
+                assert_eq!(wc.condition.operator, Operator::In);
+                match &wc.condition.right {
+                    Expression::Subquery(sub) => {
+                        assert!(sub.where_clause.is_some());
+                    }
+                    _ => panic!("Expected subquery"),
+                }
             }
             _ => panic!("Expected Select"),
         }

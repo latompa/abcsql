@@ -232,7 +232,7 @@ fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) {
                     .map(|c| ResultColumn { table: c.table.clone(), name: c.name.clone() })
                     .collect();
 
-                if evaluate_join_condition(&join.on, &candidate, &all_cols) {
+                if evaluate_join_condition(&join.on, &candidate, &all_cols, storage) {
                     new_rows.push(candidate);
                     matched = true;
                 }
@@ -255,7 +255,7 @@ fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) {
                         .chain(join_result_cols.iter())
                         .map(|c| ResultColumn { table: c.table.clone(), name: c.name.clone() })
                         .collect();
-                    evaluate_join_condition(&join.on, &candidate, &all_cols)
+                    evaluate_join_condition(&join.on, &candidate, &all_cols, storage)
                 });
                 if !has_match {
                     let mut row: Vec<Value> = std::iter::repeat(Value::Null).take(left_col_count).collect();
@@ -273,7 +273,7 @@ fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) {
     let filtered_rows: Vec<Vec<Value>> = combined_rows.into_iter()
         .filter(|row| {
             match &stmt.where_clause {
-                Some(wc) => evaluate_join_condition(&wc.condition, row, &combined_cols),
+                Some(wc) => evaluate_join_condition(&wc.condition, row, &combined_cols, storage),
                 None => true,
             }
         })
@@ -663,13 +663,64 @@ fn evaluate_join_condition(
     condition: &parser::Condition,
     row: &[Value],
     cols: &[ResultColumn],
+    storage: &Storage,
 ) -> bool {
+    // Handle IN (subquery) specially
+    if condition.operator == parser::Operator::In {
+        if let parser::Expression::Subquery(subquery) = &condition.right {
+            let left_val = resolve_join_expression(&condition.left, row, cols);
+            if let Some(left) = left_val {
+                let subquery_values = execute_subquery(subquery, storage);
+                return subquery_values.contains(&left);
+            }
+            return false;
+        }
+    }
+
     let left_val = resolve_join_expression(&condition.left, row, cols);
     let right_val = resolve_join_expression(&condition.right, row, cols);
 
     match (&left_val, &right_val) {
         (Some(l), Some(r)) => compare_values(l, &condition.operator, r),
         _ => false,
+    }
+}
+
+/// Execute a subquery and return the first column's values as a list
+fn execute_subquery(stmt: &parser::SelectStatement, storage: &Storage) -> Vec<Value> {
+    let schema = match storage.load_schema(&stmt.from) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let rows = match storage.read_rows(&stmt.from) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+
+    let from_alias = stmt.from_alias.as_deref().unwrap_or(&stmt.from);
+    let combined_cols: Vec<ResultColumn> = schema.columns.iter()
+        .map(|c| ResultColumn { table: from_alias.to_string(), name: c.name.clone() })
+        .collect();
+
+    // Filter by WHERE
+    let filtered: Vec<Vec<Value>> = rows.into_iter()
+        .filter(|row| {
+            match &stmt.where_clause {
+                Some(wc) => evaluate_join_condition(&wc.condition, row, &combined_cols, storage),
+                None => true,
+            }
+        })
+        .collect();
+
+    // Extract the first selected column's values
+    let col_idx = match &stmt.columns[0] {
+        parser::SelectColumn::All => Some(0),
+        other => resolve_column_index(other, &combined_cols),
+    };
+
+    match col_idx {
+        Some(idx) => filtered.iter().map(|row| row[idx].clone()).collect(),
+        None => Vec::new(),
     }
 }
 
@@ -690,6 +741,7 @@ fn resolve_join_expression(
                 .position(|c| c.table == *table && c.name == *col)
                 .map(|idx| row[idx].clone())
         }
+        parser::Expression::Subquery(_) => None,
     }
 }
 
@@ -702,7 +754,7 @@ fn compare_values(left: &Value, op: &parser::Operator, right: &Value) -> bool {
             parser::Operator::LessThan => l < r,
             parser::Operator::GreaterThanOrEqual => l >= r,
             parser::Operator::LessThanOrEqual => l <= r,
-            parser::Operator::Like => false,
+            parser::Operator::Like | parser::Operator::In => false,
         },
         (Value::String(l), Value::String(r)) => match op {
             parser::Operator::Like => like_match(l, r),
@@ -712,6 +764,7 @@ fn compare_values(left: &Value, op: &parser::Operator, right: &Value) -> bool {
             parser::Operator::LessThan => l < r,
             parser::Operator::GreaterThanOrEqual => l >= r,
             parser::Operator::LessThanOrEqual => l <= r,
+            parser::Operator::In => false,
         },
         (Value::Null, Value::Null) => match op {
             parser::Operator::Equals => true,

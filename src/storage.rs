@@ -417,6 +417,7 @@ fn resolve_expression(expr: &Expression, row: &[Value], schema: &[ColumnDefiniti
                 .position(|c| c.name == *col)
                 .map(|idx| row[idx].clone())
         }
+        Expression::Subquery(_) => None,
     }
 }
 
@@ -430,7 +431,7 @@ fn compare_values(left: &Value, op: &Operator, right: &Value) -> bool {
             Operator::LessThan => l < r,
             Operator::GreaterThanOrEqual => l >= r,
             Operator::LessThanOrEqual => l <= r,
-            Operator::Like => false,
+            Operator::Like | Operator::In => false,
         },
         (Value::String(l), Value::String(r)) => match op {
             Operator::Like => like_match(l, r),
@@ -440,6 +441,7 @@ fn compare_values(left: &Value, op: &Operator, right: &Value) -> bool {
             Operator::LessThan => l < r,
             Operator::GreaterThanOrEqual => l >= r,
             Operator::LessThanOrEqual => l <= r,
+            Operator::In => false,
         },
         (Value::Null, Value::Null) => match op {
             Operator::Equals => true,

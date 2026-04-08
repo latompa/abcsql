@@ -15,7 +15,7 @@
 - [x] DISTINCT keyword
 - [x] LIKE operator for string matching
 - [ ] Arithmetic operators in expressions
-- [ ] Subqueries
+- [x] Subqueries (WHERE ... IN (SELECT ...))
 
 ## Data Types
 

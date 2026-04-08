@@ -153,6 +153,7 @@ fn resolve_expr(expr: &parser::Expression, row: &[Value], cols: &[(String, Strin
         parser::Expression::QualifiedColumn(table, col) => {
             cols.iter().position(|c| c.0 == *table && c.1 == *col).map(|i| row[i].clone())
         }
+        parser::Expression::Subquery(_) => None,
     }
 }
 
@@ -165,7 +166,7 @@ fn compare(left: &Value, op: &parser::Operator, right: &Value) -> bool {
             parser::Operator::LessThan => l < r,
             parser::Operator::GreaterThanOrEqual => l >= r,
             parser::Operator::LessThanOrEqual => l <= r,
-            parser::Operator::Like => false,
+            parser::Operator::Like | parser::Operator::In => false,
         },
         (Value::String(l), Value::String(r)) => match op {
             parser::Operator::Like => like_match(l, r),
@@ -175,6 +176,7 @@ fn compare(left: &Value, op: &parser::Operator, right: &Value) -> bool {
             parser::Operator::LessThan => l < r,
             parser::Operator::GreaterThanOrEqual => l >= r,
             parser::Operator::LessThanOrEqual => l <= r,
+            parser::Operator::In => false,
         },
         _ => false,
     }

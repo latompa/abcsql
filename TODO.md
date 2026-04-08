@@ -13,7 +13,7 @@
 - [x] GROUP BY clause
 - [x] Aggregate functions (COUNT, SUM, AVG, MIN, MAX)
 - [x] DISTINCT keyword
-- [ ] LIKE operator for string matching
+- [x] LIKE operator for string matching
 - [ ] Arithmetic operators in expressions
 - [ ] Subqueries
 

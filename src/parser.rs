@@ -138,6 +138,7 @@ pub enum Operator {
     LessThan,
     GreaterThanOrEqual,
     LessThanOrEqual,
+    Like,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -562,15 +563,16 @@ fn parse_expression_literal(input: &str) -> IResult<&str, Expression> {
     Ok((input, Expression::Literal(value)))
 }
 
-/// Parse operator: =, !=, >, <, >=, <=
+/// Parse operator: =, !=, >, <, >=, <=, LIKE
 fn parse_operator(input: &str) -> IResult<&str, Operator> {
     nom::branch::alt((
-        nom::combinator::map(tag("="), |_| Operator::Equals),
         nom::combinator::map(tag("!="), |_| Operator::NotEquals),
         nom::combinator::map(tag(">="), |_| Operator::GreaterThanOrEqual),
         nom::combinator::map(tag("<="), |_| Operator::LessThanOrEqual),
+        nom::combinator::map(tag("="), |_| Operator::Equals),
         nom::combinator::map(tag(">"), |_| Operator::GreaterThan),
         nom::combinator::map(tag("<"), |_| Operator::LessThan),
+        nom::combinator::map(tag("LIKE"), |_| Operator::Like),
     ))(input)
 }
 
@@ -1457,6 +1459,38 @@ mod tests {
         match stmt {
             SqlStatement::Select(sel) => {
                 assert!(!sel.distinct);
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_like_operator() {
+        let sql = "SELECT * FROM users WHERE name LIKE 'A%';";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                let wc = sel.where_clause.unwrap();
+                assert_eq!(wc.condition.operator, Operator::Like);
+                match &wc.condition.right {
+                    Expression::Literal(Value::String(s)) => assert_eq!(s, "A%"),
+                    _ => panic!("Expected string literal"),
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_like_underscore() {
+        let sql = "SELECT * FROM users WHERE name LIKE '_ob';";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                let wc = sel.where_clause.unwrap();
+                assert_eq!(wc.condition.operator, Operator::Like);
             }
             _ => panic!("Expected Select"),
         }

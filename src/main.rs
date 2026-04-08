@@ -702,8 +702,10 @@ fn compare_values(left: &Value, op: &parser::Operator, right: &Value) -> bool {
             parser::Operator::LessThan => l < r,
             parser::Operator::GreaterThanOrEqual => l >= r,
             parser::Operator::LessThanOrEqual => l <= r,
+            parser::Operator::Like => false,
         },
         (Value::String(l), Value::String(r)) => match op {
+            parser::Operator::Like => like_match(l, r),
             parser::Operator::Equals => l == r,
             parser::Operator::NotEquals => l != r,
             parser::Operator::GreaterThan => l > r,
@@ -717,5 +719,36 @@ fn compare_values(left: &Value, op: &parser::Operator, right: &Value) -> bool {
             _ => false,
         },
         _ => false,
+    }
+}
+
+/// SQL LIKE pattern matching: % matches any sequence, _ matches any single char
+fn like_match(value: &str, pattern: &str) -> bool {
+    let v: Vec<char> = value.chars().collect();
+    let p: Vec<char> = pattern.chars().collect();
+    like_match_recursive(&v, &p, 0, 0)
+}
+
+fn like_match_recursive(v: &[char], p: &[char], vi: usize, pi: usize) -> bool {
+    if pi == p.len() {
+        return vi == v.len();
+    }
+    match p[pi] {
+        '%' => {
+            // % matches zero or more characters
+            for i in vi..=v.len() {
+                if like_match_recursive(v, p, i, pi + 1) {
+                    return true;
+                }
+            }
+            false
+        }
+        '_' => {
+            // _ matches exactly one character
+            vi < v.len() && like_match_recursive(v, p, vi + 1, pi + 1)
+        }
+        c => {
+            vi < v.len() && v[vi] == c && like_match_recursive(v, p, vi + 1, pi + 1)
+        }
     }
 }

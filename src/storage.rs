@@ -430,8 +430,10 @@ fn compare_values(left: &Value, op: &Operator, right: &Value) -> bool {
             Operator::LessThan => l < r,
             Operator::GreaterThanOrEqual => l >= r,
             Operator::LessThanOrEqual => l <= r,
+            Operator::Like => false,
         },
         (Value::String(l), Value::String(r)) => match op {
+            Operator::Like => like_match(l, r),
             Operator::Equals => l == r,
             Operator::NotEquals => l != r,
             Operator::GreaterThan => l > r,
@@ -445,6 +447,35 @@ fn compare_values(left: &Value, op: &Operator, right: &Value) -> bool {
             _ => false,
         },
         _ => false, // Type mismatch or NULL comparison
+    }
+}
+
+/// SQL LIKE pattern matching: % matches any sequence, _ matches any single char
+fn like_match(value: &str, pattern: &str) -> bool {
+    let v: Vec<char> = value.chars().collect();
+    let p: Vec<char> = pattern.chars().collect();
+    like_match_recursive(&v, &p, 0, 0)
+}
+
+fn like_match_recursive(v: &[char], p: &[char], vi: usize, pi: usize) -> bool {
+    if pi == p.len() {
+        return vi == v.len();
+    }
+    match p[pi] {
+        '%' => {
+            for i in vi..=v.len() {
+                if like_match_recursive(v, p, i, pi + 1) {
+                    return true;
+                }
+            }
+            false
+        }
+        '_' => {
+            vi < v.len() && like_match_recursive(v, p, vi + 1, pi + 1)
+        }
+        c => {
+            vi < v.len() && v[vi] == c && like_match_recursive(v, p, vi + 1, pi + 1)
+        }
     }
 }
 

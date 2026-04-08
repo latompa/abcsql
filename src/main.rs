@@ -668,7 +668,7 @@ fn evaluate_join_condition(
     // Handle IN (subquery) specially
     if condition.operator == parser::Operator::In {
         if let parser::Expression::Subquery(subquery) = &condition.right {
-            let left_val = resolve_join_expression(&condition.left, row, cols);
+            let left_val = resolve_join_expression(&condition.left, row, cols, storage);
             if let Some(left) = left_val {
                 let subquery_values = execute_subquery(subquery, storage);
                 return subquery_values.contains(&left);
@@ -677,8 +677,8 @@ fn evaluate_join_condition(
         }
     }
 
-    let left_val = resolve_join_expression(&condition.left, row, cols);
-    let right_val = resolve_join_expression(&condition.right, row, cols);
+    let left_val = resolve_join_expression(&condition.left, row, cols, storage);
+    let right_val = resolve_join_expression(&condition.right, row, cols, storage);
 
     match (&left_val, &right_val) {
         (Some(l), Some(r)) => compare_values(l, &condition.operator, r),
@@ -712,6 +712,24 @@ fn execute_subquery(stmt: &parser::SelectStatement, storage: &Storage) -> Vec<Va
         })
         .collect();
 
+    // Handle aggregate subqueries (e.g. SELECT MAX(id) FROM ...)
+    let has_aggregates = stmt.columns.iter().any(|c| matches!(c, parser::SelectColumn::Aggregate(_, _)));
+    if has_aggregates {
+        // Compute aggregate and parse the result string back into a Value
+        if let parser::SelectColumn::Aggregate(func, inner) = &stmt.columns[0] {
+            let result_str = compute_aggregate(func, inner, &filtered, &combined_cols);
+            if result_str == "NULL" {
+                return vec![Value::Null];
+            }
+            // Try parsing as integer first, then treat as string
+            if let Ok(n) = result_str.parse::<i64>() {
+                return vec![Value::Int(n)];
+            }
+            return vec![Value::String(result_str)];
+        }
+        return Vec::new();
+    }
+
     // Extract the first selected column's values
     let col_idx = match &stmt.columns[0] {
         parser::SelectColumn::All => Some(0),
@@ -728,6 +746,7 @@ fn resolve_join_expression(
     expr: &parser::Expression,
     row: &[Value],
     cols: &[ResultColumn],
+    storage: &Storage,
 ) -> Option<Value> {
     match expr {
         parser::Expression::Literal(v) => Some(v.clone()),
@@ -741,7 +760,11 @@ fn resolve_join_expression(
                 .position(|c| c.table == *table && c.name == *col)
                 .map(|idx| row[idx].clone())
         }
-        parser::Expression::Subquery(_) => None,
+        parser::Expression::Subquery(subquery) => {
+            // Scalar subquery: execute and return first value
+            let values = execute_subquery(subquery, storage);
+            values.into_iter().next()
+        }
     }
 }
 

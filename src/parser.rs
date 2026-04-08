@@ -556,13 +556,24 @@ pub fn parse_condition(input: &str) -> IResult<&str, Condition> {
     Ok((input, Condition { left, operator, right }))
 }
 
-/// Parse expression: column or table.column or literal
+/// Parse expression: subquery, column, table.column, or literal
 fn parse_expression(input: &str) -> IResult<&str, Expression> {
     nom::branch::alt((
+        parse_expression_subquery,
         parse_expression_qualified_column,
         parse_expression_simple_column,
         parse_expression_literal,
     ))(input)
+}
+
+/// Parse (SELECT ...) as a scalar subquery expression
+fn parse_expression_subquery(input: &str) -> IResult<&str, Expression> {
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, stmt) = parse_select_statement(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, Expression::Subquery(Box::new(stmt))))
 }
 
 fn parse_expression_qualified_column(input: &str) -> IResult<&str, Expression> {
@@ -1555,6 +1566,46 @@ mod tests {
                 match &wc.condition.right {
                     Expression::Subquery(sub) => {
                         assert!(sub.where_clause.is_some());
+                    }
+                    _ => panic!("Expected subquery"),
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_scalar_subquery() {
+        let sql = "SELECT * FROM users WHERE id = (SELECT MAX(id) FROM users);";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                let wc = sel.where_clause.unwrap();
+                assert_eq!(wc.condition.operator, Operator::Equals);
+                match &wc.condition.right {
+                    Expression::Subquery(sub) => {
+                        assert_eq!(sub.from, "users");
+                    }
+                    _ => panic!("Expected subquery"),
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_scalar_subquery_gt() {
+        let sql = "SELECT * FROM products WHERE price > (SELECT AVG(price) FROM products);";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                let wc = sel.where_clause.unwrap();
+                assert_eq!(wc.condition.operator, Operator::GreaterThan);
+                match &wc.condition.right {
+                    Expression::Subquery(sub) => {
+                        assert_eq!(sub.from, "products");
                     }
                     _ => panic!("Expected subquery"),
                 }

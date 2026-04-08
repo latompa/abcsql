@@ -66,13 +66,30 @@ pub struct SelectStatement {
     pub ctes: Vec<CteDefinition>,
     pub columns: Vec<SelectColumn>,
     pub distinct: bool,
-    pub from: String,
+    pub from: FromClause,
     pub from_alias: Option<String>,
     pub where_clause: Option<WhereClause>,
     pub joins: Vec<JoinClause>,
     pub group_by: Vec<SelectColumn>,
     pub order_by: Vec<OrderByClause>,
     pub limit: Option<u64>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum FromClause {
+    Table(String),
+    Subquery(Box<SelectStatement>),
+}
+
+impl FromClause {
+    /// Get the table name, or None for subqueries
+    #[allow(dead_code)]
+    pub fn table_name(&self) -> Option<&str> {
+        match self {
+            FromClause::Table(name) => Some(name),
+            FromClause::Subquery(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -87,6 +104,7 @@ pub enum SelectColumn {
     Column(String),
     QualifiedColumn(String, String), // table.column
     Aggregate(AggregateFunc, Box<SelectColumn>), // COUNT(*), SUM(col), etc.
+    Alias(Box<SelectColumn>, String), // expr AS name
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -332,8 +350,23 @@ pub fn parse_select_statement(input: &str) -> IResult<&str, SelectStatement> {
     let (input, _) = multispace1(input)?;
     let (input, _) = tag("FROM")(input)?;
     let (input, _) = multispace1(input)?;
-    let (input, from) = parse_identifier(input)?;
-    let (input, from_alias) = nom::combinator::opt(parse_table_alias)(input)?;
+
+    // FROM can be a table name or (SELECT ...) AS alias
+    let (input, from, from_alias) = if let Ok((input, _)) = nom_char::<&str, nom::error::Error<&str>>('(')(input) {
+        let (input, _) = multispace0(input)?;
+        let (input, subquery) = parse_select_statement(input)?;
+        let (input, _) = multispace0(input)?;
+        let (input, _) = nom_char(')')(input)?;
+        let (input, _) = multispace1(input)?;
+        let (input, _) = tag("AS")(input)?;
+        let (input, _) = multispace1(input)?;
+        let (input, alias) = parse_identifier(input)?;
+        (input, FromClause::Subquery(Box::new(subquery)), Some(alias.to_string()))
+    } else {
+        let (input, table) = parse_identifier(input)?;
+        let (input, from_alias) = nom::combinator::opt(parse_table_alias)(input)?;
+        (input, FromClause::Table(table.to_string()), from_alias)
+    };
 
     let (input, joins) = nom::multi::many0(parse_join)(input)?;
     let (input, where_clause) = nom::combinator::opt(parse_where)(input)?;
@@ -345,7 +378,7 @@ pub fn parse_select_statement(input: &str) -> IResult<&str, SelectStatement> {
         ctes: Vec::new(),
         columns,
         distinct,
-        from: from.to_string(),
+        from,
         from_alias,
         where_clause,
         joins,
@@ -401,6 +434,14 @@ fn parse_select_column(input: &str) -> IResult<&str, SelectColumn> {
         parse_qualified_column,
         parse_simple_column,
     ))(input)?;
+    // Check for optional AS alias
+    if let Ok((input, _)) = multispace1::<&str, nom::error::Error<&str>>(input) {
+        if let Ok((input, _)) = tag::<&str, &str, nom::error::Error<&str>>("AS")(input) {
+            let (input, _) = multispace1(input)?;
+            let (input, alias) = parse_identifier(input)?;
+            return Ok((input, SelectColumn::Alias(Box::new(col), alias.to_string())));
+        }
+    }
     Ok((input, col))
 }
 
@@ -779,7 +820,7 @@ mod tests {
         
         match stmt {
             SqlStatement::Select(sel) => {
-                assert_eq!(sel.from, "users");
+                assert_eq!(sel.from, FromClause::Table("users".to_string()));
                 assert_eq!(sel.columns.len(), 1);
             }
             _ => panic!("Expected Select"),
@@ -1094,7 +1135,7 @@ mod tests {
         
         match stmt {
             SqlStatement::Select(sel) => {
-                assert_eq!(sel.from, "users");
+                assert_eq!(sel.from, FromClause::Table("users".to_string()));
             }
             _ => panic!("Expected Select"),
         }
@@ -1634,7 +1675,7 @@ mod tests {
                 }
                 match &wc.condition.right {
                     Expression::Subquery(sub) => {
-                        assert_eq!(sub.from, "orders");
+                        assert_eq!(sub.from, FromClause::Table("orders".to_string()));
                         assert_eq!(sub.columns.len(), 1);
                     }
                     _ => panic!("Expected subquery"),
@@ -1675,7 +1716,7 @@ mod tests {
                 assert_eq!(wc.condition.operator, Operator::Equals);
                 match &wc.condition.right {
                     Expression::Subquery(sub) => {
-                        assert_eq!(sub.from, "users");
+                        assert_eq!(sub.from, FromClause::Table("users".to_string()));
                     }
                     _ => panic!("Expected subquery"),
                 }
@@ -1695,7 +1736,7 @@ mod tests {
                 assert_eq!(wc.condition.operator, Operator::GreaterThan);
                 match &wc.condition.right {
                     Expression::Subquery(sub) => {
-                        assert_eq!(sub.from, "products");
+                        assert_eq!(sub.from, FromClause::Table("products".to_string()));
                     }
                     _ => panic!("Expected subquery"),
                 }
@@ -1729,7 +1770,7 @@ mod tests {
                 assert_eq!(wc.condition.operator, Operator::Exists);
                 match &wc.condition.right {
                     Expression::Subquery(sub) => {
-                        assert_eq!(sub.from, "orders");
+                        assert_eq!(sub.from, FromClause::Table("orders".to_string()));
                     }
                     _ => panic!("Expected subquery"),
                 }
@@ -1761,8 +1802,8 @@ mod tests {
             SqlStatement::Select(sel) => {
                 assert_eq!(sel.ctes.len(), 1);
                 assert_eq!(sel.ctes[0].name, "active");
-                assert_eq!(sel.ctes[0].query.from, "users");
-                assert_eq!(sel.from, "active");
+                assert_eq!(sel.ctes[0].query.from, FromClause::Table("users".to_string()));
+                assert_eq!(sel.from, FromClause::Table("active".to_string()));
             }
             _ => panic!("Expected Select"),
         }
@@ -1791,6 +1832,82 @@ mod tests {
         match stmt {
             SqlStatement::Select(sel) => {
                 assert!(sel.ctes.is_empty());
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_column_alias() {
+        let sql = "SELECT name AS n FROM users;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                match &sel.columns[0] {
+                    SelectColumn::Alias(inner, alias) => {
+                        assert_eq!(**inner, SelectColumn::Column("name".to_string()));
+                        assert_eq!(alias, "n");
+                    }
+                    _ => panic!("Expected Alias"),
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_aggregate_alias() {
+        let sql = "SELECT COUNT(*) AS cnt FROM users;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                match &sel.columns[0] {
+                    SelectColumn::Alias(inner, alias) => {
+                        assert!(matches!(inner.as_ref(), SelectColumn::Aggregate(AggregateFunc::Count, _)));
+                        assert_eq!(alias, "cnt");
+                    }
+                    _ => panic!("Expected Alias"),
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_from_subquery() {
+        let sql = "SELECT * FROM (SELECT name FROM users) AS t;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                match &sel.from {
+                    FromClause::Subquery(sub) => {
+                        assert_eq!(sub.from, FromClause::Table("users".to_string()));
+                    }
+                    _ => panic!("Expected subquery FROM"),
+                }
+                assert_eq!(sel.from_alias, Some("t".to_string()));
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_from_subquery_with_aggregates() {
+        let sql = "SELECT * FROM (SELECT name, COUNT(*) AS cnt FROM users GROUP BY name) AS counts;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                match &sel.from {
+                    FromClause::Subquery(sub) => {
+                        assert!(!sub.group_by.is_empty());
+                    }
+                    _ => panic!("Expected subquery FROM"),
+                }
+                assert_eq!(sel.from_alias, Some("counts".to_string()));
             }
             _ => panic!("Expected Select"),
         }

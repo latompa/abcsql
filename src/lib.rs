@@ -50,10 +50,11 @@ fn execute_select_to_string(
     stmt: &parser::SelectStatement,
     storage: &Storage,
 ) -> Result<String, String> {
-    let from_schema = storage.load_schema(&stmt.from).map_err(|e| e.to_string())?;
-    let from_rows = storage.read_rows(&stmt.from).map_err(|e| e.to_string())?;
+    let table_name = stmt.from.table_name().ok_or("Subquery FROM not supported here")?;
+    let from_schema = storage.load_schema(table_name).map_err(|e| e.to_string())?;
+    let from_rows = storage.read_rows(table_name).map_err(|e| e.to_string())?;
 
-    let from_alias = stmt.from_alias.as_deref().unwrap_or(&stmt.from);
+    let from_alias = stmt.from_alias.as_deref().unwrap_or(table_name);
     let mut combined_cols: Vec<(String, String)> = from_schema.columns.iter()
         .map(|c| (from_alias.to_string(), c.name.clone()))
         .collect();

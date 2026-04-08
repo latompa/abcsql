@@ -198,21 +198,61 @@ fn load_table(
     Ok((cols, rows))
 }
 
-/// Execute a CTE query and capture its result as columns + rows
+/// Load from a FromClause — handles both table names and subqueries
+fn load_from(
+    from: &parser::FromClause,
+    alias: &str,
+    ctes: &HashMap<String, CteData>,
+    storage: &Storage,
+) -> Result<(Vec<ResultColumn>, Vec<Vec<Value>>), String> {
+    match from {
+        parser::FromClause::Table(name) => load_table(name, ctes, storage),
+        parser::FromClause::Subquery(subquery) => {
+            let cte_data = materialize_cte(subquery, storage, ctes);
+            let cols = cte_data.columns.iter()
+                .map(|c| ResultColumn { table: alias.to_string(), name: c.name.clone() })
+                .collect();
+            Ok((cols, cte_data.rows))
+        }
+    }
+}
+
+/// Get the effective name for a FROM clause (table name or alias)
+fn from_name(from: &parser::FromClause, alias: &Option<String>) -> String {
+    match (from, alias) {
+        (_, Some(a)) => a.clone(),
+        (parser::FromClause::Table(name), None) => name.clone(),
+        (parser::FromClause::Subquery(_), None) => "_subquery".to_string(),
+    }
+}
+
+/// Get the output column name for a SelectColumn, respecting aliases
+fn select_column_name(col: &parser::SelectColumn) -> String {
+    match col {
+        parser::SelectColumn::Alias(_, alias) => alias.clone(),
+        parser::SelectColumn::Column(name) => name.clone(),
+        parser::SelectColumn::QualifiedColumn(_, name) => name.clone(),
+        parser::SelectColumn::Aggregate(_, _) => column_header(col),
+        parser::SelectColumn::All => "*".to_string(),
+    }
+}
+
+/// Execute a CTE or derived table query and capture its result as columns + rows
 fn materialize_cte(
     query: &parser::SelectStatement,
     storage: &Storage,
     existing_ctes: &HashMap<String, CteData>,
 ) -> CteData {
+    let effective_name = from_name(&query.from, &query.from_alias);
+
     // Load FROM table
-    let (from_cols, from_rows) = match load_table(&query.from, existing_ctes, storage) {
+    let (from_cols, from_rows) = match load_from(&query.from, &effective_name, existing_ctes, storage) {
         Ok(r) => r,
         Err(_) => return CteData { columns: Vec::new(), rows: Vec::new() },
     };
 
-    let from_alias = query.from_alias.as_deref().unwrap_or(&query.from);
     let combined_cols: Vec<ResultColumn> = from_cols.into_iter()
-        .map(|c| ResultColumn { table: from_alias.to_string(), name: c.name })
+        .map(|c| ResultColumn { table: effective_name.clone(), name: c.name })
         .collect();
 
     // Filter by WHERE
@@ -225,7 +265,17 @@ fn materialize_cte(
         })
         .collect();
 
-    // Determine output columns
+    // Check for aggregates / GROUP BY
+    let has_aggregates = query.columns.iter().any(|c| {
+        matches!(c, parser::SelectColumn::Aggregate(_, _))
+            || matches!(c, parser::SelectColumn::Alias(inner, _) if matches!(inner.as_ref(), parser::SelectColumn::Aggregate(_, _)))
+    });
+
+    if has_aggregates || !query.group_by.is_empty() {
+        return materialize_aggregate_cte(&query.columns, &filtered, &combined_cols, &query.group_by);
+    }
+
+    // Determine output columns with alias support
     let result_cols: Vec<ResultColumn> = match &query.columns[..] {
         [parser::SelectColumn::All] => {
             combined_cols.iter()
@@ -234,10 +284,14 @@ fn materialize_cte(
         }
         cols => {
             cols.iter().filter_map(|col| {
-                match col {
-                    parser::SelectColumn::Column(name) => Some(ResultColumn { table: String::new(), name: name.clone() }),
-                    parser::SelectColumn::QualifiedColumn(_, name) => Some(ResultColumn { table: String::new(), name: name.clone() }),
-                    _ => None,
+                let name = select_column_name(col);
+                let inner = match col {
+                    parser::SelectColumn::Alias(inner, _) => inner.as_ref(),
+                    other => other,
+                };
+                match inner {
+                    parser::SelectColumn::All => None,
+                    _ => Some(ResultColumn { table: String::new(), name }),
                 }
             }).collect()
         }
@@ -247,13 +301,89 @@ fn materialize_cte(
     let display_indices: Vec<usize> = match &query.columns[..] {
         [parser::SelectColumn::All] => (0..combined_cols.len()).collect(),
         cols => {
-            cols.iter().filter_map(|col| resolve_column_index(col, &combined_cols)).collect()
+            cols.iter().filter_map(|col| {
+                let inner = match col {
+                    parser::SelectColumn::Alias(inner, _) => inner.as_ref(),
+                    other => other,
+                };
+                resolve_column_index(inner, &combined_cols)
+            }).collect()
         }
     };
 
-    let result_rows: Vec<Vec<Value>> = filtered.iter()
+    let mut result_rows: Vec<Vec<Value>> = filtered.iter()
         .map(|row| display_indices.iter().map(|&i| row[i].clone()).collect())
         .collect();
+
+    // Apply DISTINCT
+    if query.distinct {
+        let mut seen: Vec<Vec<Value>> = Vec::new();
+        result_rows.retain(|row| {
+            if seen.contains(row) {
+                false
+            } else {
+                seen.push(row.clone());
+                true
+            }
+        });
+    }
+
+    CteData { columns: result_cols, rows: result_rows }
+}
+
+/// Materialize an aggregate CTE (GROUP BY or aggregate functions)
+fn materialize_aggregate_cte(
+    columns: &[parser::SelectColumn],
+    rows: &[Vec<Value>],
+    combined_cols: &[ResultColumn],
+    group_by: &[parser::SelectColumn],
+) -> CteData {
+    let group_indices: Vec<usize> = group_by.iter()
+        .filter_map(|c| resolve_column_index(c, combined_cols))
+        .collect();
+
+    // Group rows
+    let mut group_keys: Vec<Vec<Value>> = Vec::new();
+    let mut groups: Vec<Vec<&Vec<Value>>> = Vec::new();
+    for row in rows {
+        let key: Vec<Value> = group_indices.iter().map(|&i| row[i].clone()).collect();
+        if let Some(pos) = group_keys.iter().position(|k| k == &key) {
+            groups[pos].push(row);
+        } else {
+            group_keys.push(key);
+            groups.push(vec![row]);
+        }
+    }
+    if group_by.is_empty() {
+        groups = vec![rows.iter().collect()];
+    }
+
+    let active_columns: Vec<&parser::SelectColumn> = columns.iter()
+        .filter(|c| !matches!(c, parser::SelectColumn::All))
+        .collect();
+
+    let result_cols: Vec<ResultColumn> = active_columns.iter()
+        .map(|col| ResultColumn { table: String::new(), name: select_column_name(col) })
+        .collect();
+
+    let result_rows: Vec<Vec<Value>> = groups.iter().map(|group| {
+        let owned: Vec<Vec<Value>> = group.iter().map(|r| (*r).clone()).collect();
+        active_columns.iter().map(|col| {
+            let inner = match col {
+                parser::SelectColumn::Alias(inner, _) => inner.as_ref(),
+                other => *other,
+            };
+            let val_str = compute_column_value(inner, &owned, combined_cols);
+            // Parse back to Value
+            if val_str == "NULL" {
+                Value::Null
+            } else if let Ok(n) = val_str.parse::<i64>() {
+                Value::Int(n)
+            } else {
+                Value::String(val_str)
+            }
+        }).collect()
+    }).collect();
 
     CteData { columns: result_cols, rows: result_rows }
 }
@@ -266,8 +396,9 @@ fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) {
         cte_map.insert(cte.name.clone(), cte_data);
     }
 
-    // Load the FROM table (check CTEs first)
-    let (from_cols, from_rows) = match load_table(&stmt.from, &cte_map, storage) {
+    // Load the FROM table (check CTEs first, handle subqueries)
+    let effective_from = from_name(&stmt.from, &stmt.from_alias);
+    let (from_cols, from_rows) = match load_from(&stmt.from, &effective_from, &cte_map, storage) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -276,7 +407,7 @@ fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) {
     };
 
     // Build the combined column list and row set, starting with the FROM table
-    let from_alias = stmt.from_alias.as_deref().unwrap_or(&stmt.from);
+    let from_alias = &effective_from;
     let mut combined_cols: Vec<ResultColumn> = from_cols.into_iter()
         .map(|c| ResultColumn { table: from_alias.to_string(), name: c.name })
         .collect();
@@ -379,6 +510,7 @@ fn resolve_column_index(col: &parser::SelectColumn, combined_cols: &[ResultColum
         parser::SelectColumn::QualifiedColumn(table, name) => {
             combined_cols.iter().position(|c| c.table == *table && c.name == *name)
         }
+        parser::SelectColumn::Alias(inner, _) => resolve_column_index(inner, combined_cols),
         _ => None,
     }
 }
@@ -404,6 +536,7 @@ fn column_header(col: &parser::SelectColumn) -> String {
         }
         parser::SelectColumn::Column(name) => name.clone(),
         parser::SelectColumn::QualifiedColumn(_, name) => name.clone(),
+        parser::SelectColumn::Alias(_, alias) => alias.clone(),
         parser::SelectColumn::All => "*".to_string(),
     }
 }
@@ -417,6 +550,9 @@ fn compute_column_value(
     match col {
         parser::SelectColumn::Aggregate(func, inner) => {
             compute_aggregate(func, inner, group, combined_cols)
+        }
+        parser::SelectColumn::Alias(inner, _) => {
+            compute_column_value(inner, group, combined_cols)
         }
         parser::SelectColumn::Column(_) | parser::SelectColumn::QualifiedColumn(_, _) => {
             if let Some(idx) = resolve_column_index(col, combined_cols) {
@@ -665,6 +801,10 @@ fn execute_normal_select(
                         resolve_column_index(col, combined_cols)
                             .map(|idx| (idx, name.clone()))
                     }
+                    parser::SelectColumn::Alias(inner, alias) => {
+                        resolve_column_index(inner, combined_cols)
+                            .map(|idx| (idx, alias.clone()))
+                    }
                     parser::SelectColumn::All | parser::SelectColumn::Aggregate(_, _) => None,
                 }
             }).collect()
@@ -779,18 +919,15 @@ fn evaluate_join_condition(
 
 /// Execute a subquery and return the first column's values as a list
 fn execute_subquery(stmt: &parser::SelectStatement, storage: &Storage) -> Vec<Value> {
-    let schema = match storage.load_schema(&stmt.from) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    let rows = match storage.read_rows(&stmt.from) {
+    let effective_name = from_name(&stmt.from, &stmt.from_alias);
+    let empty_ctes = HashMap::new();
+    let (from_cols, rows) = match load_from(&stmt.from, &effective_name, &empty_ctes, storage) {
         Ok(r) => r,
         Err(_) => return Vec::new(),
     };
 
-    let from_alias = stmt.from_alias.as_deref().unwrap_or(&stmt.from);
-    let combined_cols: Vec<ResultColumn> = schema.columns.iter()
-        .map(|c| ResultColumn { table: from_alias.to_string(), name: c.name.clone() })
+    let combined_cols: Vec<ResultColumn> = from_cols.into_iter()
+        .map(|c| ResultColumn { table: effective_name.clone(), name: c.name })
         .collect();
 
     // Filter by WHERE

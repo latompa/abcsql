@@ -665,13 +665,24 @@ fn evaluate_join_condition(
     cols: &[ResultColumn],
     storage: &Storage,
 ) -> bool {
-    // Handle IN (subquery) specially
-    if condition.operator == parser::Operator::In {
+    // Handle EXISTS / NOT EXISTS
+    if condition.operator == parser::Operator::Exists || condition.operator == parser::Operator::NotExists {
+        if let parser::Expression::Subquery(subquery) = &condition.right {
+            let subquery_values = execute_subquery(subquery, storage);
+            let exists = !subquery_values.is_empty();
+            return if condition.operator == parser::Operator::NotExists { !exists } else { exists };
+        }
+        return false;
+    }
+
+    // Handle IN / NOT IN (subquery) specially
+    if condition.operator == parser::Operator::In || condition.operator == parser::Operator::NotIn {
         if let parser::Expression::Subquery(subquery) = &condition.right {
             let left_val = resolve_join_expression(&condition.left, row, cols, storage);
             if let Some(left) = left_val {
                 let subquery_values = execute_subquery(subquery, storage);
-                return subquery_values.contains(&left);
+                let contains = subquery_values.contains(&left);
+                return if condition.operator == parser::Operator::NotIn { !contains } else { contains };
             }
             return false;
         }
@@ -777,7 +788,8 @@ fn compare_values(left: &Value, op: &parser::Operator, right: &Value) -> bool {
             parser::Operator::LessThan => l < r,
             parser::Operator::GreaterThanOrEqual => l >= r,
             parser::Operator::LessThanOrEqual => l <= r,
-            parser::Operator::Like | parser::Operator::In => false,
+            parser::Operator::Like | parser::Operator::In | parser::Operator::NotIn
+            | parser::Operator::Exists | parser::Operator::NotExists => false,
         },
         (Value::String(l), Value::String(r)) => match op {
             parser::Operator::Like => like_match(l, r),
@@ -787,7 +799,8 @@ fn compare_values(left: &Value, op: &parser::Operator, right: &Value) -> bool {
             parser::Operator::LessThan => l < r,
             parser::Operator::GreaterThanOrEqual => l >= r,
             parser::Operator::LessThanOrEqual => l <= r,
-            parser::Operator::In => false,
+            parser::Operator::In | parser::Operator::NotIn
+            | parser::Operator::Exists | parser::Operator::NotExists => false,
         },
         (Value::Null, Value::Null) => match op {
             parser::Operator::Equals => true,

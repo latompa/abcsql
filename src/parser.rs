@@ -141,6 +141,9 @@ pub enum Operator {
     LessThanOrEqual,
     Like,
     In,
+    NotIn,
+    Exists,
+    NotExists,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -528,13 +531,63 @@ pub fn parse_join(input: &str) -> IResult<&str, JoinClause> {
     }))
 }
 
-/// Parse condition: expression operator expression, or expression IN (SELECT ...)
+/// Parse condition: EXISTS/NOT EXISTS, expression IN/NOT IN, or expression op expression
 pub fn parse_condition(input: &str) -> IResult<&str, Condition> {
     let (input, _) = multispace0(input)?;
+
+    // Try NOT EXISTS (SELECT ...)
+    if let Ok((input, _)) = nom::sequence::pair(
+        tag::<&str, &str, nom::error::Error<&str>>("NOT"),
+        nom::sequence::preceded(multispace1::<&str, nom::error::Error<&str>>, tag("EXISTS")),
+    )(input) {
+        let (input, _) = multispace0(input)?;
+        let (input, _) = nom_char('(')(input)?;
+        let (input, _) = multispace0(input)?;
+        let (input, subquery) = parse_select_statement(input)?;
+        let (input, _) = multispace0(input)?;
+        let (input, _) = nom_char(')')(input)?;
+        return Ok((input, Condition {
+            left: Expression::Literal(Value::Null),
+            operator: Operator::NotExists,
+            right: Expression::Subquery(Box::new(subquery)),
+        }));
+    }
+
+    // Try EXISTS (SELECT ...)
+    if let Ok((input, _)) = tag::<&str, &str, nom::error::Error<&str>>("EXISTS")(input) {
+        let (input, _) = multispace0(input)?;
+        let (input, _) = nom_char('(')(input)?;
+        let (input, _) = multispace0(input)?;
+        let (input, subquery) = parse_select_statement(input)?;
+        let (input, _) = multispace0(input)?;
+        let (input, _) = nom_char(')')(input)?;
+        return Ok((input, Condition {
+            left: Expression::Literal(Value::Null),
+            operator: Operator::Exists,
+            right: Expression::Subquery(Box::new(subquery)),
+        }));
+    }
+
     let (input, left) = parse_expression(input)?;
     let (input, _) = multispace0(input)?;
 
-    // Try parsing IN (SELECT ...) first
+    // Try parsing NOT IN (SELECT ...) or IN (SELECT ...)
+    if let Ok((input, _)) = nom::sequence::pair(
+        tag::<&str, &str, nom::error::Error<&str>>("NOT"),
+        nom::sequence::preceded(multispace1::<&str, nom::error::Error<&str>>, tag("IN")),
+    )(input) {
+        let (input, _) = multispace0(input)?;
+        let (input, _) = nom_char('(')(input)?;
+        let (input, _) = multispace0(input)?;
+        let (input, subquery) = parse_select_statement(input)?;
+        let (input, _) = multispace0(input)?;
+        let (input, _) = nom_char(')')(input)?;
+        return Ok((input, Condition {
+            left,
+            operator: Operator::NotIn,
+            right: Expression::Subquery(Box::new(subquery)),
+        }));
+    }
     if let Ok((input, _)) = tag::<&str, &str, nom::error::Error<&str>>("IN")(input) {
         let (input, _) = multispace0(input)?;
         let (input, _) = nom_char('(')(input)?;
@@ -1609,6 +1662,54 @@ mod tests {
                     }
                     _ => panic!("Expected subquery"),
                 }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_not_in_subquery() {
+        let sql = "SELECT * FROM users WHERE id NOT IN (SELECT user_id FROM orders);";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                let wc = sel.where_clause.unwrap();
+                assert_eq!(wc.condition.operator, Operator::NotIn);
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_exists() {
+        let sql = "SELECT * FROM users WHERE EXISTS (SELECT id FROM orders WHERE user_id = 1);";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                let wc = sel.where_clause.unwrap();
+                assert_eq!(wc.condition.operator, Operator::Exists);
+                match &wc.condition.right {
+                    Expression::Subquery(sub) => {
+                        assert_eq!(sub.from, "orders");
+                    }
+                    _ => panic!("Expected subquery"),
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_not_exists() {
+        let sql = "SELECT * FROM users WHERE NOT EXISTS (SELECT id FROM orders WHERE user_id = 1);";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                let wc = sel.where_clause.unwrap();
+                assert_eq!(wc.condition.operator, Operator::NotExists);
             }
             _ => panic!("Expected Select"),
         }

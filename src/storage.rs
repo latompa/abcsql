@@ -431,7 +431,8 @@ fn compare_values(left: &Value, op: &Operator, right: &Value) -> bool {
             Operator::LessThan => l < r,
             Operator::GreaterThanOrEqual => l >= r,
             Operator::LessThanOrEqual => l <= r,
-            Operator::Like | Operator::In => false,
+            Operator::Like | Operator::In | Operator::NotIn
+            | Operator::Exists | Operator::NotExists => false,
         },
         (Value::String(l), Value::String(r)) => match op {
             Operator::Like => like_match(l, r),
@@ -441,7 +442,8 @@ fn compare_values(left: &Value, op: &Operator, right: &Value) -> bool {
             Operator::LessThan => l < r,
             Operator::GreaterThanOrEqual => l >= r,
             Operator::LessThanOrEqual => l <= r,
-            Operator::In => false,
+            Operator::In | Operator::NotIn
+            | Operator::Exists | Operator::NotExists => false,
         },
         (Value::Null, Value::Null) => match op {
             Operator::Equals => true,

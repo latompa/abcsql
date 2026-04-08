@@ -166,7 +166,8 @@ fn compare(left: &Value, op: &parser::Operator, right: &Value) -> bool {
             parser::Operator::LessThan => l < r,
             parser::Operator::GreaterThanOrEqual => l >= r,
             parser::Operator::LessThanOrEqual => l <= r,
-            parser::Operator::Like | parser::Operator::In => false,
+            parser::Operator::Like | parser::Operator::In | parser::Operator::NotIn
+            | parser::Operator::Exists | parser::Operator::NotExists => false,
         },
         (Value::String(l), Value::String(r)) => match op {
             parser::Operator::Like => like_match(l, r),
@@ -176,7 +177,8 @@ fn compare(left: &Value, op: &parser::Operator, right: &Value) -> bool {
             parser::Operator::LessThan => l < r,
             parser::Operator::GreaterThanOrEqual => l >= r,
             parser::Operator::LessThanOrEqual => l <= r,
-            parser::Operator::In => false,
+            parser::Operator::In | parser::Operator::NotIn
+            | parser::Operator::Exists | parser::Operator::NotExists => false,
         },
         _ => false,
     }

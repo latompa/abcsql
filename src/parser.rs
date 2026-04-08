@@ -63,6 +63,7 @@ pub struct DeleteStatement {
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct SelectStatement {
+    pub ctes: Vec<CteDefinition>,
     pub columns: Vec<SelectColumn>,
     pub distinct: bool,
     pub from: String,
@@ -72,6 +73,12 @@ pub struct SelectStatement {
     pub group_by: Vec<SelectColumn>,
     pub order_by: Vec<OrderByClause>,
     pub limit: Option<u64>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct CteDefinition {
+    pub name: String,
+    pub query: Box<SelectStatement>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -335,6 +342,7 @@ pub fn parse_select_statement(input: &str) -> IResult<&str, SelectStatement> {
     let (input, limit) = parse_limit_clause(input)?;
 
     Ok((input, SelectStatement {
+        ctes: Vec::new(),
         columns,
         distinct,
         from: from.to_string(),
@@ -347,9 +355,38 @@ pub fn parse_select_statement(input: &str) -> IResult<&str, SelectStatement> {
     }))
 }
 
-/// Parse SELECT statement (top-level, consumes optional semicolon)
+/// Parse a single CTE definition: name AS (SELECT ...)
+fn parse_cte_definition(input: &str) -> IResult<&str, CteDefinition> {
+    let (input, _) = multispace0(input)?;
+    let (input, name) = parse_identifier(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, _) = tag("AS")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, query) = parse_select_statement(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, CteDefinition { name: name.to_string(), query: Box::new(query) }))
+}
+
+/// Parse SELECT statement (top-level, with optional WITH clause and semicolon)
 pub fn parse_select(input: &str) -> IResult<&str, SqlStatement> {
-    let (input, stmt) = parse_select_statement(input)?;
+    // Try parsing WITH ... AS (...) before the SELECT
+    let (input, ctes) = if let Ok((input, _)) = tag::<&str, &str, nom::error::Error<&str>>("WITH")(input) {
+        let (input, _) = multispace1(input)?;
+        let (input, ctes) = separated_list0(
+            delimited(multispace0, nom_char(','), multispace0),
+            parse_cte_definition,
+        )(input)?;
+        let (input, _) = multispace0(input)?;
+        (input, ctes)
+    } else {
+        (input, Vec::new())
+    };
+
+    let (input, mut stmt) = parse_select_statement(input)?;
+    stmt.ctes = ctes;
     let (input, _) = multispace0(input)?;
     let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
     Ok((input, SqlStatement::Select(stmt)))
@@ -1710,6 +1747,50 @@ mod tests {
             SqlStatement::Select(sel) => {
                 let wc = sel.where_clause.unwrap();
                 assert_eq!(wc.condition.operator, Operator::NotExists);
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_cte_simple() {
+        let sql = "WITH active AS (SELECT * FROM users WHERE id > 1) SELECT * FROM active;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert_eq!(sel.ctes.len(), 1);
+                assert_eq!(sel.ctes[0].name, "active");
+                assert_eq!(sel.ctes[0].query.from, "users");
+                assert_eq!(sel.from, "active");
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_cte_multiple() {
+        let sql = "WITH a AS (SELECT * FROM users), b AS (SELECT * FROM products) SELECT * FROM a;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert_eq!(sel.ctes.len(), 2);
+                assert_eq!(sel.ctes[0].name, "a");
+                assert_eq!(sel.ctes[1].name, "b");
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_no_cte() {
+        let sql = "SELECT * FROM users;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert!(sel.ctes.is_empty());
             }
             _ => panic!("Expected Select"),
         }

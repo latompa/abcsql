@@ -1,6 +1,7 @@
 mod parser;
 mod storage;
 
+use std::collections::HashMap;
 use std::io::{self, Write};
 use parser::{parse_sql, SqlStatement, Value};
 use storage::Storage;
@@ -171,16 +172,102 @@ struct ResultColumn {
     name: String,
 }
 
-fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) {
-    // Load the FROM table
-    let from_schema = match storage.load_schema(&stmt.from) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            return;
+/// Materialized CTE: column definitions + row data
+struct CteData {
+    columns: Vec<ResultColumn>,
+    rows: Vec<Vec<Value>>,
+}
+
+/// Load a table's schema and rows from CTEs first, falling back to storage
+fn load_table(
+    name: &str,
+    ctes: &HashMap<String, CteData>,
+    storage: &Storage,
+) -> Result<(Vec<ResultColumn>, Vec<Vec<Value>>), String> {
+    if let Some(cte) = ctes.get(name) {
+        let cols = cte.columns.iter()
+            .map(|c| ResultColumn { table: name.to_string(), name: c.name.clone() })
+            .collect();
+        return Ok((cols, cte.rows.clone()));
+    }
+    let schema = storage.load_schema(name).map_err(|e| e.to_string())?;
+    let rows = storage.read_rows(name).map_err(|e| e.to_string())?;
+    let cols = schema.columns.iter()
+        .map(|c| ResultColumn { table: name.to_string(), name: c.name.clone() })
+        .collect();
+    Ok((cols, rows))
+}
+
+/// Execute a CTE query and capture its result as columns + rows
+fn materialize_cte(
+    query: &parser::SelectStatement,
+    storage: &Storage,
+    existing_ctes: &HashMap<String, CteData>,
+) -> CteData {
+    // Load FROM table
+    let (from_cols, from_rows) = match load_table(&query.from, existing_ctes, storage) {
+        Ok(r) => r,
+        Err(_) => return CteData { columns: Vec::new(), rows: Vec::new() },
+    };
+
+    let from_alias = query.from_alias.as_deref().unwrap_or(&query.from);
+    let combined_cols: Vec<ResultColumn> = from_cols.into_iter()
+        .map(|c| ResultColumn { table: from_alias.to_string(), name: c.name })
+        .collect();
+
+    // Filter by WHERE
+    let filtered: Vec<Vec<Value>> = from_rows.into_iter()
+        .filter(|row| {
+            match &query.where_clause {
+                Some(wc) => evaluate_join_condition(&wc.condition, row, &combined_cols, storage),
+                None => true,
+            }
+        })
+        .collect();
+
+    // Determine output columns
+    let result_cols: Vec<ResultColumn> = match &query.columns[..] {
+        [parser::SelectColumn::All] => {
+            combined_cols.iter()
+                .map(|c| ResultColumn { table: String::new(), name: c.name.clone() })
+                .collect()
+        }
+        cols => {
+            cols.iter().filter_map(|col| {
+                match col {
+                    parser::SelectColumn::Column(name) => Some(ResultColumn { table: String::new(), name: name.clone() }),
+                    parser::SelectColumn::QualifiedColumn(_, name) => Some(ResultColumn { table: String::new(), name: name.clone() }),
+                    _ => None,
+                }
+            }).collect()
         }
     };
-    let from_rows = match storage.read_rows(&stmt.from) {
+
+    // Project rows to selected columns
+    let display_indices: Vec<usize> = match &query.columns[..] {
+        [parser::SelectColumn::All] => (0..combined_cols.len()).collect(),
+        cols => {
+            cols.iter().filter_map(|col| resolve_column_index(col, &combined_cols)).collect()
+        }
+    };
+
+    let result_rows: Vec<Vec<Value>> = filtered.iter()
+        .map(|row| display_indices.iter().map(|&i| row[i].clone()).collect())
+        .collect();
+
+    CteData { columns: result_cols, rows: result_rows }
+}
+
+fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) {
+    // Materialize CTEs
+    let mut cte_map: HashMap<String, CteData> = HashMap::new();
+    for cte in &stmt.ctes {
+        let cte_data = materialize_cte(&cte.query, storage, &cte_map);
+        cte_map.insert(cte.name.clone(), cte_data);
+    }
+
+    // Load the FROM table (check CTEs first)
+    let (from_cols, from_rows) = match load_table(&stmt.from, &cte_map, storage) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -190,21 +277,14 @@ fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) {
 
     // Build the combined column list and row set, starting with the FROM table
     let from_alias = stmt.from_alias.as_deref().unwrap_or(&stmt.from);
-    let mut combined_cols: Vec<ResultColumn> = from_schema.columns.iter()
-        .map(|c| ResultColumn { table: from_alias.to_string(), name: c.name.clone() })
+    let mut combined_cols: Vec<ResultColumn> = from_cols.into_iter()
+        .map(|c| ResultColumn { table: from_alias.to_string(), name: c.name })
         .collect();
     let mut combined_rows: Vec<Vec<Value>> = from_rows;
 
-    // Process each JOIN
+    // Process each JOIN (check CTEs first)
     for join in &stmt.joins {
-        let join_schema = match storage.load_schema(&join.table) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("Error: {}", e);
-                return;
-            }
-        };
-        let join_rows = match storage.read_rows(&join.table) {
+        let (join_cols, join_rows) = match load_table(&join.table, &cte_map, storage) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("Error: {}", e);
@@ -213,8 +293,8 @@ fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) {
         };
 
         let join_alias = join.alias.as_deref().unwrap_or(&join.table);
-        let join_result_cols: Vec<ResultColumn> = join_schema.columns.iter()
-            .map(|c| ResultColumn { table: join_alias.to_string(), name: c.name.clone() })
+        let join_result_cols: Vec<ResultColumn> = join_cols.into_iter()
+            .map(|c| ResultColumn { table: join_alias.to_string(), name: c.name })
             .collect();
 
         let mut new_rows: Vec<Vec<Value>> = Vec::new();

@@ -233,6 +233,7 @@ fn select_column_name(col: &parser::SelectColumn) -> String {
         parser::SelectColumn::Column(name) => name.clone(),
         parser::SelectColumn::QualifiedColumn(_, name) => name.clone(),
         parser::SelectColumn::Aggregate(_, _) => column_header(col),
+        parser::SelectColumn::Expr(expr) => format_expr(expr),
         parser::SelectColumn::All => "*".to_string(),
     }
 }
@@ -537,6 +538,7 @@ fn column_header(col: &parser::SelectColumn) -> String {
         parser::SelectColumn::Column(name) => name.clone(),
         parser::SelectColumn::QualifiedColumn(_, name) => name.clone(),
         parser::SelectColumn::Alias(_, alias) => alias.clone(),
+        parser::SelectColumn::Expr(expr) => format_expr(expr),
         parser::SelectColumn::All => "*".to_string(),
     }
 }
@@ -557,6 +559,16 @@ fn compute_column_value(
         parser::SelectColumn::Column(_) | parser::SelectColumn::QualifiedColumn(_, _) => {
             if let Some(idx) = resolve_column_index(col, combined_cols) {
                 group.first().map(|r| format_value(&r[idx])).unwrap_or_else(|| "NULL".to_string())
+            } else {
+                "NULL".to_string()
+            }
+        }
+        parser::SelectColumn::Expr(expr) => {
+            if let Some(row) = group.first() {
+                let empty_storage = Storage::new("/dev/null").unwrap();
+                resolve_join_expression(expr, row, combined_cols, &empty_storage)
+                    .map(|v| format_value(&v))
+                    .unwrap_or_else(|| "NULL".to_string())
             } else {
                 "NULL".to_string()
             }
@@ -783,11 +795,15 @@ fn execute_normal_select(
         });
     }
 
-    // Determine which columns to display
-    let display_columns: Vec<(usize, String)> = match columns {
+    // Build display column definitions: header name + how to get the value
+    enum ColSource {
+        Index(usize),
+        Expr(parser::Expression),
+    }
+    let display_columns: Vec<(ColSource, String)> = match columns {
         [parser::SelectColumn::All] => {
             combined_cols.iter().enumerate()
-                .map(|(i, c)| (i, c.name.clone()))
+                .map(|(i, c)| (ColSource::Index(i), c.name.clone()))
                 .collect()
         }
         cols => {
@@ -795,15 +811,23 @@ fn execute_normal_select(
                 match col {
                     parser::SelectColumn::Column(name) => {
                         resolve_column_index(col, combined_cols)
-                            .map(|idx| (idx, name.clone()))
+                            .map(|idx| (ColSource::Index(idx), name.clone()))
                     }
                     parser::SelectColumn::QualifiedColumn(_, name) => {
                         resolve_column_index(col, combined_cols)
-                            .map(|idx| (idx, name.clone()))
+                            .map(|idx| (ColSource::Index(idx), name.clone()))
                     }
                     parser::SelectColumn::Alias(inner, alias) => {
-                        resolve_column_index(inner, combined_cols)
-                            .map(|idx| (idx, alias.clone()))
+                        match inner.as_ref() {
+                            parser::SelectColumn::Expr(expr) => {
+                                Some((ColSource::Expr(expr.clone()), alias.clone()))
+                            }
+                            _ => resolve_column_index(inner, combined_cols)
+                                .map(|idx| (ColSource::Index(idx), alias.clone()))
+                        }
+                    }
+                    parser::SelectColumn::Expr(expr) => {
+                        Some((ColSource::Expr(expr.clone()), format_expr(expr)))
                     }
                     parser::SelectColumn::All | parser::SelectColumn::Aggregate(_, _) => None,
                 }
@@ -811,11 +835,23 @@ fn execute_normal_select(
         }
     };
 
-    // Apply DISTINCT — deduplicate based on projected column values
+    // Helper to get a display value for a row
+    let empty_storage = Storage::new("/dev/null").unwrap();
+    let get_val = |row: &Vec<Value>, src: &ColSource| -> Value {
+        match src {
+            ColSource::Index(idx) => row[*idx].clone(),
+            ColSource::Expr(expr) => {
+                resolve_join_expression(expr, row, combined_cols, &empty_storage)
+                    .unwrap_or(Value::Null)
+            }
+        }
+    };
+
+    // Apply DISTINCT
     if distinct {
         let mut seen: Vec<Vec<Value>> = Vec::new();
         rows.retain(|row| {
-            let projected: Vec<Value> = display_columns.iter().map(|(idx, _)| row[*idx].clone()).collect();
+            let projected: Vec<Value> = display_columns.iter().map(|(src, _)| get_val(row, src)).collect();
             if seen.contains(&projected) {
                 false
             } else {
@@ -838,8 +874,8 @@ fn execute_normal_select(
     // Calculate column widths
     let mut widths: Vec<usize> = display_columns.iter().map(|(_, name)| name.len()).collect();
     for row in &rows {
-        for (i, (col_idx, _)) in display_columns.iter().enumerate() {
-            let val_len = format_value(&row[*col_idx]).len();
+        for (i, (src, _)) in display_columns.iter().enumerate() {
+            let val_len = format_value(&get_val(row, src)).len();
             if val_len > widths[i] {
                 widths[i] = val_len;
             }
@@ -861,14 +897,33 @@ fn execute_normal_select(
     for row in &rows {
         let values: Vec<String> = display_columns.iter()
             .enumerate()
-            .map(|(i, (col_idx, _))| {
-                format!("{:width$}", format_value(&row[*col_idx]), width = widths[i])
+            .map(|(i, (src, _))| {
+                format!("{:width$}", format_value(&get_val(row, src)), width = widths[i])
             })
             .collect();
         println!("{}", values.join(" | "));
     }
 
     println!("({} rows)", rows.len());
+}
+
+/// Format an expression for display as a column header
+fn format_expr(expr: &parser::Expression) -> String {
+    match expr {
+        parser::Expression::Column(name) => name.clone(),
+        parser::Expression::QualifiedColumn(t, c) => format!("{}.{}", t, c),
+        parser::Expression::Literal(v) => format_value(v),
+        parser::Expression::BinaryOp(l, op, r) => {
+            let op_str = match op {
+                parser::ArithOp::Add => "+",
+                parser::ArithOp::Sub => "-",
+                parser::ArithOp::Mul => "*",
+                parser::ArithOp::Div => "/",
+            };
+            format!("{} {} {}", format_expr(l), op_str, format_expr(r))
+        }
+        parser::Expression::Subquery(_) => "(subquery)".to_string(),
+    }
 }
 
 fn format_value(value: &Value) -> String {
@@ -993,6 +1048,30 @@ fn resolve_join_expression(
             let values = execute_subquery(subquery, storage);
             values.into_iter().next()
         }
+        parser::Expression::BinaryOp(left, op, right) => {
+            let left_val = resolve_join_expression(left, row, cols, storage)?;
+            let right_val = resolve_join_expression(right, row, cols, storage)?;
+            eval_arith(&left_val, op, &right_val)
+        }
+    }
+}
+
+/// Evaluate arithmetic operation on two Values
+fn eval_arith(left: &Value, op: &parser::ArithOp, right: &Value) -> Option<Value> {
+    match (left, right) {
+        (Value::Int(l), Value::Int(r)) => {
+            let result = match op {
+                parser::ArithOp::Add => l + r,
+                parser::ArithOp::Sub => l - r,
+                parser::ArithOp::Mul => l * r,
+                parser::ArithOp::Div => {
+                    if *r == 0 { return Some(Value::Null); }
+                    l / r
+                }
+            };
+            Some(Value::Int(result))
+        }
+        _ => Some(Value::Null),
     }
 }
 

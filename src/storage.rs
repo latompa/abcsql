@@ -418,6 +418,7 @@ fn resolve_expression(expr: &Expression, row: &[Value], schema: &[ColumnDefiniti
                 .map(|idx| row[idx].clone())
         }
         Expression::Subquery(_) => None,
+        Expression::BinaryOp(_, _, _) => None,
     }
 }
 

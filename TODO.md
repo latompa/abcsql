@@ -14,7 +14,7 @@
 - [x] Aggregate functions (COUNT, SUM, AVG, MIN, MAX)
 - [x] DISTINCT keyword
 - [x] LIKE operator for string matching
-- [ ] Arithmetic operators in expressions
+- [x] Arithmetic operators in expressions
 - [x] Subqueries (WHERE ... IN (SELECT ...))
 
 ## Data Types

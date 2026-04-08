@@ -105,6 +105,7 @@ pub enum SelectColumn {
     QualifiedColumn(String, String), // table.column
     Aggregate(AggregateFunc, Box<SelectColumn>), // COUNT(*), SUM(col), etc.
     Alias(Box<SelectColumn>, String), // expr AS name
+    Expr(Expression), // arithmetic expression like price * 2
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -152,8 +153,17 @@ pub struct Condition {
 pub enum Expression {
     Column(String),
     QualifiedColumn(String, String), // table.column
+    BinaryOp(Box<Expression>, ArithOp, Box<Expression>),
     Literal(Value),
     Subquery(Box<SelectStatement>),
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum ArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -425,12 +435,13 @@ pub fn parse_select(input: &str) -> IResult<&str, SqlStatement> {
     Ok((input, SqlStatement::Select(stmt)))
 }
 
-/// Parse SELECT column: aggregate, *, table.column, or column
+/// Parse SELECT column: aggregate, *, arithmetic expr, table.column, or column
 fn parse_select_column(input: &str) -> IResult<&str, SelectColumn> {
     let (input, _) = multispace0(input)?;
     let (input, col) = nom::branch::alt((
         parse_aggregate_column,
         parse_all_column,
+        parse_arith_select_column,
         parse_qualified_column,
         parse_simple_column,
     ))(input)?;
@@ -443,6 +454,16 @@ fn parse_select_column(input: &str) -> IResult<&str, SelectColumn> {
         }
     }
     Ok((input, col))
+}
+
+/// Parse arithmetic expression as a select column (only matches if there's an operator)
+fn parse_arith_select_column(input: &str) -> IResult<&str, SelectColumn> {
+    let (new_input, expr) = parse_expression(input)?;
+    // Only succeed if the expression actually contains arithmetic
+    match &expr {
+        Expression::BinaryOp(_, _, _) => Ok((new_input, SelectColumn::Expr(expr))),
+        _ => Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag))),
+    }
 }
 
 /// Parse aggregate function: COUNT(*), SUM(col), AVG(col), MIN(col), MAX(col)
@@ -687,8 +708,51 @@ pub fn parse_condition(input: &str) -> IResult<&str, Condition> {
     Ok((input, Condition { left, operator, right }))
 }
 
-/// Parse expression: subquery, column, table.column, or literal
+/// Try to parse an arithmetic operator surrounded by optional whitespace
+fn parse_arith_add_sub(input: &str) -> IResult<&str, ArithOp> {
+    let (input, _) = multispace0(input)?;
+    let (input, op) = nom::branch::alt((
+        nom::combinator::map(nom_char('+'), |_| ArithOp::Add),
+        nom::combinator::map(nom_char('-'), |_| ArithOp::Sub),
+    ))(input)?;
+    let (input, _) = multispace0(input)?;
+    Ok((input, op))
+}
+
+fn parse_arith_mul_div(input: &str) -> IResult<&str, ArithOp> {
+    let (input, _) = multispace0(input)?;
+    let (input, op) = nom::branch::alt((
+        nom::combinator::map(nom_char('*'), |_| ArithOp::Mul),
+        nom::combinator::map(nom_char('/'), |_| ArithOp::Div),
+    ))(input)?;
+    let (input, _) = multispace0(input)?;
+    Ok((input, op))
+}
+
+/// Parse expression with arithmetic: handles +, -, *, / with precedence
 fn parse_expression(input: &str) -> IResult<&str, Expression> {
+    let (mut input, mut left) = parse_term(input)?;
+    while let Ok((remaining, op)) = parse_arith_add_sub(input) {
+        let (remaining, right) = parse_term(remaining)?;
+        left = Expression::BinaryOp(Box::new(left), op, Box::new(right));
+        input = remaining;
+    }
+    Ok((input, left))
+}
+
+/// Parse term: handles * and / (higher precedence)
+fn parse_term(input: &str) -> IResult<&str, Expression> {
+    let (mut input, mut left) = parse_atom(input)?;
+    while let Ok((remaining, op)) = parse_arith_mul_div(input) {
+        let (remaining, right) = parse_atom(remaining)?;
+        left = Expression::BinaryOp(Box::new(left), op, Box::new(right));
+        input = remaining;
+    }
+    Ok((input, left))
+}
+
+/// Parse atomic expression: subquery, column, table.column, or literal
+fn parse_atom(input: &str) -> IResult<&str, Expression> {
     nom::branch::alt((
         parse_expression_subquery,
         parse_expression_qualified_column,
@@ -748,7 +812,6 @@ fn parse_value(input: &str) -> IResult<&str, Value> {
         parse_null_value,
         parse_int_value,
     ))(input)?;
-    let (input, _) = multispace0(input)?;
     Ok((input, value))
 }
 
@@ -1908,6 +1971,102 @@ mod tests {
                     _ => panic!("Expected subquery FROM"),
                 }
                 assert_eq!(sel.from_alias, Some("counts".to_string()));
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_arithmetic_add() {
+        let sql = "SELECT * FROM products WHERE price > 100 + 50;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                let wc = sel.where_clause.unwrap();
+                match &wc.condition.right {
+                    Expression::BinaryOp(_, ArithOp::Add, _) => {}
+                    _ => panic!("Expected BinaryOp Add"),
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_arithmetic_mul() {
+        let sql = "SELECT * FROM products WHERE price > 10 * 5;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                let wc = sel.where_clause.unwrap();
+                match &wc.condition.right {
+                    Expression::BinaryOp(_, ArithOp::Mul, _) => {}
+                    _ => panic!("Expected BinaryOp Mul"),
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_arithmetic_precedence() {
+        // 1 + 2 * 3 should parse as 1 + (2 * 3)
+        let sql = "SELECT * FROM users WHERE id = 1 + 2 * 3;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                let wc = sel.where_clause.unwrap();
+                match &wc.condition.right {
+                    Expression::BinaryOp(left, ArithOp::Add, right) => {
+                        assert_eq!(**left, Expression::Literal(Value::Int(1)));
+                        match right.as_ref() {
+                            Expression::BinaryOp(_, ArithOp::Mul, _) => {}
+                            _ => panic!("Expected inner Mul"),
+                        }
+                    }
+                    _ => panic!("Expected BinaryOp Add"),
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_arithmetic_select_no_alias() {
+        let sql = "SELECT id + 1 FROM users;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                match &sel.columns[0] {
+                    SelectColumn::Expr(Expression::BinaryOp(_, ArithOp::Add, _)) => {}
+                    other => panic!("Expected Expr with Add, got {:?}", other),
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_arithmetic_select_column() {
+        let sql = "SELECT price * 2 AS double_price FROM products;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                match &sel.columns[0] {
+                    SelectColumn::Alias(inner, alias) => {
+                        assert_eq!(alias, "double_price");
+                        match inner.as_ref() {
+                            SelectColumn::Expr(Expression::BinaryOp(_, ArithOp::Mul, _)) => {}
+                            _ => panic!("Expected Expr with Mul"),
+                        }
+                    }
+                    _ => panic!("Expected Alias"),
+                }
             }
             _ => panic!("Expected Select"),
         }

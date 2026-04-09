@@ -177,6 +177,11 @@ fn compare(left: &Value, op: &parser::Operator, right: &Value) -> bool {
         (Value::Float(l), Value::Float(r)) => compare_numeric(*l, *r, op),
         (Value::Int(l), Value::Float(r)) => compare_numeric(*l as f64, *r, op),
         (Value::Float(l), Value::Int(r)) => compare_numeric(*l, *r as f64, op),
+        (Value::Bool(l), Value::Bool(r)) => match op {
+            parser::Operator::Equals => l == r,
+            parser::Operator::NotEquals => l != r,
+            _ => false,
+        },
         (Value::String(l), Value::String(r)) => match op {
             parser::Operator::Like => like_match(l, r),
             parser::Operator::Equals => l == r,

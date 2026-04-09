@@ -105,6 +105,7 @@ fn handle_meta_command(cmd: &str, storage: &Storage) {
                             parser::DataType::Int => "INT".to_string(),
                             parser::DataType::Float => "FLOAT".to_string(),
                             parser::DataType::Double => "DOUBLE".to_string(),
+                            parser::DataType::Boolean => "BOOLEAN".to_string(),
                             parser::DataType::Varchar(Some(n)) => format!("VARCHAR({})", n),
                             parser::DataType::Varchar(None) => "VARCHAR".to_string(),
                         };
@@ -775,6 +776,7 @@ fn cmp_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Value::Float(a), Value::Float(b)) => a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
         (Value::Int(a), Value::Float(b)) => (*a as f64).partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
         (Value::Float(a), Value::Int(b)) => a.partial_cmp(&(*b as f64)).unwrap_or(std::cmp::Ordering::Equal),
+        (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
         (Value::String(a), Value::String(b)) => a.cmp(b),
         (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
         (Value::Null, _) => std::cmp::Ordering::Less,
@@ -949,6 +951,7 @@ fn format_value(value: &Value) -> String {
             let s = s.trim_end_matches('.');
             if s.contains('.') { s.to_string() } else { format!("{}.0", s) }
         }
+        Value::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
         Value::String(s) => s.clone(),
         Value::Null => "NULL".to_string(),
     }
@@ -1131,6 +1134,11 @@ fn compare_values(left: &Value, op: &parser::Operator, right: &Value) -> bool {
         (Value::Float(l), Value::Float(r)) => compare_numeric(*l, *r, op),
         (Value::Int(l), Value::Float(r)) => compare_numeric(*l as f64, *r, op),
         (Value::Float(l), Value::Int(r)) => compare_numeric(*l, *r as f64, op),
+        (Value::Bool(l), Value::Bool(r)) => match op {
+            parser::Operator::Equals => l == r,
+            parser::Operator::NotEquals => l != r,
+            _ => false,
+        },
         (Value::String(l), Value::String(r)) => match op {
             parser::Operator::Like => like_match(l, r),
             parser::Operator::Equals => l == r,

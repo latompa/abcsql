@@ -359,6 +359,7 @@ fn data_type_to_string(data_type: &DataType) -> String {
         DataType::Float => "FLOAT".to_string(),
         DataType::Double => "DOUBLE".to_string(),
         DataType::Varchar(Some(size)) => format!("VARCHAR({})", size),
+        DataType::Boolean => "BOOLEAN".to_string(),
         DataType::Varchar(None) => "VARCHAR".to_string(),
     }
 }
@@ -371,6 +372,8 @@ fn parse_data_type(s: &str) -> Result<DataType, StorageError> {
         Ok(DataType::Float)
     } else if s == "DOUBLE" {
         Ok(DataType::Double)
+    } else if s == "BOOLEAN" || s == "BOOL" {
+        Ok(DataType::Boolean)
     } else if s == "VARCHAR" {
         Ok(DataType::Varchar(None))
     } else if s.starts_with("VARCHAR(") && s.ends_with(')') {
@@ -390,6 +393,7 @@ fn validate_value_type(value: &Value, data_type: &DataType, column_name: &str) -
         (Value::Int(_), DataType::Int) => Ok(()),
         (Value::Float(_), DataType::Float) => Ok(()),
         (Value::Float(_), DataType::Double) => Ok(()),
+        (Value::Bool(_), DataType::Boolean) => Ok(()),
         (Value::Int(_), DataType::Float) => Ok(()),
         (Value::Int(_), DataType::Double) => Ok(()),
         (Value::String(_), DataType::Varchar(_)) => Ok(()),
@@ -451,6 +455,11 @@ fn compare_values(left: &Value, op: &Operator, right: &Value) -> bool {
         (Value::Float(l), Value::Float(r)) => compare_numeric(*l, *r, op),
         (Value::Int(l), Value::Float(r)) => compare_numeric(*l as f64, *r, op),
         (Value::Float(l), Value::Int(r)) => compare_numeric(*l, *r as f64, op),
+        (Value::Bool(l), Value::Bool(r)) => match op {
+            Operator::Equals => l == r,
+            Operator::NotEquals => l != r,
+            _ => false,
+        },
         (Value::String(l), Value::String(r)) => match op {
             Operator::Like => like_match(l, r),
             Operator::Equals => l == r,
@@ -507,6 +516,7 @@ fn serialize_row(values: &[Value]) -> String {
         .map(|v| match v {
             Value::Int(n) => format!("INT:{}", n),
             Value::Float(n) => format!("FLOAT:{}", n),
+            Value::Bool(b) => format!("BOOL:{}", b),
             Value::String(s) => {
                 // Escape pipe and newline characters
                 let escaped = s.replace('\\', "\\\\")
@@ -560,6 +570,10 @@ fn deserialize_row(s: &str) -> Result<Vec<Value>, StorageError> {
             let n = float_str.parse::<f64>()
                 .map_err(|_| StorageError::InvalidData(format!("Invalid float: {}", float_str)))?;
             values.push(Value::Float(n));
+        } else if let Some(bool_str) = part.strip_prefix("BOOL:") {
+            let b = bool_str.parse::<bool>()
+                .map_err(|_| StorageError::InvalidData(format!("Invalid boolean: {}", bool_str)))?;
+            values.push(Value::Bool(b));
         } else if let Some(string_val) = part.strip_prefix("STRING:") {
             // Unescape special characters
             let unescaped = string_val

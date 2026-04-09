@@ -35,6 +35,7 @@ pub enum DataType {
     Int,
     Float,
     Double,
+    Boolean,
     Varchar(Option<usize>), // VARCHAR(255) or VARCHAR
 }
 
@@ -187,6 +188,7 @@ pub enum Operator {
 pub enum Value {
     Int(i64),
     Float(f64),
+    Bool(bool),
     String(String),
     Null,
 }
@@ -248,9 +250,15 @@ fn parse_data_type(input: &str) -> IResult<&str, DataType> {
     nom::branch::alt((
         parse_double_type,
         parse_float_type,
+        parse_boolean_type,
         parse_int_type,
         parse_varchar_type,
     ))(input)
+}
+
+fn parse_boolean_type(input: &str) -> IResult<&str, DataType> {
+    let (input, _) = nom::branch::alt((tag("BOOLEAN"), tag("BOOL")))(input)?;
+    Ok((input, DataType::Boolean))
 }
 
 fn parse_int_type(input: &str) -> IResult<&str, DataType> {
@@ -771,8 +779,8 @@ fn parse_atom(input: &str) -> IResult<&str, Expression> {
     nom::branch::alt((
         parse_expression_subquery,
         parse_expression_qualified_column,
-        parse_expression_simple_column,
         parse_expression_literal,
+        parse_expression_simple_column,
     ))(input)
 }
 
@@ -825,10 +833,16 @@ fn parse_value(input: &str) -> IResult<&str, Value> {
     let (input, value) = nom::branch::alt((
         parse_string_value,
         parse_null_value,
+        parse_bool_value,
         parse_float_value,
         parse_int_value,
     ))(input)?;
     Ok((input, value))
+}
+
+fn parse_bool_value(input: &str) -> IResult<&str, Value> {
+    let (input, val) = nom::branch::alt((tag("TRUE"), tag("FALSE")))(input)?;
+    Ok((input, Value::Bool(val == "TRUE")))
 }
 
 /// Parse float literal: digits.digits (must have decimal point)
@@ -2152,6 +2166,55 @@ mod tests {
                     }
                     _ => panic!("Expected Float literal"),
                 }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_boolean_type() {
+        let sql = "CREATE TABLE flags (active BOOLEAN);";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::CreateTable(ct) => {
+                assert_eq!(ct.columns[0].data_type, DataType::Boolean);
+            }
+            _ => panic!("Expected CreateTable"),
+        }
+    }
+
+    #[test]
+    fn test_parse_bool_type_shorthand() {
+        let sql = "CREATE TABLE flags (active BOOL);";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::CreateTable(ct) => {
+                assert_eq!(ct.columns[0].data_type, DataType::Boolean);
+            }
+            _ => panic!("Expected CreateTable"),
+        }
+    }
+
+    #[test]
+    fn test_parse_bool_literal() {
+        let sql = "INSERT INTO flags VALUES (TRUE);";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Insert(ins) => {
+                assert_eq!(ins.values[0], Value::Bool(true));
+            }
+            _ => panic!("Expected Insert"),
+        }
+    }
+
+    #[test]
+    fn test_parse_bool_in_where() {
+        let sql = "SELECT * FROM flags WHERE active = FALSE;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                let wc = sel.where_clause.unwrap();
+                assert_eq!(wc.condition.right, Expression::Literal(Value::Bool(false)));
             }
             _ => panic!("Expected Select"),
         }

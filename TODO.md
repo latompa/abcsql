@@ -20,7 +20,7 @@
 ## Data Types
 
 - [x] FLOAT / DOUBLE
-- [ ] BOOLEAN
+- [x] BOOLEAN
 - [ ] DATE / TIMESTAMP
 - [ ] AUTO_INCREMENT
 - [ ] JSON

@@ -112,13 +112,14 @@ fn handle_meta_command(cmd: &str, storage: &Storage) {
                             parser::DataType::Varchar(None) => "VARCHAR".to_string(),
                         };
                         let nn = if col.not_null { " NOT NULL" } else { "" };
+                        let uq = if col.unique { " UNIQUE" } else { "" };
                         let auto_inc = if col.auto_increment { " AUTO_INCREMENT" } else { "" };
                         let pk = if col.primary_key { " PRIMARY KEY" } else { "" };
                         let fk = col.references.as_ref()
                             .map(|r| format!(" REFERENCES {}({})", r.table, r.column))
                             .unwrap_or_default();
                         let comma = if i < schema.columns.len() - 1 { "," } else { "" };
-                        println!("  {} {}{}{}{}{}{}", col.name, type_str, nn, auto_inc, pk, fk, comma);
+                        println!("  {} {}{}{}{}{}{}{}", col.name, type_str, nn, uq, auto_inc, pk, fk, comma);
                     }
                     println!(");");
                 }

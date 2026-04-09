@@ -31,6 +31,7 @@ pub struct ColumnDefinition {
     pub auto_increment: bool,
     pub primary_key: bool,
     pub not_null: bool,
+    pub unique: bool,
     pub references: Option<ForeignKeyRef>,
 }
 
@@ -42,7 +43,7 @@ pub struct ForeignKeyRef {
 
 impl ColumnDefinition {
     pub fn new(name: &str, data_type: DataType) -> Self {
-        Self { name: name.to_string(), data_type, auto_increment: false, primary_key: false, not_null: false, references: None }
+        Self { name: name.to_string(), data_type, auto_increment: false, primary_key: false, not_null: false, unique: false, references: None }
     }
 }
 
@@ -258,6 +259,8 @@ fn parse_column_definition(input: &str) -> IResult<&str, ColumnDefinition> {
     let (input, _) = multispace0(input)?;
     let (input, nn) = nom::combinator::opt(tag("NOT NULL"))(input)?;
     let (input, _) = multispace0(input)?;
+    let (input, uniq) = nom::combinator::opt(tag("UNIQUE"))(input)?;
+    let (input, _) = multispace0(input)?;
     let (input, auto_inc) = nom::combinator::opt(tag("AUTO_INCREMENT"))(input)?;
     let (input, _) = multispace0(input)?;
     let (input, pk) = nom::combinator::opt(tag("PRIMARY KEY"))(input)?;
@@ -271,6 +274,7 @@ fn parse_column_definition(input: &str) -> IResult<&str, ColumnDefinition> {
         auto_increment: auto_inc.is_some(),
         primary_key: pk.is_some(),
         not_null: nn.is_some(),
+        unique: uniq.is_some(),
         references: fk_ref,
     }))
 }
@@ -2360,6 +2364,19 @@ mod tests {
             SqlStatement::CreateTable(ct) => {
                 assert!(ct.columns[0].not_null);
                 assert!(!ct.columns[1].not_null);
+            }
+            _ => panic!("Expected CreateTable"),
+        }
+    }
+
+    #[test]
+    fn test_parse_unique() {
+        let sql = "CREATE TABLE users (id INT, email VARCHAR UNIQUE);";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::CreateTable(ct) => {
+                assert!(!ct.columns[0].unique);
+                assert!(ct.columns[1].unique);
             }
             _ => panic!("Expected CreateTable"),
         }

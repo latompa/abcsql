@@ -101,7 +101,9 @@ impl Storage {
             let mut parts = vec![col.name.as_str(), type_str.as_str()];
             let ai = "AUTO_INCREMENT".to_string();
             let pk = "PRIMARY_KEY".to_string();
+            let nn = "NOT_NULL".to_string();
             let fk = col.references.as_ref().map(|r| format!("FK={}.{}", r.table, r.column));
+            if col.not_null { parts.push(&nn); }
             if col.auto_increment { parts.push(&ai); }
             if col.primary_key { parts.push(&pk); }
             if let Some(ref fk_str) = fk { parts.push(fk_str); }
@@ -146,6 +148,13 @@ impl Storage {
         // Validate types
         for (value, col_def) in final_values.iter().zip(schema.columns.iter()) {
             validate_value_type(value, &col_def.data_type, &col_def.name)?;
+        }
+
+        // Enforce NOT NULL constraints
+        for (value, col_def) in final_values.iter().zip(schema.columns.iter()) {
+            if col_def.not_null && *value == Value::Null {
+                return Err(StorageError::NullConstraint { column: col_def.name.clone() });
+            }
         }
 
         // Enforce primary key constraints (NOT NULL + unique)
@@ -206,8 +215,8 @@ impl Storage {
                 .find(|c| c.name == assignment.column)
                 .ok_or_else(|| StorageError::ColumnNotFound(assignment.column.clone()))?;
             validate_value_type(&assignment.value, &col_def.data_type, &col_def.name)?;
-            // Prevent setting primary key columns to NULL
-            if col_def.primary_key && assignment.value == Value::Null {
+            // Prevent setting NOT NULL or primary key columns to NULL
+            if (col_def.not_null || col_def.primary_key) && assignment.value == Value::Null {
                 return Err(StorageError::NullConstraint { column: col_def.name.clone() });
             }
         }
@@ -364,6 +373,7 @@ impl Storage {
             let flags: Vec<&str> = parts[2..].to_vec();
             let auto_increment = flags.contains(&"AUTO_INCREMENT");
             let primary_key = flags.contains(&"PRIMARY_KEY");
+            let not_null = flags.contains(&"NOT_NULL");
             let references = flags.iter()
                 .find(|f| f.starts_with("FK="))
                 .map(|f| {
@@ -377,6 +387,7 @@ impl Storage {
                 data_type,
                 auto_increment,
                 primary_key,
+                not_null,
                 references,
             });
         }
@@ -1673,7 +1684,7 @@ mod tests {
         let create = CreateTableStatement {
             table_name: "users".to_string(),
             columns: vec![
-                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: true, primary_key: false, references: None },
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: true, primary_key: false, not_null: false, references: None },
                 ColumnDefinition::new("name", DataType::Varchar(None)),
             ],
         };
@@ -1717,7 +1728,7 @@ mod tests {
         let create = CreateTableStatement {
             table_name: "users".to_string(),
             columns: vec![
-                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, references: None },
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, references: None },
                 ColumnDefinition::new("name", DataType::Varchar(None)),
             ],
         };
@@ -1754,7 +1765,7 @@ mod tests {
         let create = CreateTableStatement {
             table_name: "users".to_string(),
             columns: vec![
-                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, references: None },
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, references: None },
                 ColumnDefinition::new("name", DataType::Varchar(None)),
             ],
         };
@@ -1779,7 +1790,7 @@ mod tests {
         let create_users = CreateTableStatement {
             table_name: "users".to_string(),
             columns: vec![
-                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, references: None },
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, references: None },
                 ColumnDefinition::new("name", DataType::Varchar(None)),
             ],
         };
@@ -1794,7 +1805,7 @@ mod tests {
             table_name: "orders".to_string(),
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
-                ColumnDefinition { name: "user_id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: false,
+                ColumnDefinition { name: "user_id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: false, not_null: false,
                     references: Some(ForeignKeyRef { table: "users".to_string(), column: "id".to_string() }) },
             ],
         };
@@ -1825,7 +1836,7 @@ mod tests {
         let create_users = CreateTableStatement {
             table_name: "users".to_string(),
             columns: vec![
-                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, references: None },
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, references: None },
                 ColumnDefinition::new("name", DataType::Varchar(None)),
             ],
         };
@@ -1844,7 +1855,7 @@ mod tests {
             table_name: "orders".to_string(),
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
-                ColumnDefinition { name: "user_id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: false,
+                ColumnDefinition { name: "user_id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: false, not_null: false,
                     references: Some(ForeignKeyRef { table: "users".to_string(), column: "id".to_string() }) },
             ],
         };
@@ -1879,6 +1890,37 @@ mod tests {
             }),
         });
         assert!(result.is_ok());
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_not_null_constraint() {
+        let temp_dir = format!("/tmp/abcsql_test_nn_{}", std::process::id());
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        let create = CreateTableStatement {
+            table_name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id", DataType::Int),
+                ColumnDefinition { name: "name".to_string(), data_type: DataType::Varchar(None),
+                    auto_increment: false, primary_key: false, not_null: true, references: None },
+            ],
+        };
+        storage.create_table(&create).unwrap();
+
+        // Valid insert
+        storage.insert_row(&InsertStatement {
+            table_name: "users".to_string(),
+            values: vec![Value::Int(1), Value::String("Alice".to_string())],
+        }).unwrap();
+
+        // NULL in NOT NULL column should fail
+        let result = storage.insert_row(&InsertStatement {
+            table_name: "users".to_string(),
+            values: vec![Value::Int(2), Value::Null],
+        });
+        assert!(matches!(result, Err(StorageError::NullConstraint { .. })));
 
         fs::remove_dir_all(&temp_dir).unwrap();
     }

@@ -29,7 +29,7 @@
 
 - [x] PRIMARY KEY constraint
 - [x] FOREIGN KEY constraint
-- [ ] NOT NULL constraint
+- [x] NOT NULL constraint
 - [ ] UNIQUE constraint
 - [ ] ALTER TABLE statement
 

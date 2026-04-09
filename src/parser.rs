@@ -30,6 +30,7 @@ pub struct ColumnDefinition {
     pub data_type: DataType,
     pub auto_increment: bool,
     pub primary_key: bool,
+    pub not_null: bool,
     pub references: Option<ForeignKeyRef>,
 }
 
@@ -41,7 +42,7 @@ pub struct ForeignKeyRef {
 
 impl ColumnDefinition {
     pub fn new(name: &str, data_type: DataType) -> Self {
-        Self { name: name.to_string(), data_type, auto_increment: false, primary_key: false, references: None }
+        Self { name: name.to_string(), data_type, auto_increment: false, primary_key: false, not_null: false, references: None }
     }
 }
 
@@ -255,6 +256,8 @@ fn parse_column_definition(input: &str) -> IResult<&str, ColumnDefinition> {
     let (input, _) = multispace1(input)?;
     let (input, data_type) = parse_data_type(input)?;
     let (input, _) = multispace0(input)?;
+    let (input, nn) = nom::combinator::opt(tag("NOT NULL"))(input)?;
+    let (input, _) = multispace0(input)?;
     let (input, auto_inc) = nom::combinator::opt(tag("AUTO_INCREMENT"))(input)?;
     let (input, _) = multispace0(input)?;
     let (input, pk) = nom::combinator::opt(tag("PRIMARY KEY"))(input)?;
@@ -267,6 +270,7 @@ fn parse_column_definition(input: &str) -> IResult<&str, ColumnDefinition> {
         data_type,
         auto_increment: auto_inc.is_some(),
         primary_key: pk.is_some(),
+        not_null: nn.is_some(),
         references: fk_ref,
     }))
 }
@@ -2343,6 +2347,19 @@ mod tests {
                 let fk = ct.columns[1].references.as_ref().unwrap();
                 assert_eq!(fk.table, "users");
                 assert_eq!(fk.column, "id");
+            }
+            _ => panic!("Expected CreateTable"),
+        }
+    }
+
+    #[test]
+    fn test_parse_not_null() {
+        let sql = "CREATE TABLE users (id INT NOT NULL, name VARCHAR);";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::CreateTable(ct) => {
+                assert!(ct.columns[0].not_null);
+                assert!(!ct.columns[1].not_null);
             }
             _ => panic!("Expected CreateTable"),
         }

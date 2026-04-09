@@ -31,6 +31,7 @@ pub struct CreateIndexStatement {
     pub index_name: String,
     pub table_name: String,
     pub column_name: String,
+    pub unique: bool,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -249,6 +250,7 @@ pub fn parse_create(input: &str) -> IResult<&str, SqlStatement> {
     let (input, _) = multispace1(input)?;
     nom::branch::alt((
         parse_create_table_inner,
+        parse_create_unique_index_inner,
         parse_create_index_inner,
     ))(input)
 }
@@ -272,6 +274,32 @@ fn parse_create_table_inner(input: &str) -> IResult<&str, SqlStatement> {
     })))
 }
 
+// CREATE UNIQUE INDEX index_name ON table(column);
+fn parse_create_unique_index_inner(input: &str) -> IResult<&str, SqlStatement> {
+    let (input, _) = tag("UNIQUE")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, _) = tag("INDEX")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, index_name) = parse_identifier(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, _) = tag("ON")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, table_name) = parse_identifier(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, column_name) = parse_identifier(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
+
+    Ok((input, SqlStatement::CreateIndex(CreateIndexStatement {
+        index_name: index_name.to_string(),
+        table_name: table_name.to_string(),
+        column_name: column_name.to_string(),
+        unique: true,
+    })))
+}
+
 // CREATE INDEX index_name ON table(column);
 fn parse_create_index_inner(input: &str) -> IResult<&str, SqlStatement> {
     let (input, _) = tag("INDEX")(input)?;
@@ -292,6 +320,7 @@ fn parse_create_index_inner(input: &str) -> IResult<&str, SqlStatement> {
         index_name: index_name.to_string(),
         table_name: table_name.to_string(),
         column_name: column_name.to_string(),
+        unique: false,
     })))
 }
 
@@ -2451,6 +2480,22 @@ mod tests {
                 assert_eq!(ci.index_name, "idx_name");
                 assert_eq!(ci.table_name, "users");
                 assert_eq!(ci.column_name, "name");
+                assert!(!ci.unique);
+            }
+            _ => panic!("Expected CreateIndex"),
+        }
+    }
+
+    #[test]
+    fn test_parse_create_unique_index() {
+        let sql = "CREATE UNIQUE INDEX idx_email ON users (email);";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::CreateIndex(ci) => {
+                assert_eq!(ci.index_name, "idx_email");
+                assert_eq!(ci.table_name, "users");
+                assert_eq!(ci.column_name, "email");
+                assert!(ci.unique);
             }
             _ => panic!("Expected CreateIndex"),
         }

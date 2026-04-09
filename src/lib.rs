@@ -43,8 +43,9 @@ pub fn execute(storage: &Storage, sql: &str) -> Result<String, String> {
                 .map_err(|e| e.to_string())
         }
         SqlStatement::CreateIndex(idx_stmt) => {
+            let label = if idx_stmt.unique { "unique index" } else { "index" };
             storage.create_index(&idx_stmt)
-                .map(|_| format!("Created index '{}'", idx_stmt.index_name))
+                .map(|_| format!("Created {} '{}'", label, idx_stmt.index_name))
                 .map_err(|e| e.to_string())
         }
         SqlStatement::DropIndex(idx_stmt) => {

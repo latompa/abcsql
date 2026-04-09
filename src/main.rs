@@ -177,8 +177,9 @@ fn execute_sql(sql: &str, storage: &Storage) {
         }
         SqlStatement::CreateIndex(idx_stmt) => {
             let name = idx_stmt.index_name.clone();
+            let unique = idx_stmt.unique;
             match storage.create_index(&idx_stmt) {
-                Ok(_) => println!("Created index '{}'", name),
+                Ok(_) => println!("Created{} index '{}'", if unique { " unique" } else { "" }, name),
                 Err(e) => eprintln!("Error: {}", e),
             }
         }

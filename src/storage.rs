@@ -191,6 +191,9 @@ impl Storage {
             }
         }
 
+        // Enforce unique index constraints
+        self.check_unique_indexes(&stmt.table_name, &final_values)?;
+
         // Enforce foreign key constraints
         for (i, col_def) in schema.columns.iter().enumerate() {
             if let Some(ref fk) = col_def.references {
@@ -487,7 +490,7 @@ impl Storage {
 
         // Drop all indexes for this table
         let meta = self.load_index_meta()?;
-        for (idx_name, t, _) in &meta {
+        for (idx_name, t, _, _) in &meta {
             if t == table_name {
                 let idx_path = self.index_data_path(idx_name);
                 if idx_path.exists() {
@@ -496,12 +499,16 @@ impl Storage {
             }
         }
         // Rewrite metadata without this table's indexes
-        let remaining: Vec<_> = meta.iter().filter(|(_, t, _)| t != table_name).collect();
+        let remaining: Vec<_> = meta.iter().filter(|(_, t, _, _)| t != table_name).collect();
         let meta_path = self.index_meta_path();
         if meta_path.exists() {
             let mut file = fs::File::create(meta_path)?;
-            for (name, table, col) in remaining {
-                writeln!(file, "{}:{}:{}", name, table, col)?;
+            for (name, table, col, unique) in remaining {
+                if *unique {
+                    writeln!(file, "{}:{}:{}:UNIQUE", name, table, col)?;
+                } else {
+                    writeln!(file, "{}:{}:{}", name, table, col)?;
+                }
             }
         }
 
@@ -590,7 +597,7 @@ impl Storage {
     }
 
     /// Load all index metadata entries
-    pub fn load_index_meta(&self) -> Result<Vec<(String, String, String)>, StorageError> {
+    pub fn load_index_meta(&self) -> Result<Vec<(String, String, String, bool)>, StorageError> {
         let path = self.index_meta_path();
         if !path.exists() {
             return Ok(Vec::new());
@@ -599,8 +606,9 @@ impl Storage {
         let mut entries = Vec::new();
         for line in content.lines() {
             let parts: Vec<&str> = line.split(':').collect();
-            if parts.len() == 3 {
-                entries.push((parts[0].to_string(), parts[1].to_string(), parts[2].to_string()));
+            if parts.len() >= 3 {
+                let unique = parts.get(3) == Some(&"UNIQUE");
+                entries.push((parts[0].to_string(), parts[1].to_string(), parts[2].to_string(), unique));
             }
         }
         Ok(entries)
@@ -616,7 +624,7 @@ impl Storage {
 
         // Check index doesn't already exist
         let meta = self.load_index_meta()?;
-        if meta.iter().any(|(name, _, _)| name == &stmt.index_name) {
+        if meta.iter().any(|(name, _, _, _)| name == &stmt.index_name) {
             return Err(StorageError::IndexAlreadyExists(stmt.index_name.clone()));
         }
 
@@ -628,13 +636,29 @@ impl Storage {
             index.entry(key).or_default().push(row_num);
         }
 
+        // For unique indexes, check no duplicates exist in current data
+        if stmt.unique {
+            for (key, row_nums) in &index {
+                if key != "NULL" && row_nums.len() > 1 {
+                    return Err(StorageError::DuplicateKey {
+                        column: stmt.column_name.clone(),
+                        value: key.clone(),
+                    });
+                }
+            }
+        }
+
         // Write index data
         self.write_index_data(&stmt.index_name, &index)?;
 
         // Append to metadata
         let meta_path = self.index_meta_path();
         let mut file = fs::OpenOptions::new().create(true).append(true).open(meta_path)?;
-        writeln!(file, "{}:{}:{}", stmt.index_name, stmt.table_name, stmt.column_name)?;
+        if stmt.unique {
+            writeln!(file, "{}:{}:{}:UNIQUE", stmt.index_name, stmt.table_name, stmt.column_name)?;
+        } else {
+            writeln!(file, "{}:{}:{}", stmt.index_name, stmt.table_name, stmt.column_name)?;
+        }
 
         Ok(())
     }
@@ -642,7 +666,7 @@ impl Storage {
     /// Drop an index
     pub fn drop_index(&self, index_name: &str) -> Result<(), StorageError> {
         let meta = self.load_index_meta()?;
-        if !meta.iter().any(|(name, _, _)| name == index_name) {
+        if !meta.iter().any(|(name, _, _, _)| name == index_name) {
             return Err(StorageError::IndexNotFound(index_name.to_string()));
         }
 
@@ -653,11 +677,15 @@ impl Storage {
         }
 
         // Rewrite metadata without this index
-        let remaining: Vec<_> = meta.iter().filter(|(name, _, _)| name != index_name).collect();
+        let remaining: Vec<_> = meta.iter().filter(|(name, _, _, _)| name != index_name).collect();
         let meta_path = self.index_meta_path();
         let mut file = fs::File::create(meta_path)?;
-        for (name, table, col) in remaining {
-            writeln!(file, "{}:{}:{}", name, table, col)?;
+        for (name, table, col, unique) in remaining {
+            if *unique {
+                writeln!(file, "{}:{}:{}:UNIQUE", name, table, col)?;
+            } else {
+                writeln!(file, "{}:{}:{}", name, table, col)?;
+            }
         }
 
         Ok(())
@@ -700,15 +728,42 @@ impl Storage {
     pub fn find_index(&self, table_name: &str, column_name: &str) -> Result<Option<String>, StorageError> {
         let meta = self.load_index_meta()?;
         Ok(meta.iter()
-            .find(|(_, t, c)| t == table_name && c == column_name)
-            .map(|(name, _, _)| name.clone()))
+            .find(|(_, t, c, _)| t == table_name && c == column_name)
+            .map(|(name, _, _, _)| name.clone()))
     }
 
-    /// Rebuild all indexes for a table (called after update/delete)
+    // Check unique index constraints for a table before inserting a value
+    fn check_unique_indexes(&self, table_name: &str, values: &[Value]) -> Result<(), StorageError> {
+        let meta = self.load_index_meta()?;
+        let schema = self.load_schema(table_name)?;
+        for (idx_name, t, col_name, unique) in &meta {
+            if !unique || t != table_name {
+                continue;
+            }
+            let col_idx = schema.columns.iter()
+                .position(|c| &c.name == col_name)
+                .ok_or_else(|| StorageError::ColumnNotFound(col_name.clone()))?;
+            let val = &values[col_idx];
+            if *val == Value::Null {
+                continue; // NULL doesn't violate uniqueness
+            }
+            if let Some(row_nums) = self.lookup_index(idx_name, val)? {
+                if !row_nums.is_empty() {
+                    return Err(StorageError::DuplicateKey {
+                        column: col_name.clone(),
+                        value: format!("{:?}", val),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Rebuild all indexes for a table (called after insert/update/delete)
     fn rebuild_indexes_for_table(&self, table_name: &str) -> Result<(), StorageError> {
         let meta = self.load_index_meta()?;
         let table_indexes: Vec<_> = meta.iter()
-            .filter(|(_, t, _)| t == table_name)
+            .filter(|(_, t, _, _)| t == table_name)
             .collect();
         if table_indexes.is_empty() {
             return Ok(());
@@ -717,7 +772,7 @@ impl Storage {
         let schema = self.load_schema(table_name)?;
         let rows = self.read_rows(table_name)?;
 
-        for (idx_name, _, col_name) in &table_indexes {
+        for (idx_name, _, col_name, _) in &table_indexes {
             let col_idx = schema.columns.iter()
                 .position(|c| &c.name == col_name)
                 .ok_or_else(|| StorageError::ColumnNotFound(col_name.clone()))?;
@@ -2207,6 +2262,7 @@ mod tests {
             index_name: "idx_name".to_string(),
             table_name: "users".to_string(),
             column_name: "name".to_string(),
+            unique: false,
         }).unwrap();
 
         // Lookup should find matching rows
@@ -2253,6 +2309,7 @@ mod tests {
             index_name: "idx_name".to_string(),
             table_name: "users".to_string(),
             column_name: "name".to_string(),
+            unique: false,
         }).unwrap();
 
         // Insert another row — index should be rebuilt
@@ -2296,6 +2353,7 @@ mod tests {
             index_name: "idx_name".to_string(),
             table_name: "users".to_string(),
             column_name: "name".to_string(),
+            unique: false,
         }).unwrap();
 
         // Delete Alice
@@ -2339,6 +2397,7 @@ mod tests {
             index_name: "idx_name".to_string(),
             table_name: "users".to_string(),
             column_name: "name".to_string(),
+            unique: false,
         }).unwrap();
 
         // Drop the index
@@ -2373,6 +2432,7 @@ mod tests {
             index_name: "idx_name".to_string(),
             table_name: "users".to_string(),
             column_name: "name".to_string(),
+            unique: false,
         }).unwrap();
 
         // Creating an index with the same name should fail
@@ -2380,6 +2440,7 @@ mod tests {
             index_name: "idx_name".to_string(),
             table_name: "users".to_string(),
             column_name: "name".to_string(),
+            unique: false,
         });
         assert!(matches!(result, Err(StorageError::IndexAlreadyExists(_))));
 
@@ -2418,6 +2479,90 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0], vec![Value::Int(1), Value::String("Alice".to_string())]);
         assert_eq!(rows[1], vec![Value::Int(3), Value::String("Charlie".to_string())]);
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_unique_index_enforced_on_insert() {
+        let temp_dir = format!("/tmp/abcsql_test_uidx_{}", std::process::id());
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        let create = CreateTableStatement {
+            table_name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id", DataType::Int),
+                ColumnDefinition::new("email", DataType::Varchar(None)),
+            ],
+        };
+        storage.create_table(&create).unwrap();
+
+        storage.insert_row(&InsertStatement {
+            table_name: "users".to_string(),
+            values: vec![Value::Int(1), Value::String("a@b.com".to_string())],
+        }).unwrap();
+
+        // Create unique index on email
+        storage.create_index(&CreateIndexStatement {
+            index_name: "idx_email".to_string(),
+            table_name: "users".to_string(),
+            column_name: "email".to_string(),
+            unique: true,
+        }).unwrap();
+
+        // Inserting a duplicate email should fail
+        let result = storage.insert_row(&InsertStatement {
+            table_name: "users".to_string(),
+            values: vec![Value::Int(2), Value::String("a@b.com".to_string())],
+        });
+        assert!(matches!(result, Err(StorageError::DuplicateKey { .. })));
+
+        // Inserting a different email should succeed
+        storage.insert_row(&InsertStatement {
+            table_name: "users".to_string(),
+            values: vec![Value::Int(3), Value::String("c@d.com".to_string())],
+        }).unwrap();
+
+        // NULL should not violate unique index
+        storage.insert_row(&InsertStatement {
+            table_name: "users".to_string(),
+            values: vec![Value::Int(4), Value::Null],
+        }).unwrap();
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_unique_index_rejects_existing_duplicates() {
+        let temp_dir = format!("/tmp/abcsql_test_uidx_dup_{}", std::process::id());
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        let create = CreateTableStatement {
+            table_name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id", DataType::Int),
+                ColumnDefinition::new("name", DataType::Varchar(None)),
+            ],
+        };
+        storage.create_table(&create).unwrap();
+
+        storage.insert_row(&InsertStatement {
+            table_name: "users".to_string(),
+            values: vec![Value::Int(1), Value::String("Alice".to_string())],
+        }).unwrap();
+        storage.insert_row(&InsertStatement {
+            table_name: "users".to_string(),
+            values: vec![Value::Int(2), Value::String("Alice".to_string())],
+        }).unwrap();
+
+        // Creating a unique index should fail because duplicates exist
+        let result = storage.create_index(&CreateIndexStatement {
+            index_name: "idx_name".to_string(),
+            table_name: "users".to_string(),
+            column_name: "name".to_string(),
+            unique: true,
+        });
+        assert!(matches!(result, Err(StorageError::DuplicateKey { .. })));
 
         fs::remove_dir_all(&temp_dir).unwrap();
     }

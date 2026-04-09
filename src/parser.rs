@@ -29,11 +29,12 @@ pub struct ColumnDefinition {
     pub name: String,
     pub data_type: DataType,
     pub auto_increment: bool,
+    pub primary_key: bool,
 }
 
 impl ColumnDefinition {
     pub fn new(name: &str, data_type: DataType) -> Self {
-        Self { name: name.to_string(), data_type, auto_increment: false }
+        Self { name: name.to_string(), data_type, auto_increment: false, primary_key: false }
     }
 }
 
@@ -249,11 +250,14 @@ fn parse_column_definition(input: &str) -> IResult<&str, ColumnDefinition> {
     let (input, _) = multispace0(input)?;
     let (input, auto_inc) = nom::combinator::opt(tag("AUTO_INCREMENT"))(input)?;
     let (input, _) = multispace0(input)?;
+    let (input, pk) = nom::combinator::opt(tag("PRIMARY KEY"))(input)?;
+    let (input, _) = multispace0(input)?;
 
     Ok((input, ColumnDefinition {
         name: name.to_string(),
         data_type,
         auto_increment: auto_inc.is_some(),
+        primary_key: pk.is_some(),
     }))
 }
 
@@ -2281,5 +2285,30 @@ mod tests {
             _ => panic!("Expected CreateTable"),
         }
     }
-}
 
+    #[test]
+    fn test_parse_primary_key() {
+        let sql = "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR);";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::CreateTable(ct) => {
+                assert!(ct.columns[0].primary_key);
+                assert!(!ct.columns[1].primary_key);
+            }
+            _ => panic!("Expected CreateTable"),
+        }
+    }
+
+    #[test]
+    fn test_parse_auto_increment_primary_key() {
+        let sql = "CREATE TABLE users (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR);";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::CreateTable(ct) => {
+                assert!(ct.columns[0].auto_increment);
+                assert!(ct.columns[0].primary_key);
+            }
+            _ => panic!("Expected CreateTable"),
+        }
+    }
+}

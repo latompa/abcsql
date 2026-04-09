@@ -19,6 +19,8 @@ pub enum StorageError {
     TypeMismatch { column: String, expected: String, got: String },
     InvalidData(String),
     ColumnNotFound(String),
+    DuplicateKey { column: String, value: String },
+    NullConstraint { column: String },
 }
 
 impl From<io::Error> for StorageError {
@@ -42,6 +44,12 @@ impl fmt::Display for StorageError {
             }
             StorageError::InvalidData(msg) => write!(f, "Invalid data: {}", msg),
             StorageError::ColumnNotFound(name) => write!(f, "Column '{}' not found", name),
+            StorageError::DuplicateKey { column, value } => {
+                write!(f, "Duplicate key in column '{}': {}", column, value)
+            }
+            StorageError::NullConstraint { column } => {
+                write!(f, "NULL not allowed in PRIMARY KEY column '{}'", column)
+            }
         }
     }
 }
@@ -83,14 +91,15 @@ impl Storage {
         // First line: table name
         writeln!(file, "{}", stmt.table_name)?;
 
-        // Subsequent lines: column definitions
+        // Subsequent lines: column definitions (name:TYPE[:flags...])
         for col in &stmt.columns {
             let type_str = data_type_to_string(&col.data_type);
-            if col.auto_increment {
-                writeln!(file, "{}:{}:AUTO_INCREMENT", col.name, type_str)?;
-            } else {
-                writeln!(file, "{}:{}", col.name, type_str)?;
-            }
+            let mut parts = vec![col.name.as_str(), type_str.as_str()];
+            let ai = "AUTO_INCREMENT".to_string();
+            let pk = "PRIMARY_KEY".to_string();
+            if col.auto_increment { parts.push(&ai); }
+            if col.primary_key { parts.push(&pk); }
+            writeln!(file, "{}", parts.join(":"))?;
         }
 
         // Create empty data file
@@ -133,6 +142,30 @@ impl Storage {
             validate_value_type(value, &col_def.data_type, &col_def.name)?;
         }
 
+        // Enforce primary key constraints (NOT NULL + unique)
+        let pk_columns: Vec<(usize, &ColumnDefinition)> = schema.columns.iter()
+            .enumerate()
+            .filter(|(_, c)| c.primary_key)
+            .collect();
+        if !pk_columns.is_empty() {
+            for &(i, col_def) in &pk_columns {
+                if final_values[i] == Value::Null {
+                    return Err(StorageError::NullConstraint { column: col_def.name.clone() });
+                }
+            }
+            let existing_rows = self.read_rows(&stmt.table_name)?;
+            for row in &existing_rows {
+                for &(i, col_def) in &pk_columns {
+                    if row[i] == final_values[i] {
+                        return Err(StorageError::DuplicateKey {
+                            column: col_def.name.clone(),
+                            value: format!("{:?}", final_values[i]),
+                        });
+                    }
+                }
+            }
+        }
+
         // Serialize row and append to data file
         let data_path = self.data_path(&stmt.table_name);
         let file = fs::OpenOptions::new()
@@ -158,6 +191,10 @@ impl Storage {
                 .find(|c| c.name == assignment.column)
                 .ok_or_else(|| StorageError::ColumnNotFound(assignment.column.clone()))?;
             validate_value_type(&assignment.value, &col_def.data_type, &col_def.name)?;
+            // Prevent setting primary key columns to NULL
+            if col_def.primary_key && assignment.value == Value::Null {
+                return Err(StorageError::NullConstraint { column: col_def.name.clone() });
+            }
         }
 
         // Read all existing rows
@@ -301,12 +338,15 @@ impl Storage {
 
             let col_name = parts[0].to_string();
             let data_type = parse_data_type(parts[1])?;
-            let auto_increment = parts.get(2).map_or(false, |&s| s == "AUTO_INCREMENT");
+            let flags: Vec<&str> = parts[2..].to_vec();
+            let auto_increment = flags.contains(&"AUTO_INCREMENT");
+            let primary_key = flags.contains(&"PRIMARY_KEY");
 
             columns.push(ColumnDefinition {
                 name: col_name,
                 data_type,
                 auto_increment,
+                primary_key,
             });
         }
 
@@ -1556,7 +1596,7 @@ mod tests {
         let create = CreateTableStatement {
             table_name: "users".to_string(),
             columns: vec![
-                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: true },
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: true, primary_key: false },
                 ColumnDefinition::new("name", DataType::Varchar(None)),
             ],
         };
@@ -1588,6 +1628,67 @@ mod tests {
 
         let rows = storage.read_rows("users").unwrap();
         assert_eq!(rows[2][0], Value::Int(10));
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_primary_key_unique() {
+        let temp_dir = format!("/tmp/abcsql_test_pk_{}", std::process::id());
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        let create = CreateTableStatement {
+            table_name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true },
+                ColumnDefinition::new("name", DataType::Varchar(None)),
+            ],
+        };
+        storage.create_table(&create).unwrap();
+
+        let insert1 = InsertStatement {
+            table_name: "users".to_string(),
+            values: vec![Value::Int(1), Value::String("Alice".to_string())],
+        };
+        storage.insert_row(&insert1).unwrap();
+
+        // Duplicate key should fail
+        let insert2 = InsertStatement {
+            table_name: "users".to_string(),
+            values: vec![Value::Int(1), Value::String("Bob".to_string())],
+        };
+        assert!(matches!(storage.insert_row(&insert2), Err(StorageError::DuplicateKey { .. })));
+
+        // Different key should succeed
+        let insert3 = InsertStatement {
+            table_name: "users".to_string(),
+            values: vec![Value::Int(2), Value::String("Bob".to_string())],
+        };
+        storage.insert_row(&insert3).unwrap();
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_primary_key_not_null() {
+        let temp_dir = format!("/tmp/abcsql_test_pknull_{}", std::process::id());
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        let create = CreateTableStatement {
+            table_name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true },
+                ColumnDefinition::new("name", DataType::Varchar(None)),
+            ],
+        };
+        storage.create_table(&create).unwrap();
+
+        // NULL primary key should fail
+        let insert = InsertStatement {
+            table_name: "users".to_string(),
+            values: vec![Value::Null, Value::String("Alice".to_string())],
+        };
+        assert!(matches!(storage.insert_row(&insert), Err(StorageError::NullConstraint { .. })));
 
         fs::remove_dir_all(&temp_dir).unwrap();
     }

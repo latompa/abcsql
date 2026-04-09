@@ -27,7 +27,7 @@
 
 ## Schema & Constraints
 
-- [ ] PRIMARY KEY constraint
+- [x] PRIMARY KEY constraint
 - [ ] FOREIGN KEY constraint
 - [ ] NOT NULL constraint
 - [ ] UNIQUE constraint
@@ -45,3 +45,7 @@
 ## Tooling
 
 - [ ] Interactive REPL / SQL shell
+
+## Common table structures
+- [ ] 1 - n (customer has many orders)
+- [ ] 1 - n - 1 (product has many tags (via join table))

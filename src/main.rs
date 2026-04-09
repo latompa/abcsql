@@ -112,8 +112,9 @@ fn handle_meta_command(cmd: &str, storage: &Storage) {
                             parser::DataType::Varchar(None) => "VARCHAR".to_string(),
                         };
                         let auto_inc = if col.auto_increment { " AUTO_INCREMENT" } else { "" };
+                        let pk = if col.primary_key { " PRIMARY KEY" } else { "" };
                         let comma = if i < schema.columns.len() - 1 { "," } else { "" };
-                        println!("  {} {}{}{}", col.name, type_str, auto_inc, comma);
+                        println!("  {} {}{}{}{}", col.name, type_str, auto_inc, pk, comma);
                     }
                     println!(");");
                 }

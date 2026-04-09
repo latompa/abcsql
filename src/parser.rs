@@ -30,11 +30,18 @@ pub struct ColumnDefinition {
     pub data_type: DataType,
     pub auto_increment: bool,
     pub primary_key: bool,
+    pub references: Option<ForeignKeyRef>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct ForeignKeyRef {
+    pub table: String,
+    pub column: String,
 }
 
 impl ColumnDefinition {
     pub fn new(name: &str, data_type: DataType) -> Self {
-        Self { name: name.to_string(), data_type, auto_increment: false, primary_key: false }
+        Self { name: name.to_string(), data_type, auto_increment: false, primary_key: false, references: None }
     }
 }
 
@@ -252,13 +259,27 @@ fn parse_column_definition(input: &str) -> IResult<&str, ColumnDefinition> {
     let (input, _) = multispace0(input)?;
     let (input, pk) = nom::combinator::opt(tag("PRIMARY KEY"))(input)?;
     let (input, _) = multispace0(input)?;
+    let (input, fk_ref) = nom::combinator::opt(parse_references)(input)?;
+    let (input, _) = multispace0(input)?;
 
     Ok((input, ColumnDefinition {
         name: name.to_string(),
         data_type,
         auto_increment: auto_inc.is_some(),
         primary_key: pk.is_some(),
+        references: fk_ref,
     }))
+}
+
+// Parse REFERENCES table(column)
+fn parse_references(input: &str) -> IResult<&str, ForeignKeyRef> {
+    let (input, _) = tag("REFERENCES")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, table) = parse_identifier(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, column) = parse_identifier(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, ForeignKeyRef { table: table.to_string(), column: column.to_string() }))
 }
 
 /// Parse data type: INT or VARCHAR or VARCHAR(n)
@@ -2307,6 +2328,21 @@ mod tests {
             SqlStatement::CreateTable(ct) => {
                 assert!(ct.columns[0].auto_increment);
                 assert!(ct.columns[0].primary_key);
+            }
+            _ => panic!("Expected CreateTable"),
+        }
+    }
+
+    #[test]
+    fn test_parse_foreign_key() {
+        let sql = "CREATE TABLE orders (id INT, user_id INT REFERENCES users(id));";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::CreateTable(ct) => {
+                assert!(ct.columns[1].references.is_some());
+                let fk = ct.columns[1].references.as_ref().unwrap();
+                assert_eq!(fk.table, "users");
+                assert_eq!(fk.column, "id");
             }
             _ => panic!("Expected CreateTable"),
         }

@@ -2,7 +2,7 @@ use std::fs;
 use std::io::{self, Write as IoWrite, BufWriter, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::fmt;
-use crate::parser::{CreateTableStatement, ColumnDefinition, DataType, InsertStatement, UpdateStatement, DeleteStatement, Value, Condition, Expression, Operator};
+use crate::parser::{CreateTableStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, UpdateStatement, DeleteStatement, Value, Condition, Expression, Operator};
 
 /// Storage engine for persisting tables to disk
 pub struct Storage {
@@ -21,6 +21,7 @@ pub enum StorageError {
     ColumnNotFound(String),
     DuplicateKey { column: String, value: String },
     NullConstraint { column: String },
+    ForeignKeyViolation { column: String, ref_table: String, ref_column: String },
 }
 
 impl From<io::Error> for StorageError {
@@ -49,6 +50,9 @@ impl fmt::Display for StorageError {
             }
             StorageError::NullConstraint { column } => {
                 write!(f, "NULL not allowed in PRIMARY KEY column '{}'", column)
+            }
+            StorageError::ForeignKeyViolation { column, ref_table, ref_column } => {
+                write!(f, "Foreign key violation: '{}' references {}.{}", column, ref_table, ref_column)
             }
         }
     }
@@ -97,8 +101,10 @@ impl Storage {
             let mut parts = vec![col.name.as_str(), type_str.as_str()];
             let ai = "AUTO_INCREMENT".to_string();
             let pk = "PRIMARY_KEY".to_string();
+            let fk = col.references.as_ref().map(|r| format!("FK={}.{}", r.table, r.column));
             if col.auto_increment { parts.push(&ai); }
             if col.primary_key { parts.push(&pk); }
+            if let Some(ref fk_str) = fk { parts.push(fk_str); }
             writeln!(file, "{}", parts.join(":"))?;
         }
 
@@ -162,6 +168,15 @@ impl Storage {
                             value: format!("{:?}", final_values[i]),
                         });
                     }
+                }
+            }
+        }
+
+        // Enforce foreign key constraints
+        for (i, col_def) in schema.columns.iter().enumerate() {
+            if let Some(ref fk) = col_def.references {
+                if final_values[i] != Value::Null {
+                    self.validate_foreign_key(&final_values[i], fk, &col_def.name)?;
                 }
             }
         }
@@ -238,20 +253,28 @@ impl Storage {
 
         // Read all existing rows
         let rows = self.read_rows(&stmt.table_name)?;
-        let original_count = rows.len();
 
-        // Filter out rows that match the condition (keep non-matching rows)
-        let remaining_rows: Vec<Vec<Value>> = rows
+        // Split into rows to keep and rows to delete
+        let (remaining_rows, deleted_rows): (Vec<_>, Vec<_>) = rows
             .into_iter()
-            .filter(|row| {
+            .partition(|row| {
                 match &stmt.where_clause {
                     Some(wc) => !evaluate_condition(&wc.condition, row, &schema.columns),
-                    None => false, // No WHERE clause means delete all rows
+                    None => false,
                 }
-            })
-            .collect();
+            });
 
-        let deleted_count = original_count - remaining_rows.len();
+        let deleted_count = deleted_rows.len();
+
+        // Check FK constraints on deleted rows — are any referenced by child tables?
+        for (i, col) in schema.columns.iter().enumerate() {
+            if col.primary_key {
+                let deleted_values: Vec<Value> = deleted_rows.iter().map(|r| r[i].clone()).collect();
+                if !deleted_values.is_empty() {
+                    self.check_fk_references(&stmt.table_name, &col.name, &deleted_values)?;
+                }
+            }
+        }
 
         // Write remaining rows back to file
         let data_path = self.data_path(&stmt.table_name);
@@ -341,12 +364,20 @@ impl Storage {
             let flags: Vec<&str> = parts[2..].to_vec();
             let auto_increment = flags.contains(&"AUTO_INCREMENT");
             let primary_key = flags.contains(&"PRIMARY_KEY");
+            let references = flags.iter()
+                .find(|f| f.starts_with("FK="))
+                .map(|f| {
+                    let fk = &f[3..];
+                    let dot = fk.find('.').unwrap();
+                    ForeignKeyRef { table: fk[..dot].to_string(), column: fk[dot+1..].to_string() }
+                });
 
             columns.push(ColumnDefinition {
                 name: col_name,
                 data_type,
                 auto_increment,
                 primary_key,
+                references,
             });
         }
 
@@ -430,6 +461,52 @@ impl Storage {
         let next = current + 1;
         fs::write(&seq_path, next.to_string())?;
         Ok(next)
+    }
+
+    /// Check that a value exists in the referenced table's column
+    fn validate_foreign_key(&self, value: &Value, fk: &ForeignKeyRef, col_name: &str) -> Result<(), StorageError> {
+        let ref_schema = self.load_schema(&fk.table)?;
+        let ref_col_idx = ref_schema.columns.iter()
+            .position(|c| c.name == fk.column)
+            .ok_or_else(|| StorageError::InvalidSchema(
+                format!("FK references unknown column {}.{}", fk.table, fk.column)
+            ))?;
+        let ref_rows = self.read_rows(&fk.table)?;
+        let exists = ref_rows.iter().any(|row| row[ref_col_idx] == *value);
+        if !exists {
+            return Err(StorageError::ForeignKeyViolation {
+                column: col_name.to_string(),
+                ref_table: fk.table.clone(),
+                ref_column: fk.column.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Check if any table has a FK referencing the given table+column with the given values
+    fn check_fk_references(&self, table_name: &str, col_name: &str, values: &[Value]) -> Result<(), StorageError> {
+        let tables = self.list_tables().map_err(StorageError::IoError)?;
+        for t in &tables {
+            if t == table_name { continue; }
+            let schema = self.load_schema(t)?;
+            for (i, col) in schema.columns.iter().enumerate() {
+                if let Some(ref fk) = col.references {
+                    if fk.table == table_name && fk.column == col_name {
+                        let rows = self.read_rows(t)?;
+                        for val in values {
+                            if rows.iter().any(|row| row[i] == *val) {
+                                return Err(StorageError::ForeignKeyViolation {
+                                    column: col.name.clone(),
+                                    ref_table: table_name.to_string(),
+                                    ref_column: col_name.to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1596,7 +1673,7 @@ mod tests {
         let create = CreateTableStatement {
             table_name: "users".to_string(),
             columns: vec![
-                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: true, primary_key: false },
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: true, primary_key: false, references: None },
                 ColumnDefinition::new("name", DataType::Varchar(None)),
             ],
         };
@@ -1640,7 +1717,7 @@ mod tests {
         let create = CreateTableStatement {
             table_name: "users".to_string(),
             columns: vec![
-                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true },
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, references: None },
                 ColumnDefinition::new("name", DataType::Varchar(None)),
             ],
         };
@@ -1677,7 +1754,7 @@ mod tests {
         let create = CreateTableStatement {
             table_name: "users".to_string(),
             columns: vec![
-                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true },
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, references: None },
                 ColumnDefinition::new("name", DataType::Varchar(None)),
             ],
         };
@@ -1689,6 +1766,119 @@ mod tests {
             values: vec![Value::Null, Value::String("Alice".to_string())],
         };
         assert!(matches!(storage.insert_row(&insert), Err(StorageError::NullConstraint { .. })));
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_foreign_key_insert() {
+        let temp_dir = format!("/tmp/abcsql_test_fk_{}", std::process::id());
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        // Parent table
+        let create_users = CreateTableStatement {
+            table_name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, references: None },
+                ColumnDefinition::new("name", DataType::Varchar(None)),
+            ],
+        };
+        storage.create_table(&create_users).unwrap();
+        storage.insert_row(&InsertStatement {
+            table_name: "users".to_string(),
+            values: vec![Value::Int(1), Value::String("Alice".to_string())],
+        }).unwrap();
+
+        // Child table with FK
+        let create_orders = CreateTableStatement {
+            table_name: "orders".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id", DataType::Int),
+                ColumnDefinition { name: "user_id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: false,
+                    references: Some(ForeignKeyRef { table: "users".to_string(), column: "id".to_string() }) },
+            ],
+        };
+        storage.create_table(&create_orders).unwrap();
+
+        // Valid FK reference
+        storage.insert_row(&InsertStatement {
+            table_name: "orders".to_string(),
+            values: vec![Value::Int(1), Value::Int(1)],
+        }).unwrap();
+
+        // Invalid FK reference should fail
+        let result = storage.insert_row(&InsertStatement {
+            table_name: "orders".to_string(),
+            values: vec![Value::Int(2), Value::Int(999)],
+        });
+        assert!(matches!(result, Err(StorageError::ForeignKeyViolation { .. })));
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_foreign_key_delete_parent() {
+        let temp_dir = format!("/tmp/abcsql_test_fkdel_{}", std::process::id());
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        // Parent table
+        let create_users = CreateTableStatement {
+            table_name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, references: None },
+                ColumnDefinition::new("name", DataType::Varchar(None)),
+            ],
+        };
+        storage.create_table(&create_users).unwrap();
+        storage.insert_row(&InsertStatement {
+            table_name: "users".to_string(),
+            values: vec![Value::Int(1), Value::String("Alice".to_string())],
+        }).unwrap();
+        storage.insert_row(&InsertStatement {
+            table_name: "users".to_string(),
+            values: vec![Value::Int(2), Value::String("Bob".to_string())],
+        }).unwrap();
+
+        // Child table with FK
+        let create_orders = CreateTableStatement {
+            table_name: "orders".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id", DataType::Int),
+                ColumnDefinition { name: "user_id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: false,
+                    references: Some(ForeignKeyRef { table: "users".to_string(), column: "id".to_string() }) },
+            ],
+        };
+        storage.create_table(&create_orders).unwrap();
+        storage.insert_row(&InsertStatement {
+            table_name: "orders".to_string(),
+            values: vec![Value::Int(1), Value::Int(1)],
+        }).unwrap();
+
+        // Deleting referenced parent should fail
+        let result = storage.delete_rows(&DeleteStatement {
+            table_name: "users".to_string(),
+            where_clause: Some(crate::parser::WhereClause {
+                condition: Condition {
+                    left: Expression::Column("id".to_string()),
+                    operator: Operator::Equals,
+                    right: Expression::Literal(Value::Int(1)),
+                },
+            }),
+        });
+        assert!(matches!(result, Err(StorageError::ForeignKeyViolation { .. })));
+
+        // Deleting non-referenced parent should succeed
+        let result = storage.delete_rows(&DeleteStatement {
+            table_name: "users".to_string(),
+            where_clause: Some(crate::parser::WhereClause {
+                condition: Condition {
+                    left: Expression::Column("id".to_string()),
+                    operator: Operator::Equals,
+                    right: Expression::Literal(Value::Int(2)),
+                },
+            }),
+        });
+        assert!(result.is_ok());
 
         fs::remove_dir_all(&temp_dir).unwrap();
     }

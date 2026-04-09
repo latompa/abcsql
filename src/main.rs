@@ -113,8 +113,11 @@ fn handle_meta_command(cmd: &str, storage: &Storage) {
                         };
                         let auto_inc = if col.auto_increment { " AUTO_INCREMENT" } else { "" };
                         let pk = if col.primary_key { " PRIMARY KEY" } else { "" };
+                        let fk = col.references.as_ref()
+                            .map(|r| format!(" REFERENCES {}({})", r.table, r.column))
+                            .unwrap_or_default();
                         let comma = if i < schema.columns.len() - 1 { "," } else { "" };
-                        println!("  {} {}{}{}{}", col.name, type_str, auto_inc, pk, comma);
+                        println!("  {} {}{}{}{}{}", col.name, type_str, auto_inc, pk, fk, comma);
                     }
                     println!(");");
                 }

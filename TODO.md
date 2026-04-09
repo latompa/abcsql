@@ -28,7 +28,7 @@
 ## Schema & Constraints
 
 - [x] PRIMARY KEY constraint
-- [ ] FOREIGN KEY constraint
+- [x] FOREIGN KEY constraint
 - [ ] NOT NULL constraint
 - [ ] UNIQUE constraint
 - [ ] ALTER TABLE statement

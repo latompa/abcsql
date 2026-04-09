@@ -106,6 +106,8 @@ fn handle_meta_command(cmd: &str, storage: &Storage) {
                             parser::DataType::Float => "FLOAT".to_string(),
                             parser::DataType::Double => "DOUBLE".to_string(),
                             parser::DataType::Boolean => "BOOLEAN".to_string(),
+                            parser::DataType::Date => "DATE".to_string(),
+                            parser::DataType::Timestamp => "TIMESTAMP".to_string(),
                             parser::DataType::Varchar(Some(n)) => format!("VARCHAR({})", n),
                             parser::DataType::Varchar(None) => "VARCHAR".to_string(),
                         };

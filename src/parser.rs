@@ -36,6 +36,8 @@ pub enum DataType {
     Float,
     Double,
     Boolean,
+    Date,
+    Timestamp,
     Varchar(Option<usize>), // VARCHAR(255) or VARCHAR
 }
 
@@ -248,12 +250,24 @@ fn parse_column_definition(input: &str) -> IResult<&str, ColumnDefinition> {
 /// Parse data type: INT or VARCHAR or VARCHAR(n)
 fn parse_data_type(input: &str) -> IResult<&str, DataType> {
     nom::branch::alt((
+        parse_timestamp_type,
         parse_double_type,
         parse_float_type,
         parse_boolean_type,
+        parse_date_type,
         parse_int_type,
         parse_varchar_type,
     ))(input)
+}
+
+fn parse_date_type(input: &str) -> IResult<&str, DataType> {
+    let (input, _) = tag("DATE")(input)?;
+    Ok((input, DataType::Date))
+}
+
+fn parse_timestamp_type(input: &str) -> IResult<&str, DataType> {
+    let (input, _) = tag("TIMESTAMP")(input)?;
+    Ok((input, DataType::Timestamp))
 }
 
 fn parse_boolean_type(input: &str) -> IResult<&str, DataType> {
@@ -2217,6 +2231,30 @@ mod tests {
                 assert_eq!(wc.condition.right, Expression::Literal(Value::Bool(false)));
             }
             _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_date_type() {
+        let sql = "CREATE TABLE events (event_date DATE);";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::CreateTable(ct) => {
+                assert_eq!(ct.columns[0].data_type, DataType::Date);
+            }
+            _ => panic!("Expected CreateTable"),
+        }
+    }
+
+    #[test]
+    fn test_parse_timestamp_type() {
+        let sql = "CREATE TABLE logs (created_at TIMESTAMP);";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::CreateTable(ct) => {
+                assert_eq!(ct.columns[0].data_type, DataType::Timestamp);
+            }
+            _ => panic!("Expected CreateTable"),
         }
     }
 }

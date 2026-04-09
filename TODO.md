@@ -21,7 +21,7 @@
 
 - [x] FLOAT / DOUBLE
 - [x] BOOLEAN
-- [ ] DATE / TIMESTAMP
+- [x] DATE / TIMESTAMP
 - [ ] AUTO_INCREMENT
 - [ ] JSON
 
@@ -32,6 +32,10 @@
 - [ ] NOT NULL constraint
 - [ ] UNIQUE constraint
 - [ ] ALTER TABLE statement
+
+## Additional
+- [ ] COALESCE
+- [ ] CAST functions (string to int etc)
 
 ## Performance & Storage
 

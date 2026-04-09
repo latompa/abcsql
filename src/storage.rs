@@ -360,6 +360,8 @@ fn data_type_to_string(data_type: &DataType) -> String {
         DataType::Double => "DOUBLE".to_string(),
         DataType::Varchar(Some(size)) => format!("VARCHAR({})", size),
         DataType::Boolean => "BOOLEAN".to_string(),
+        DataType::Date => "DATE".to_string(),
+        DataType::Timestamp => "TIMESTAMP".to_string(),
         DataType::Varchar(None) => "VARCHAR".to_string(),
     }
 }
@@ -374,6 +376,10 @@ fn parse_data_type(s: &str) -> Result<DataType, StorageError> {
         Ok(DataType::Double)
     } else if s == "BOOLEAN" || s == "BOOL" {
         Ok(DataType::Boolean)
+    } else if s == "DATE" {
+        Ok(DataType::Date)
+    } else if s == "TIMESTAMP" {
+        Ok(DataType::Timestamp)
     } else if s == "VARCHAR" {
         Ok(DataType::Varchar(None))
     } else if s.starts_with("VARCHAR(") && s.ends_with(')') {
@@ -394,6 +400,12 @@ fn validate_value_type(value: &Value, data_type: &DataType, column_name: &str) -
         (Value::Float(_), DataType::Float) => Ok(()),
         (Value::Float(_), DataType::Double) => Ok(()),
         (Value::Bool(_), DataType::Boolean) => Ok(()),
+        (Value::String(s), DataType::Date) => {
+            validate_date_format(s, column_name)
+        }
+        (Value::String(s), DataType::Timestamp) => {
+            validate_timestamp_format(s, column_name)
+        }
         (Value::Int(_), DataType::Float) => Ok(()),
         (Value::Int(_), DataType::Double) => Ok(()),
         (Value::String(_), DataType::Varchar(_)) => Ok(()),
@@ -402,6 +414,53 @@ fn validate_value_type(value: &Value, data_type: &DataType, column_name: &str) -
             expected: format!("{:?}", data_type),
             got: format!("{:?}", value),
         }),
+    }
+}
+
+// Validate YYYY-MM-DD format with valid ranges
+fn validate_date_format(s: &str, column_name: &str) -> Result<(), StorageError> {
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() == 3
+        && parts[0].len() == 4 && parts[1].len() == 2 && parts[2].len() == 2
+        && parts[0].parse::<u16>().is_ok()
+        && parts[1].parse::<u8>().map_or(false, |m| (1..=12).contains(&m))
+        && parts[2].parse::<u8>().map_or(false, |d| (1..=31).contains(&d))
+    {
+        Ok(())
+    } else {
+        Err(StorageError::TypeMismatch {
+            column: column_name.to_string(),
+            expected: "DATE (YYYY-MM-DD)".to_string(),
+            got: s.to_string(),
+        })
+    }
+}
+
+// Validate YYYY-MM-DD HH:MM:SS format
+fn validate_timestamp_format(s: &str, column_name: &str) -> Result<(), StorageError> {
+    let parts: Vec<&str> = s.splitn(2, ' ').collect();
+    if parts.len() != 2 {
+        return Err(StorageError::TypeMismatch {
+            column: column_name.to_string(),
+            expected: "TIMESTAMP (YYYY-MM-DD HH:MM:SS)".to_string(),
+            got: s.to_string(),
+        });
+    }
+    validate_date_format(parts[0], column_name)?;
+    let time_parts: Vec<&str> = parts[1].split(':').collect();
+    if time_parts.len() == 3
+        && time_parts[0].len() == 2 && time_parts[1].len() == 2 && time_parts[2].len() == 2
+        && time_parts[0].parse::<u8>().map_or(false, |h| h < 24)
+        && time_parts[1].parse::<u8>().map_or(false, |m| m < 60)
+        && time_parts[2].parse::<u8>().map_or(false, |s| s < 60)
+    {
+        Ok(())
+    } else {
+        Err(StorageError::TypeMismatch {
+            column: column_name.to_string(),
+            expected: "TIMESTAMP (YYYY-MM-DD HH:MM:SS)".to_string(),
+            got: s.to_string(),
+        })
     }
 }
 
@@ -1434,6 +1493,73 @@ mod tests {
 
         let result = storage.delete_rows(&delete_stmt);
         assert!(matches!(result, Err(StorageError::TableNotFound(_))));
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_date_insert_and_read() {
+        let temp_dir = format!("/tmp/abcsql_test_date_{}", std::process::id());
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        let create = CreateTableStatement {
+            table_name: "events".to_string(),
+            columns: vec![
+                ColumnDefinition { name: "name".to_string(), data_type: DataType::Varchar(None) },
+                ColumnDefinition { name: "event_date".to_string(), data_type: DataType::Date },
+            ],
+        };
+        storage.create_table(&create).unwrap();
+
+        let insert = InsertStatement {
+            table_name: "events".to_string(),
+            values: vec![Value::String("launch".to_string()), Value::String("2024-03-15".to_string())],
+        };
+        storage.insert_row(&insert).unwrap();
+
+        let rows = storage.read_rows("events").unwrap();
+        assert_eq!(rows[0][1], Value::String("2024-03-15".to_string()));
+
+        // invalid date should fail
+        let bad_insert = InsertStatement {
+            table_name: "events".to_string(),
+            values: vec![Value::String("oops".to_string()), Value::String("not-a-date".to_string())],
+        };
+        assert!(bad_insert.values.len() == 2);
+        assert!(storage.insert_row(&bad_insert).is_err());
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_timestamp_insert_and_read() {
+        let temp_dir = format!("/tmp/abcsql_test_ts_{}", std::process::id());
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        let create = CreateTableStatement {
+            table_name: "logs".to_string(),
+            columns: vec![
+                ColumnDefinition { name: "msg".to_string(), data_type: DataType::Varchar(None) },
+                ColumnDefinition { name: "created_at".to_string(), data_type: DataType::Timestamp },
+            ],
+        };
+        storage.create_table(&create).unwrap();
+
+        let insert = InsertStatement {
+            table_name: "logs".to_string(),
+            values: vec![Value::String("hello".to_string()), Value::String("2024-03-15 14:30:00".to_string())],
+        };
+        storage.insert_row(&insert).unwrap();
+
+        let rows = storage.read_rows("logs").unwrap();
+        assert_eq!(rows[0][1], Value::String("2024-03-15 14:30:00".to_string()));
+
+        // invalid timestamp should fail
+        let bad_insert = InsertStatement {
+            table_name: "logs".to_string(),
+            values: vec![Value::String("bad".to_string()), Value::String("2024-03-15".to_string())],
+        };
+        assert!(storage.insert_row(&bad_insert).is_err());
 
         fs::remove_dir_all(&temp_dir).unwrap();
     }

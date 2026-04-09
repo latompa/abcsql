@@ -2,7 +2,8 @@ use std::fs;
 use std::io::{self, Write as IoWrite, BufWriter, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::fmt;
-use crate::parser::{CreateTableStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, UpdateStatement, DeleteStatement, Value, Condition, Expression, Operator};
+use std::collections::HashMap;
+use crate::parser::{CreateTableStatement, CreateIndexStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, UpdateStatement, DeleteStatement, Value, Condition, Expression, Operator};
 
 /// Storage engine for persisting tables to disk
 pub struct Storage {
@@ -22,6 +23,8 @@ pub enum StorageError {
     DuplicateKey { column: String, value: String },
     NullConstraint { column: String },
     ForeignKeyViolation { column: String, ref_table: String, ref_column: String },
+    IndexAlreadyExists(String),
+    IndexNotFound(String),
 }
 
 impl From<io::Error> for StorageError {
@@ -54,6 +57,8 @@ impl fmt::Display for StorageError {
             StorageError::ForeignKeyViolation { column, ref_table, ref_column } => {
                 write!(f, "Foreign key violation: '{}' references {}.{}", column, ref_table, ref_column)
             }
+            StorageError::IndexAlreadyExists(name) => write!(f, "Index '{}' already exists", name),
+            StorageError::IndexNotFound(name) => write!(f, "Index '{}' not found", name),
         }
     }
 }
@@ -207,6 +212,9 @@ impl Storage {
         writeln!(writer, "{}", row_str)?;
         writer.flush()?;
 
+        // Rebuild any indexes on this table
+        self.rebuild_indexes_for_table(&stmt.table_name)?;
+
         Ok(())
     }
 
@@ -258,6 +266,7 @@ impl Storage {
         }
         writer.flush()?;
 
+        self.rebuild_indexes_for_table(&stmt.table_name)?;
         Ok(updated_count)
     }
 
@@ -300,7 +309,30 @@ impl Storage {
         }
         writer.flush()?;
 
+        self.rebuild_indexes_for_table(&stmt.table_name)?;
         Ok(deleted_count)
+    }
+
+    /// Read specific rows by row numbers (used with index lookups)
+    pub fn read_rows_by_numbers(&self, table_name: &str, row_nums: &[usize]) -> Result<Vec<Vec<Value>>, StorageError> {
+        if !self.table_exists(table_name) {
+            return Err(StorageError::TableNotFound(table_name.to_string()));
+        }
+        let data_path = self.data_path(table_name);
+        if !data_path.exists() {
+            return Ok(Vec::new());
+        }
+        let file = fs::File::open(data_path)?;
+        let reader = BufReader::new(file);
+        let mut rows = Vec::new();
+        for (i, line) in reader.lines().enumerate() {
+            let line = line?;
+            if line.trim().is_empty() { continue; }
+            if row_nums.contains(&i) {
+                rows.push(deserialize_row(&line)?);
+            }
+        }
+        Ok(rows)
     }
 
     /// Read all rows from a table
@@ -453,6 +485,26 @@ impl Storage {
             fs::remove_file(seq_path)?;
         }
 
+        // Drop all indexes for this table
+        let meta = self.load_index_meta()?;
+        for (idx_name, t, _) in &meta {
+            if t == table_name {
+                let idx_path = self.index_data_path(idx_name);
+                if idx_path.exists() {
+                    fs::remove_file(&idx_path)?;
+                }
+            }
+        }
+        // Rewrite metadata without this table's indexes
+        let remaining: Vec<_> = meta.iter().filter(|(_, t, _)| t != table_name).collect();
+        let meta_path = self.index_meta_path();
+        if meta_path.exists() {
+            let mut file = fs::File::create(meta_path)?;
+            for (name, table, col) in remaining {
+                writeln!(file, "{}:{}:{}", name, table, col)?;
+            }
+        }
+
         Ok(())
     }
 
@@ -523,6 +575,158 @@ impl Storage {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    // --- Index operations ---
+
+    fn index_meta_path(&self) -> PathBuf {
+        self.data_dir.join("_indexes.meta")
+    }
+
+    fn index_data_path(&self, index_name: &str) -> PathBuf {
+        self.data_dir.join(format!("{}.idx", index_name))
+    }
+
+    /// Load all index metadata entries
+    pub fn load_index_meta(&self) -> Result<Vec<(String, String, String)>, StorageError> {
+        let path = self.index_meta_path();
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let content = fs::read_to_string(path)?;
+        let mut entries = Vec::new();
+        for line in content.lines() {
+            let parts: Vec<&str> = line.split(':').collect();
+            if parts.len() == 3 {
+                entries.push((parts[0].to_string(), parts[1].to_string(), parts[2].to_string()));
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Create an index, building it from existing data
+    pub fn create_index(&self, stmt: &CreateIndexStatement) -> Result<(), StorageError> {
+        // Check table and column exist
+        let schema = self.load_schema(&stmt.table_name)?;
+        let col_idx = schema.columns.iter()
+            .position(|c| c.name == stmt.column_name)
+            .ok_or_else(|| StorageError::ColumnNotFound(stmt.column_name.clone()))?;
+
+        // Check index doesn't already exist
+        let meta = self.load_index_meta()?;
+        if meta.iter().any(|(name, _, _)| name == &stmt.index_name) {
+            return Err(StorageError::IndexAlreadyExists(stmt.index_name.clone()));
+        }
+
+        // Build index from existing rows
+        let rows = self.read_rows(&stmt.table_name)?;
+        let mut index: HashMap<String, Vec<usize>> = HashMap::new();
+        for (row_num, row) in rows.iter().enumerate() {
+            let key = serialize_value(&row[col_idx]);
+            index.entry(key).or_default().push(row_num);
+        }
+
+        // Write index data
+        self.write_index_data(&stmt.index_name, &index)?;
+
+        // Append to metadata
+        let meta_path = self.index_meta_path();
+        let mut file = fs::OpenOptions::new().create(true).append(true).open(meta_path)?;
+        writeln!(file, "{}:{}:{}", stmt.index_name, stmt.table_name, stmt.column_name)?;
+
+        Ok(())
+    }
+
+    /// Drop an index
+    pub fn drop_index(&self, index_name: &str) -> Result<(), StorageError> {
+        let meta = self.load_index_meta()?;
+        if !meta.iter().any(|(name, _, _)| name == index_name) {
+            return Err(StorageError::IndexNotFound(index_name.to_string()));
+        }
+
+        // Remove index data file
+        let idx_path = self.index_data_path(index_name);
+        if idx_path.exists() {
+            fs::remove_file(idx_path)?;
+        }
+
+        // Rewrite metadata without this index
+        let remaining: Vec<_> = meta.iter().filter(|(name, _, _)| name != index_name).collect();
+        let meta_path = self.index_meta_path();
+        let mut file = fs::File::create(meta_path)?;
+        for (name, table, col) in remaining {
+            writeln!(file, "{}:{}:{}", name, table, col)?;
+        }
+
+        Ok(())
+    }
+
+    /// Write index data to disk
+    fn write_index_data(&self, index_name: &str, index: &HashMap<String, Vec<usize>>) -> Result<(), StorageError> {
+        let path = self.index_data_path(index_name);
+        let mut file = fs::File::create(path)?;
+        for (key, row_nums) in index {
+            let nums: Vec<String> = row_nums.iter().map(|n| n.to_string()).collect();
+            writeln!(file, "{}|{}", key, nums.join(","))?;
+        }
+        Ok(())
+    }
+
+    /// Look up row numbers from an index for a given value
+    pub fn lookup_index(&self, index_name: &str, value: &Value) -> Result<Option<Vec<usize>>, StorageError> {
+        let path = self.index_data_path(index_name);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let key = serialize_value(value);
+        let content = fs::read_to_string(path)?;
+        for line in content.lines() {
+            // Format: serialized_value|row_num1,row_num2,...
+            if let Some((line_key, nums_str)) = line.split_once('|') {
+                if line_key == key {
+                    let nums: Vec<usize> = nums_str.split(',')
+                        .filter_map(|s| s.parse().ok())
+                        .collect();
+                    return Ok(Some(nums));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Find an index for a given table and column
+    pub fn find_index(&self, table_name: &str, column_name: &str) -> Result<Option<String>, StorageError> {
+        let meta = self.load_index_meta()?;
+        Ok(meta.iter()
+            .find(|(_, t, c)| t == table_name && c == column_name)
+            .map(|(name, _, _)| name.clone()))
+    }
+
+    /// Rebuild all indexes for a table (called after update/delete)
+    fn rebuild_indexes_for_table(&self, table_name: &str) -> Result<(), StorageError> {
+        let meta = self.load_index_meta()?;
+        let table_indexes: Vec<_> = meta.iter()
+            .filter(|(_, t, _)| t == table_name)
+            .collect();
+        if table_indexes.is_empty() {
+            return Ok(());
+        }
+
+        let schema = self.load_schema(table_name)?;
+        let rows = self.read_rows(table_name)?;
+
+        for (idx_name, _, col_name) in &table_indexes {
+            let col_idx = schema.columns.iter()
+                .position(|c| &c.name == col_name)
+                .ok_or_else(|| StorageError::ColumnNotFound(col_name.clone()))?;
+            let mut index: HashMap<String, Vec<usize>> = HashMap::new();
+            for (row_num, row) in rows.iter().enumerate() {
+                let key = serialize_value(&row[col_idx]);
+                index.entry(key).or_default().push(row_num);
+            }
+            self.write_index_data(idx_name, &index)?;
         }
         Ok(())
     }
@@ -745,24 +949,23 @@ fn like_match_recursive(v: &[char], p: &[char], vi: usize, pi: usize) -> bool {
 
 /// Serialize a row to string format: TYPE:value|TYPE:value|...
 /// Format: INT:123|STRING:Alice|NULL
+fn serialize_value(v: &Value) -> String {
+    match v {
+        Value::Int(n) => format!("INT:{}", n),
+        Value::Float(n) => format!("FLOAT:{}", n),
+        Value::Bool(b) => format!("BOOL:{}", b),
+        Value::String(s) => {
+            let escaped = s.replace('\\', "\\\\")
+                .replace('|', "\\|")
+                .replace('\n', "\\n");
+            format!("STRING:{}", escaped)
+        }
+        Value::Null => "NULL".to_string(),
+    }
+}
+
 fn serialize_row(values: &[Value]) -> String {
-    values
-        .iter()
-        .map(|v| match v {
-            Value::Int(n) => format!("INT:{}", n),
-            Value::Float(n) => format!("FLOAT:{}", n),
-            Value::Bool(b) => format!("BOOL:{}", b),
-            Value::String(s) => {
-                // Escape pipe and newline characters
-                let escaped = s.replace('\\', "\\\\")
-                    .replace('|', "\\|")
-                    .replace('\n', "\\n");
-                format!("STRING:{}", escaped)
-            }
-            Value::Null => "NULL".to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join("|")
+    values.iter().map(serialize_value).collect::<Vec<_>>().join("|")
 }
 
 /// Deserialize a row from string format
@@ -1968,6 +2171,253 @@ mod tests {
             table_name: "users".to_string(),
             values: vec![Value::Int(4), Value::Null],
         }).unwrap();
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_create_and_lookup_index() {
+        let temp_dir = format!("/tmp/abcsql_test_idx_{}", std::process::id());
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        let create = CreateTableStatement {
+            table_name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id", DataType::Int),
+                ColumnDefinition::new("name", DataType::Varchar(None)),
+            ],
+        };
+        storage.create_table(&create).unwrap();
+
+        storage.insert_row(&InsertStatement {
+            table_name: "users".to_string(),
+            values: vec![Value::Int(1), Value::String("Alice".to_string())],
+        }).unwrap();
+        storage.insert_row(&InsertStatement {
+            table_name: "users".to_string(),
+            values: vec![Value::Int(2), Value::String("Bob".to_string())],
+        }).unwrap();
+        storage.insert_row(&InsertStatement {
+            table_name: "users".to_string(),
+            values: vec![Value::Int(3), Value::String("Alice".to_string())],
+        }).unwrap();
+
+        // Create index on name column
+        storage.create_index(&CreateIndexStatement {
+            index_name: "idx_name".to_string(),
+            table_name: "users".to_string(),
+            column_name: "name".to_string(),
+        }).unwrap();
+
+        // Lookup should find matching rows
+        let result = storage.lookup_index("idx_name", &Value::String("Alice".to_string())).unwrap();
+        assert!(result.is_some());
+        let row_nums = result.unwrap();
+        assert_eq!(row_nums.len(), 2);
+
+        // Lookup non-existent value
+        let result = storage.lookup_index("idx_name", &Value::String("Charlie".to_string())).unwrap();
+        assert!(result.is_none());
+
+        // find_index should locate it
+        let found = storage.find_index("users", "name").unwrap();
+        assert_eq!(found, Some("idx_name".to_string()));
+
+        // find_index for non-indexed column
+        let found = storage.find_index("users", "id").unwrap();
+        assert_eq!(found, None);
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_index_rebuild_after_insert() {
+        let temp_dir = format!("/tmp/abcsql_test_idx_ins_{}", std::process::id());
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        let create = CreateTableStatement {
+            table_name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id", DataType::Int),
+                ColumnDefinition::new("name", DataType::Varchar(None)),
+            ],
+        };
+        storage.create_table(&create).unwrap();
+
+        storage.insert_row(&InsertStatement {
+            table_name: "users".to_string(),
+            values: vec![Value::Int(1), Value::String("Alice".to_string())],
+        }).unwrap();
+
+        storage.create_index(&CreateIndexStatement {
+            index_name: "idx_name".to_string(),
+            table_name: "users".to_string(),
+            column_name: "name".to_string(),
+        }).unwrap();
+
+        // Insert another row — index should be rebuilt
+        storage.insert_row(&InsertStatement {
+            table_name: "users".to_string(),
+            values: vec![Value::Int(2), Value::String("Bob".to_string())],
+        }).unwrap();
+
+        let result = storage.lookup_index("idx_name", &Value::String("Bob".to_string())).unwrap();
+        assert!(result.is_some());
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_index_rebuild_after_delete() {
+        use crate::parser::{DeleteStatement, WhereClause, Condition, Expression, Operator};
+
+        let temp_dir = format!("/tmp/abcsql_test_idx_del_{}", std::process::id());
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        let create = CreateTableStatement {
+            table_name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id", DataType::Int),
+                ColumnDefinition::new("name", DataType::Varchar(None)),
+            ],
+        };
+        storage.create_table(&create).unwrap();
+
+        storage.insert_row(&InsertStatement {
+            table_name: "users".to_string(),
+            values: vec![Value::Int(1), Value::String("Alice".to_string())],
+        }).unwrap();
+        storage.insert_row(&InsertStatement {
+            table_name: "users".to_string(),
+            values: vec![Value::Int(2), Value::String("Bob".to_string())],
+        }).unwrap();
+
+        storage.create_index(&CreateIndexStatement {
+            index_name: "idx_name".to_string(),
+            table_name: "users".to_string(),
+            column_name: "name".to_string(),
+        }).unwrap();
+
+        // Delete Alice
+        storage.delete_rows(&DeleteStatement {
+            table_name: "users".to_string(),
+            where_clause: Some(WhereClause {
+                condition: Condition {
+                    left: Expression::Column("name".to_string()),
+                    operator: Operator::Equals,
+                    right: Expression::Literal(Value::String("Alice".to_string())),
+                },
+            }),
+        }).unwrap();
+
+        // Alice should no longer be in the index
+        let result = storage.lookup_index("idx_name", &Value::String("Alice".to_string())).unwrap();
+        assert!(result.is_none());
+
+        // Bob should still be there
+        let result = storage.lookup_index("idx_name", &Value::String("Bob".to_string())).unwrap();
+        assert!(result.is_some());
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_drop_index() {
+        let temp_dir = format!("/tmp/abcsql_test_idx_drop_{}", std::process::id());
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        let create = CreateTableStatement {
+            table_name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id", DataType::Int),
+                ColumnDefinition::new("name", DataType::Varchar(None)),
+            ],
+        };
+        storage.create_table(&create).unwrap();
+
+        storage.create_index(&CreateIndexStatement {
+            index_name: "idx_name".to_string(),
+            table_name: "users".to_string(),
+            column_name: "name".to_string(),
+        }).unwrap();
+
+        // Drop the index
+        storage.drop_index("idx_name").unwrap();
+
+        // Should no longer be findable
+        let found = storage.find_index("users", "name").unwrap();
+        assert_eq!(found, None);
+
+        // Dropping again should fail
+        let result = storage.drop_index("idx_name");
+        assert!(matches!(result, Err(StorageError::IndexNotFound(_))));
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_duplicate_index_name() {
+        let temp_dir = format!("/tmp/abcsql_test_idx_dup_{}", std::process::id());
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        let create = CreateTableStatement {
+            table_name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id", DataType::Int),
+                ColumnDefinition::new("name", DataType::Varchar(None)),
+            ],
+        };
+        storage.create_table(&create).unwrap();
+
+        storage.create_index(&CreateIndexStatement {
+            index_name: "idx_name".to_string(),
+            table_name: "users".to_string(),
+            column_name: "name".to_string(),
+        }).unwrap();
+
+        // Creating an index with the same name should fail
+        let result = storage.create_index(&CreateIndexStatement {
+            index_name: "idx_name".to_string(),
+            table_name: "users".to_string(),
+            column_name: "name".to_string(),
+        });
+        assert!(matches!(result, Err(StorageError::IndexAlreadyExists(_))));
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_read_rows_by_numbers() {
+        let temp_dir = format!("/tmp/abcsql_test_idx_rbn_{}", std::process::id());
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        let create = CreateTableStatement {
+            table_name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id", DataType::Int),
+                ColumnDefinition::new("name", DataType::Varchar(None)),
+            ],
+        };
+        storage.create_table(&create).unwrap();
+
+        storage.insert_row(&InsertStatement {
+            table_name: "users".to_string(),
+            values: vec![Value::Int(1), Value::String("Alice".to_string())],
+        }).unwrap();
+        storage.insert_row(&InsertStatement {
+            table_name: "users".to_string(),
+            values: vec![Value::Int(2), Value::String("Bob".to_string())],
+        }).unwrap();
+        storage.insert_row(&InsertStatement {
+            table_name: "users".to_string(),
+            values: vec![Value::Int(3), Value::String("Charlie".to_string())],
+        }).unwrap();
+
+        // Read only rows 0 and 2
+        let rows = storage.read_rows_by_numbers("users", &[0, 2]).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], vec![Value::Int(1), Value::String("Alice".to_string())]);
+        assert_eq!(rows[1], vec![Value::Int(3), Value::String("Charlie".to_string())]);
 
         fs::remove_dir_all(&temp_dir).unwrap();
     }

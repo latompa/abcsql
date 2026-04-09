@@ -12,6 +12,8 @@ use nom::{
 #[derive(Debug, PartialEq, Clone)]
 pub enum SqlStatement {
     CreateTable(CreateTableStatement),
+    CreateIndex(CreateIndexStatement),
+    DropIndex(DropIndexStatement),
     Insert(InsertStatement),
     Select(SelectStatement),
     Update(UpdateStatement),
@@ -22,6 +24,18 @@ pub enum SqlStatement {
 pub struct CreateTableStatement {
     pub table_name: String,
     pub columns: Vec<ColumnDefinition>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct CreateIndexStatement {
+    pub index_name: String,
+    pub table_name: String,
+    pub column_name: String,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct DropIndexStatement {
+    pub index_name: String,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -219,7 +233,8 @@ pub fn parse_sql(input: &str) -> IResult<&str, SqlStatement> {
     let (input, _) = multispace0(input)?;
     let (input, stmt) = nom::branch::alt((
         parse_insert,
-        parse_create_table,
+        parse_create,
+        parse_drop_index,
         parse_select,
         parse_update,
         parse_delete,
@@ -229,9 +244,16 @@ pub fn parse_sql(input: &str) -> IResult<&str, SqlStatement> {
 }
 
 /// Parse CREATE TABLE statement
-pub fn parse_create_table(input: &str) -> IResult<&str, SqlStatement> {
+pub fn parse_create(input: &str) -> IResult<&str, SqlStatement> {
     let (input, _) = tag("CREATE")(input)?;
     let (input, _) = multispace1(input)?;
+    nom::branch::alt((
+        parse_create_table_inner,
+        parse_create_index_inner,
+    ))(input)
+}
+
+fn parse_create_table_inner(input: &str) -> IResult<&str, SqlStatement> {
     let (input, _) = tag("TABLE")(input)?;
     let (input, _) = multispace1(input)?;
     let (input, table_name) = parse_identifier(input)?;
@@ -243,10 +265,33 @@ pub fn parse_create_table(input: &str) -> IResult<&str, SqlStatement> {
     )(input)?;
     let (input, _) = multispace0(input)?;
     let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
-    
+
     Ok((input, SqlStatement::CreateTable(CreateTableStatement {
         table_name: table_name.to_string(),
         columns,
+    })))
+}
+
+// CREATE INDEX index_name ON table(column);
+fn parse_create_index_inner(input: &str) -> IResult<&str, SqlStatement> {
+    let (input, _) = tag("INDEX")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, index_name) = parse_identifier(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, _) = tag("ON")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, table_name) = parse_identifier(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, column_name) = parse_identifier(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
+
+    Ok((input, SqlStatement::CreateIndex(CreateIndexStatement {
+        index_name: index_name.to_string(),
+        table_name: table_name.to_string(),
+        column_name: column_name.to_string(),
     })))
 }
 
@@ -424,6 +469,21 @@ pub fn parse_delete(input: &str) -> IResult<&str, SqlStatement> {
     Ok((input, SqlStatement::Delete(DeleteStatement {
         table_name: table_name.to_string(),
         where_clause,
+    })))
+}
+
+// DROP INDEX index_name;
+pub fn parse_drop_index(input: &str) -> IResult<&str, SqlStatement> {
+    let (input, _) = tag("DROP")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, _) = tag("INDEX")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, index_name) = parse_identifier(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
+
+    Ok((input, SqlStatement::DropIndex(DropIndexStatement {
+        index_name: index_name.to_string(),
     })))
 }
 
@@ -2379,6 +2439,32 @@ mod tests {
                 assert!(ct.columns[1].unique);
             }
             _ => panic!("Expected CreateTable"),
+        }
+    }
+
+    #[test]
+    fn test_parse_create_index() {
+        let sql = "CREATE INDEX idx_name ON users (name);";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::CreateIndex(ci) => {
+                assert_eq!(ci.index_name, "idx_name");
+                assert_eq!(ci.table_name, "users");
+                assert_eq!(ci.column_name, "name");
+            }
+            _ => panic!("Expected CreateIndex"),
+        }
+    }
+
+    #[test]
+    fn test_parse_drop_index() {
+        let sql = "DROP INDEX idx_name;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::DropIndex(di) => {
+                assert_eq!(di.index_name, "idx_name");
+            }
+            _ => panic!("Expected DropIndex"),
         }
     }
 }

@@ -39,7 +39,7 @@
 
 ## Performance & Storage
 
-- [ ] Indexing (B-tree or hash)
+- [x] Indexing (hash)
 - [ ] Transactions (BEGIN, COMMIT, ROLLBACK)
 
 ## Tooling

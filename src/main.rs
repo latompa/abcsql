@@ -175,6 +175,20 @@ fn execute_sql(sql: &str, storage: &Storage) {
                 Err(e) => eprintln!("Error: {}", e),
             }
         }
+        SqlStatement::CreateIndex(idx_stmt) => {
+            let name = idx_stmt.index_name.clone();
+            match storage.create_index(&idx_stmt) {
+                Ok(_) => println!("Created index '{}'", name),
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        }
+        SqlStatement::DropIndex(idx_stmt) => {
+            let name = idx_stmt.index_name.clone();
+            match storage.drop_index(&name) {
+                Ok(_) => println!("Dropped index '{}'", name),
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        }
     }
 }
 
@@ -196,6 +210,16 @@ fn load_table(
     ctes: &HashMap<String, CteData>,
     storage: &Storage,
 ) -> Result<(Vec<ResultColumn>, Vec<Vec<Value>>), String> {
+    load_table_with_index(name, ctes, storage, None)
+}
+
+// Load a table, optionally using an index for a WHERE column = value condition
+fn load_table_with_index(
+    name: &str,
+    ctes: &HashMap<String, CteData>,
+    storage: &Storage,
+    index_hint: Option<(&str, &parser::Value)>,
+) -> Result<(Vec<ResultColumn>, Vec<Vec<Value>>), String> {
     if let Some(cte) = ctes.get(name) {
         let cols = cte.columns.iter()
             .map(|c| ResultColumn { table: name.to_string(), name: c.name.clone() })
@@ -203,7 +227,22 @@ fn load_table(
         return Ok((cols, cte.rows.clone()));
     }
     let schema = storage.load_schema(name).map_err(|e| e.to_string())?;
-    let rows = storage.read_rows(name).map_err(|e| e.to_string())?;
+
+    // Try index lookup if we have a hint
+    let rows = if let Some((col_name, value)) = index_hint {
+        if let Ok(Some(idx_name)) = storage.find_index(name, col_name) {
+            if let Ok(Some(row_nums)) = storage.lookup_index(&idx_name, value) {
+                storage.read_rows_by_numbers(name, &row_nums).map_err(|e| e.to_string())?
+            } else {
+                storage.read_rows(name).map_err(|e| e.to_string())?
+            }
+        } else {
+            storage.read_rows(name).map_err(|e| e.to_string())?
+        }
+    } else {
+        storage.read_rows(name).map_err(|e| e.to_string())?
+    };
+
     let cols = schema.columns.iter()
         .map(|c| ResultColumn { table: name.to_string(), name: c.name.clone() })
         .collect();
@@ -217,8 +256,19 @@ fn load_from(
     ctes: &HashMap<String, CteData>,
     storage: &Storage,
 ) -> Result<(Vec<ResultColumn>, Vec<Vec<Value>>), String> {
+    load_from_with_index(from, alias, ctes, storage, None)
+}
+
+// Load from a FromClause, optionally using an index for equality lookups
+fn load_from_with_index(
+    from: &parser::FromClause,
+    alias: &str,
+    ctes: &HashMap<String, CteData>,
+    storage: &Storage,
+    index_hint: Option<(&str, &parser::Value)>,
+) -> Result<(Vec<ResultColumn>, Vec<Vec<Value>>), String> {
     match from {
-        parser::FromClause::Table(name) => load_table(name, ctes, storage),
+        parser::FromClause::Table(name) => load_table_with_index(name, ctes, storage, index_hint),
         parser::FromClause::Subquery(subquery) => {
             let cte_data = materialize_cte(subquery, storage, ctes);
             let cols = cte_data.columns.iter()
@@ -226,6 +276,23 @@ fn load_from(
                 .collect();
             Ok((cols, cte_data.rows))
         }
+    }
+}
+
+// Extract a simple (column_name, literal_value) from a WHERE column = literal condition
+fn extract_index_hint(where_clause: &Option<parser::WhereClause>) -> Option<(String, parser::Value)> {
+    let wc = where_clause.as_ref()?;
+    if wc.condition.operator != parser::Operator::Equals {
+        return None;
+    }
+    match (&wc.condition.left, &wc.condition.right) {
+        (parser::Expression::Column(col), parser::Expression::Literal(val)) => {
+            Some((col.clone(), val.clone()))
+        }
+        (parser::Expression::Literal(val), parser::Expression::Column(col)) => {
+            Some((col.clone(), val.clone()))
+        }
+        _ => None,
     }
 }
 
@@ -410,8 +477,11 @@ fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) {
     }
 
     // Load the FROM table (check CTEs first, handle subqueries)
+    // Use index hint if WHERE is a simple column = literal equality
     let effective_from = from_name(&stmt.from, &stmt.from_alias);
-    let (from_cols, from_rows) = match load_from(&stmt.from, &effective_from, &cte_map, storage) {
+    let hint = extract_index_hint(&stmt.where_clause);
+    let hint_ref = hint.as_ref().map(|(c, v)| (c.as_str(), v));
+    let (from_cols, from_rows) = match load_from_with_index(&stmt.from, &effective_from, &cte_map, storage, hint_ref) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Error: {}", e);

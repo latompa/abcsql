@@ -42,6 +42,16 @@ pub fn execute(storage: &Storage, sql: &str) -> Result<String, String> {
                 .map(|n| format!("Deleted {} row(s)", n))
                 .map_err(|e| e.to_string())
         }
+        SqlStatement::CreateIndex(idx_stmt) => {
+            storage.create_index(&idx_stmt)
+                .map(|_| format!("Created index '{}'", idx_stmt.index_name))
+                .map_err(|e| e.to_string())
+        }
+        SqlStatement::DropIndex(idx_stmt) => {
+            storage.drop_index(&idx_stmt.index_name)
+                .map(|_| format!("Dropped index '{}'", idx_stmt.index_name))
+                .map_err(|e| e.to_string())
+        }
     }
 }
 
@@ -52,7 +62,34 @@ fn execute_select_to_string(
 ) -> Result<String, String> {
     let table_name = stmt.from.table_name().ok_or("Subquery FROM not supported here")?;
     let from_schema = storage.load_schema(table_name).map_err(|e| e.to_string())?;
-    let from_rows = storage.read_rows(table_name).map_err(|e| e.to_string())?;
+
+    // Try to use an index if WHERE is a simple column = literal equality
+    let from_rows = if let Some(ref wc) = stmt.where_clause {
+        if wc.condition.operator == parser::Operator::Equals {
+            let hint = match (&wc.condition.left, &wc.condition.right) {
+                (parser::Expression::Column(col), parser::Expression::Literal(val)) => Some((col.as_str(), val)),
+                (parser::Expression::Literal(val), parser::Expression::Column(col)) => Some((col.as_str(), val)),
+                _ => None,
+            };
+            if let Some((col, val)) = hint {
+                if let Ok(Some(idx_name)) = storage.find_index(table_name, col) {
+                    if let Ok(Some(row_nums)) = storage.lookup_index(&idx_name, val) {
+                        storage.read_rows_by_numbers(table_name, &row_nums).map_err(|e| e.to_string())?
+                    } else {
+                        storage.read_rows(table_name).map_err(|e| e.to_string())?
+                    }
+                } else {
+                    storage.read_rows(table_name).map_err(|e| e.to_string())?
+                }
+            } else {
+                storage.read_rows(table_name).map_err(|e| e.to_string())?
+            }
+        } else {
+            storage.read_rows(table_name).map_err(|e| e.to_string())?
+        }
+    } else {
+        storage.read_rows(table_name).map_err(|e| e.to_string())?
+    };
 
     let from_alias = stmt.from_alias.as_deref().unwrap_or(table_name);
     let mut combined_cols: Vec<(String, String)> = from_schema.columns.iter()

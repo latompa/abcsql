@@ -22,7 +22,7 @@
 - [x] FLOAT / DOUBLE
 - [x] BOOLEAN
 - [x] DATE / TIMESTAMP
-- [ ] AUTO_INCREMENT
+- [x] AUTO_INCREMENT
 - [ ] JSON
 
 ## Schema & Constraints

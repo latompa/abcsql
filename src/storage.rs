@@ -86,12 +86,22 @@ impl Storage {
         // Subsequent lines: column definitions
         for col in &stmt.columns {
             let type_str = data_type_to_string(&col.data_type);
-            writeln!(file, "{}:{}", col.name, type_str)?;
+            if col.auto_increment {
+                writeln!(file, "{}:{}:AUTO_INCREMENT", col.name, type_str)?;
+            } else {
+                writeln!(file, "{}:{}", col.name, type_str)?;
+            }
         }
 
         // Create empty data file
         let data_path = self.data_path(&stmt.table_name);
         fs::File::create(data_path)?;
+
+        // Initialize sequence file for auto_increment columns
+        if stmt.columns.iter().any(|c| c.auto_increment) {
+            let seq_path = self.seq_path(&stmt.table_name);
+            fs::write(seq_path, "0")?;
+        }
 
         Ok(())
     }
@@ -109,8 +119,17 @@ impl Storage {
             });
         }
 
-        // Validate types (basic validation)
-        for (value, col_def) in stmt.values.iter().zip(schema.columns.iter()) {
+        // Build final values, filling in auto_increment where NULL is provided
+        let mut final_values = stmt.values.clone();
+        for (i, col_def) in schema.columns.iter().enumerate() {
+            if col_def.auto_increment && final_values[i] == Value::Null {
+                let next_val = self.next_auto_increment(&stmt.table_name)?;
+                final_values[i] = Value::Int(next_val);
+            }
+        }
+
+        // Validate types
+        for (value, col_def) in final_values.iter().zip(schema.columns.iter()) {
             validate_value_type(value, &col_def.data_type, &col_def.name)?;
         }
 
@@ -122,7 +141,7 @@ impl Storage {
             .open(data_path)?;
 
         let mut writer = BufWriter::new(file);
-        let row_str = serialize_row(&stmt.values);
+        let row_str = serialize_row(&final_values);
         writeln!(writer, "{}", row_str)?;
         writer.flush()?;
 
@@ -274,7 +293,7 @@ impl Storage {
             }
 
             let parts: Vec<&str> = line.split(':').collect();
-            if parts.len() != 2 {
+            if parts.len() < 2 {
                 return Err(StorageError::InvalidSchema(
                     format!("Invalid column definition: {}", line)
                 ));
@@ -282,10 +301,12 @@ impl Storage {
 
             let col_name = parts[0].to_string();
             let data_type = parse_data_type(parts[1])?;
+            let auto_increment = parts.get(2).map_or(false, |&s| s == "AUTO_INCREMENT");
 
             columns.push(ColumnDefinition {
                 name: col_name,
                 data_type,
+                auto_increment,
             });
         }
 
@@ -338,17 +359,37 @@ impl Storage {
             fs::remove_file(data_path)?;
         }
 
+        let seq_path = self.seq_path(table_name);
+        if seq_path.exists() {
+            fs::remove_file(seq_path)?;
+        }
+
         Ok(())
     }
 
-    /// Get the path to a table's schema file
     fn schema_path(&self, table_name: &str) -> PathBuf {
         self.data_dir.join(format!("{}.schema", table_name))
     }
 
-    /// Get the path to a table's data file
     fn data_path(&self, table_name: &str) -> PathBuf {
         self.data_dir.join(format!("{}.data", table_name))
+    }
+
+    fn seq_path(&self, table_name: &str) -> PathBuf {
+        self.data_dir.join(format!("{}.seq", table_name))
+    }
+
+    /// Read and increment the auto_increment counter
+    fn next_auto_increment(&self, table_name: &str) -> Result<i64, StorageError> {
+        let seq_path = self.seq_path(table_name);
+        let current: i64 = fs::read_to_string(&seq_path)
+            .map_err(|_| StorageError::InvalidData("Missing sequence file".to_string()))?
+            .trim()
+            .parse()
+            .map_err(|_| StorageError::InvalidData("Invalid sequence value".to_string()))?;
+        let next = current + 1;
+        fs::write(&seq_path, next.to_string())?;
+        Ok(next)
     }
 }
 
@@ -666,14 +707,8 @@ mod tests {
         let stmt = CreateTableStatement {
             table_name: "users".to_string(),
             columns: vec![
-                ColumnDefinition {
-                    name: "id".to_string(),
-                    data_type: DataType::Int,
-                },
-                ColumnDefinition {
-                    name: "name".to_string(),
-                    data_type: DataType::Varchar(Some(255)),
-                },
+                ColumnDefinition::new("id", DataType::Int),
+                ColumnDefinition::new("name", DataType::Varchar(Some(255))),
             ],
         };
 
@@ -695,10 +730,7 @@ mod tests {
         let stmt = CreateTableStatement {
             table_name: "users".to_string(),
             columns: vec![
-                ColumnDefinition {
-                    name: "id".to_string(),
-                    data_type: DataType::Int,
-                },
+                ColumnDefinition::new("id", DataType::Int),
             ],
         };
 
@@ -721,18 +753,9 @@ mod tests {
         let stmt = CreateTableStatement {
             table_name: "products".to_string(),
             columns: vec![
-                ColumnDefinition {
-                    name: "id".to_string(),
-                    data_type: DataType::Int,
-                },
-                ColumnDefinition {
-                    name: "name".to_string(),
-                    data_type: DataType::Varchar(Some(100)),
-                },
-                ColumnDefinition {
-                    name: "description".to_string(),
-                    data_type: DataType::Varchar(None),
-                },
+                ColumnDefinition::new("id", DataType::Int),
+                ColumnDefinition::new("name", DataType::Varchar(Some(100))),
+                ColumnDefinition::new("description", DataType::Varchar(None)),
             ],
         };
 
@@ -758,20 +781,14 @@ mod tests {
         let users = CreateTableStatement {
             table_name: "users".to_string(),
             columns: vec![
-                ColumnDefinition {
-                    name: "id".to_string(),
-                    data_type: DataType::Int,
-                },
+                ColumnDefinition::new("id", DataType::Int),
             ],
         };
 
         let orders = CreateTableStatement {
             table_name: "orders".to_string(),
             columns: vec![
-                ColumnDefinition {
-                    name: "id".to_string(),
-                    data_type: DataType::Int,
-                },
+                ColumnDefinition::new("id", DataType::Int),
             ],
         };
 
@@ -796,10 +813,7 @@ mod tests {
         let stmt = CreateTableStatement {
             table_name: "temp_table".to_string(),
             columns: vec![
-                ColumnDefinition {
-                    name: "id".to_string(),
-                    data_type: DataType::Int,
-                },
+                ColumnDefinition::new("id", DataType::Int),
             ],
         };
 
@@ -823,18 +837,9 @@ mod tests {
         let create_stmt = CreateTableStatement {
             table_name: "users".to_string(),
             columns: vec![
-                ColumnDefinition {
-                    name: "id".to_string(),
-                    data_type: DataType::Int,
-                },
-                ColumnDefinition {
-                    name: "name".to_string(),
-                    data_type: DataType::Varchar(Some(255)),
-                },
-                ColumnDefinition {
-                    name: "email".to_string(),
-                    data_type: DataType::Varchar(Some(255)),
-                },
+                ColumnDefinition::new("id", DataType::Int),
+                ColumnDefinition::new("name", DataType::Varchar(Some(255))),
+                ColumnDefinition::new("email", DataType::Varchar(Some(255))),
             ],
         };
         storage.create_table(&create_stmt).unwrap();
@@ -888,18 +893,9 @@ mod tests {
         let create_stmt = CreateTableStatement {
             table_name: "products".to_string(),
             columns: vec![
-                ColumnDefinition {
-                    name: "id".to_string(),
-                    data_type: DataType::Int,
-                },
-                ColumnDefinition {
-                    name: "name".to_string(),
-                    data_type: DataType::Varchar(Some(100)),
-                },
-                ColumnDefinition {
-                    name: "description".to_string(),
-                    data_type: DataType::Varchar(None),
-                },
+                ColumnDefinition::new("id", DataType::Int),
+                ColumnDefinition::new("name", DataType::Varchar(Some(100))),
+                ColumnDefinition::new("description", DataType::Varchar(None)),
             ],
         };
         storage.create_table(&create_stmt).unwrap();
@@ -931,14 +927,8 @@ mod tests {
         let create_stmt = CreateTableStatement {
             table_name: "test".to_string(),
             columns: vec![
-                ColumnDefinition {
-                    name: "id".to_string(),
-                    data_type: DataType::Int,
-                },
-                ColumnDefinition {
-                    name: "name".to_string(),
-                    data_type: DataType::Varchar(Some(255)),
-                },
+                ColumnDefinition::new("id", DataType::Int),
+                ColumnDefinition::new("name", DataType::Varchar(Some(255))),
             ],
         };
         storage.create_table(&create_stmt).unwrap();
@@ -965,14 +955,8 @@ mod tests {
         let create_stmt = CreateTableStatement {
             table_name: "test".to_string(),
             columns: vec![
-                ColumnDefinition {
-                    name: "id".to_string(),
-                    data_type: DataType::Int,
-                },
-                ColumnDefinition {
-                    name: "name".to_string(),
-                    data_type: DataType::Varchar(Some(255)),
-                },
+                ColumnDefinition::new("id", DataType::Int),
+                ColumnDefinition::new("name", DataType::Varchar(Some(255))),
             ],
         };
         storage.create_table(&create_stmt).unwrap();
@@ -1034,8 +1018,8 @@ mod tests {
         let create_stmt = CreateTableStatement {
             table_name: "users".to_string(),
             columns: vec![
-                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int },
-                ColumnDefinition { name: "name".to_string(), data_type: DataType::Varchar(Some(255)) },
+                ColumnDefinition::new("id", DataType::Int),
+                ColumnDefinition::new("name", DataType::Varchar(Some(255))),
             ],
         };
         storage.create_table(&create_stmt).unwrap();
@@ -1089,8 +1073,8 @@ mod tests {
         let create_stmt = CreateTableStatement {
             table_name: "users".to_string(),
             columns: vec![
-                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int },
-                ColumnDefinition { name: "active".to_string(), data_type: DataType::Int },
+                ColumnDefinition::new("id", DataType::Int),
+                ColumnDefinition::new("active", DataType::Int),
             ],
         };
         storage.create_table(&create_stmt).unwrap();
@@ -1143,8 +1127,8 @@ mod tests {
         let create_stmt = CreateTableStatement {
             table_name: "users".to_string(),
             columns: vec![
-                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int },
-                ColumnDefinition { name: "status".to_string(), data_type: DataType::Varchar(None) },
+                ColumnDefinition::new("id", DataType::Int),
+                ColumnDefinition::new("status", DataType::Varchar(None)),
             ],
         };
         storage.create_table(&create_stmt).unwrap();
@@ -1190,7 +1174,7 @@ mod tests {
         let create_stmt = CreateTableStatement {
             table_name: "users".to_string(),
             columns: vec![
-                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int },
+                ColumnDefinition::new("id", DataType::Int),
             ],
         };
         storage.create_table(&create_stmt).unwrap();
@@ -1238,7 +1222,7 @@ mod tests {
         let create_stmt = CreateTableStatement {
             table_name: "users".to_string(),
             columns: vec![
-                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int },
+                ColumnDefinition::new("id", DataType::Int),
             ],
         };
         storage.create_table(&create_stmt).unwrap();
@@ -1270,7 +1254,7 @@ mod tests {
         let create_stmt = CreateTableStatement {
             table_name: "users".to_string(),
             columns: vec![
-                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int },
+                ColumnDefinition::new("id", DataType::Int),
             ],
         };
         storage.create_table(&create_stmt).unwrap();
@@ -1303,8 +1287,8 @@ mod tests {
         let create_stmt = CreateTableStatement {
             table_name: "users".to_string(),
             columns: vec![
-                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int },
-                ColumnDefinition { name: "name".to_string(), data_type: DataType::Varchar(Some(255)) },
+                ColumnDefinition::new("id", DataType::Int),
+                ColumnDefinition::new("name", DataType::Varchar(Some(255))),
             ],
         };
         storage.create_table(&create_stmt).unwrap();
@@ -1353,8 +1337,8 @@ mod tests {
         let create_stmt = CreateTableStatement {
             table_name: "users".to_string(),
             columns: vec![
-                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int },
-                ColumnDefinition { name: "active".to_string(), data_type: DataType::Int },
+                ColumnDefinition::new("id", DataType::Int),
+                ColumnDefinition::new("active", DataType::Int),
             ],
         };
         storage.create_table(&create_stmt).unwrap();
@@ -1405,7 +1389,7 @@ mod tests {
         let create_stmt = CreateTableStatement {
             table_name: "users".to_string(),
             columns: vec![
-                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int },
+                ColumnDefinition::new("id", DataType::Int),
             ],
         };
         storage.create_table(&create_stmt).unwrap();
@@ -1445,7 +1429,7 @@ mod tests {
         let create_stmt = CreateTableStatement {
             table_name: "users".to_string(),
             columns: vec![
-                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int },
+                ColumnDefinition::new("id", DataType::Int),
             ],
         };
         storage.create_table(&create_stmt).unwrap();
@@ -1505,8 +1489,8 @@ mod tests {
         let create = CreateTableStatement {
             table_name: "events".to_string(),
             columns: vec![
-                ColumnDefinition { name: "name".to_string(), data_type: DataType::Varchar(None) },
-                ColumnDefinition { name: "event_date".to_string(), data_type: DataType::Date },
+                ColumnDefinition::new("name", DataType::Varchar(None)),
+                ColumnDefinition::new("event_date", DataType::Date),
             ],
         };
         storage.create_table(&create).unwrap();
@@ -1539,8 +1523,8 @@ mod tests {
         let create = CreateTableStatement {
             table_name: "logs".to_string(),
             columns: vec![
-                ColumnDefinition { name: "msg".to_string(), data_type: DataType::Varchar(None) },
-                ColumnDefinition { name: "created_at".to_string(), data_type: DataType::Timestamp },
+                ColumnDefinition::new("msg", DataType::Varchar(None)),
+                ColumnDefinition::new("created_at", DataType::Timestamp),
             ],
         };
         storage.create_table(&create).unwrap();
@@ -1560,6 +1544,50 @@ mod tests {
             values: vec![Value::String("bad".to_string()), Value::String("2024-03-15".to_string())],
         };
         assert!(storage.insert_row(&bad_insert).is_err());
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_auto_increment() {
+        let temp_dir = format!("/tmp/abcsql_test_autoinc_{}", std::process::id());
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        let create = CreateTableStatement {
+            table_name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: true },
+                ColumnDefinition::new("name", DataType::Varchar(None)),
+            ],
+        };
+        storage.create_table(&create).unwrap();
+
+        // Insert with NULL for auto_increment column
+        let insert1 = InsertStatement {
+            table_name: "users".to_string(),
+            values: vec![Value::Null, Value::String("Alice".to_string())],
+        };
+        storage.insert_row(&insert1).unwrap();
+
+        let insert2 = InsertStatement {
+            table_name: "users".to_string(),
+            values: vec![Value::Null, Value::String("Bob".to_string())],
+        };
+        storage.insert_row(&insert2).unwrap();
+
+        let rows = storage.read_rows("users").unwrap();
+        assert_eq!(rows[0][0], Value::Int(1));
+        assert_eq!(rows[1][0], Value::Int(2));
+
+        // Can also supply an explicit value
+        let insert3 = InsertStatement {
+            table_name: "users".to_string(),
+            values: vec![Value::Int(10), Value::String("Charlie".to_string())],
+        };
+        storage.insert_row(&insert3).unwrap();
+
+        let rows = storage.read_rows("users").unwrap();
+        assert_eq!(rows[2][0], Value::Int(10));
 
         fs::remove_dir_all(&temp_dir).unwrap();
     }

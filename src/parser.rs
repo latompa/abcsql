@@ -28,6 +28,13 @@ pub struct CreateTableStatement {
 pub struct ColumnDefinition {
     pub name: String,
     pub data_type: DataType,
+    pub auto_increment: bool,
+}
+
+impl ColumnDefinition {
+    pub fn new(name: &str, data_type: DataType) -> Self {
+        Self { name: name.to_string(), data_type, auto_increment: false }
+    }
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -240,10 +247,13 @@ fn parse_column_definition(input: &str) -> IResult<&str, ColumnDefinition> {
     let (input, _) = multispace1(input)?;
     let (input, data_type) = parse_data_type(input)?;
     let (input, _) = multispace0(input)?;
-    
+    let (input, auto_inc) = nom::combinator::opt(tag("AUTO_INCREMENT"))(input)?;
+    let (input, _) = multispace0(input)?;
+
     Ok((input, ColumnDefinition {
         name: name.to_string(),
         data_type,
+        auto_increment: auto_inc.is_some(),
     }))
 }
 
@@ -2253,6 +2263,20 @@ mod tests {
         match stmt {
             SqlStatement::CreateTable(ct) => {
                 assert_eq!(ct.columns[0].data_type, DataType::Timestamp);
+            }
+            _ => panic!("Expected CreateTable"),
+        }
+    }
+
+    #[test]
+    fn test_parse_auto_increment() {
+        let sql = "CREATE TABLE users (id INT AUTO_INCREMENT, name VARCHAR);";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::CreateTable(ct) => {
+                assert_eq!(ct.columns[0].data_type, DataType::Int);
+                assert!(ct.columns[0].auto_increment);
+                assert!(!ct.columns[1].auto_increment);
             }
             _ => panic!("Expected CreateTable"),
         }

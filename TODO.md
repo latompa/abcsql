@@ -19,10 +19,11 @@
 
 ## Data Types
 
-- [ ] FLOAT / DOUBLE
+- [x] FLOAT / DOUBLE
 - [ ] BOOLEAN
 - [ ] DATE / TIMESTAMP
 - [ ] AUTO_INCREMENT
+- [ ] JSON
 
 ## Schema & Constraints
 

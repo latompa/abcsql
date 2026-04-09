@@ -159,18 +159,24 @@ fn resolve_expr(expr: &parser::Expression, row: &[Value], cols: &[(String, Strin
     }
 }
 
+fn compare_numeric(l: f64, r: f64, op: &parser::Operator) -> bool {
+    match op {
+        parser::Operator::Equals => l == r,
+        parser::Operator::NotEquals => l != r,
+        parser::Operator::GreaterThan => l > r,
+        parser::Operator::LessThan => l < r,
+        parser::Operator::GreaterThanOrEqual => l >= r,
+        parser::Operator::LessThanOrEqual => l <= r,
+        _ => false,
+    }
+}
+
 fn compare(left: &Value, op: &parser::Operator, right: &Value) -> bool {
     match (left, right) {
-        (Value::Int(l), Value::Int(r)) => match op {
-            parser::Operator::Equals => l == r,
-            parser::Operator::NotEquals => l != r,
-            parser::Operator::GreaterThan => l > r,
-            parser::Operator::LessThan => l < r,
-            parser::Operator::GreaterThanOrEqual => l >= r,
-            parser::Operator::LessThanOrEqual => l <= r,
-            parser::Operator::Like | parser::Operator::In | parser::Operator::NotIn
-            | parser::Operator::Exists | parser::Operator::NotExists => false,
-        },
+        (Value::Int(l), Value::Int(r)) => compare_numeric(*l as f64, *r as f64, op),
+        (Value::Float(l), Value::Float(r)) => compare_numeric(*l, *r, op),
+        (Value::Int(l), Value::Float(r)) => compare_numeric(*l as f64, *r, op),
+        (Value::Float(l), Value::Int(r)) => compare_numeric(*l, *r as f64, op),
         (Value::String(l), Value::String(r)) => match op {
             parser::Operator::Like => like_match(l, r),
             parser::Operator::Equals => l == r,
@@ -179,8 +185,7 @@ fn compare(left: &Value, op: &parser::Operator, right: &Value) -> bool {
             parser::Operator::LessThan => l < r,
             parser::Operator::GreaterThanOrEqual => l >= r,
             parser::Operator::LessThanOrEqual => l <= r,
-            parser::Operator::In | parser::Operator::NotIn
-            | parser::Operator::Exists | parser::Operator::NotExists => false,
+            _ => false,
         },
         _ => false,
     }

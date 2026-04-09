@@ -33,6 +33,8 @@ pub struct ColumnDefinition {
 #[derive(Debug, PartialEq, Clone)]
 pub enum DataType {
     Int,
+    Float,
+    Double,
     Varchar(Option<usize>), // VARCHAR(255) or VARCHAR
 }
 
@@ -184,6 +186,7 @@ pub enum Operator {
 #[derive(Debug, PartialEq, Clone)]
 pub enum Value {
     Int(i64),
+    Float(f64),
     String(String),
     Null,
 }
@@ -243,6 +246,8 @@ fn parse_column_definition(input: &str) -> IResult<&str, ColumnDefinition> {
 /// Parse data type: INT or VARCHAR or VARCHAR(n)
 fn parse_data_type(input: &str) -> IResult<&str, DataType> {
     nom::branch::alt((
+        parse_double_type,
+        parse_float_type,
         parse_int_type,
         parse_varchar_type,
     ))(input)
@@ -251,6 +256,16 @@ fn parse_data_type(input: &str) -> IResult<&str, DataType> {
 fn parse_int_type(input: &str) -> IResult<&str, DataType> {
     let (input, _) = tag("INT")(input)?;
     Ok((input, DataType::Int))
+}
+
+fn parse_float_type(input: &str) -> IResult<&str, DataType> {
+    let (input, _) = tag("FLOAT")(input)?;
+    Ok((input, DataType::Float))
+}
+
+fn parse_double_type(input: &str) -> IResult<&str, DataType> {
+    let (input, _) = tag("DOUBLE")(input)?;
+    Ok((input, DataType::Double))
 }
 
 fn parse_varchar_type(input: &str) -> IResult<&str, DataType> {
@@ -804,15 +819,27 @@ fn parse_operator(input: &str) -> IResult<&str, Operator> {
     ))(input)
 }
 
-/// Parse value: integer or string or NULL
+/// Parse value: float, integer, string, or NULL
 fn parse_value(input: &str) -> IResult<&str, Value> {
     let (input, _) = multispace0(input)?;
     let (input, value) = nom::branch::alt((
         parse_string_value,
         parse_null_value,
+        parse_float_value,
         parse_int_value,
     ))(input)?;
     Ok((input, value))
+}
+
+/// Parse float literal: digits.digits (must have decimal point)
+fn parse_float_value(input: &str) -> IResult<&str, Value> {
+    let (input, neg) = nom::combinator::opt(nom_char('-'))(input)?;
+    let (input, whole) = nom::character::complete::digit1(input)?;
+    let (input, _) = nom_char('.')(input)?;
+    let (input, frac) = nom::character::complete::digit1(input)?;
+    let s = format!("{}{}.{}", if neg.is_some() { "-" } else { "" }, whole, frac);
+    let n = s.parse::<f64>().map_err(|_| nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Float)))?;
+    Ok((input, Value::Float(n)))
 }
 
 fn parse_int_value(input: &str) -> IResult<&str, Value> {
@@ -2066,6 +2093,64 @@ mod tests {
                         }
                     }
                     _ => panic!("Expected Alias"),
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_float_literal() {
+        let sql = "INSERT INTO data VALUES (3.14);";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Insert(ins) => {
+                assert_eq!(ins.values[0], Value::Float(3.14));
+            }
+            _ => panic!("Expected Insert"),
+        }
+    }
+
+    #[test]
+    fn test_parse_float_type() {
+        let sql = "CREATE TABLE data (val FLOAT);";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::CreateTable(ct) => {
+                assert_eq!(ct.columns[0].data_type, DataType::Float);
+            }
+            _ => panic!("Expected CreateTable"),
+        }
+    }
+
+    #[test]
+    fn test_parse_double_type() {
+        let sql = "CREATE TABLE data (val DOUBLE);";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::CreateTable(ct) => {
+                assert_eq!(ct.columns[0].data_type, DataType::Double);
+            }
+            _ => panic!("Expected CreateTable"),
+        }
+    }
+
+    #[test]
+    fn test_parse_float_in_where() {
+        let sql = "SELECT * FROM data WHERE val > 3.14;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                let wc = sel.where_clause.unwrap();
+                match &wc.condition.right {
+                    Expression::Literal(Value::Float(n)) => {
+                        assert!((*n - 3.14).abs() < 0.001);
+                    }
+                    _ => panic!("Expected Float literal"),
                 }
             }
             _ => panic!("Expected Select"),

@@ -356,6 +356,8 @@ impl Storage {
 fn data_type_to_string(data_type: &DataType) -> String {
     match data_type {
         DataType::Int => "INT".to_string(),
+        DataType::Float => "FLOAT".to_string(),
+        DataType::Double => "DOUBLE".to_string(),
         DataType::Varchar(Some(size)) => format!("VARCHAR({})", size),
         DataType::Varchar(None) => "VARCHAR".to_string(),
     }
@@ -365,6 +367,10 @@ fn data_type_to_string(data_type: &DataType) -> String {
 fn parse_data_type(s: &str) -> Result<DataType, StorageError> {
     if s == "INT" {
         Ok(DataType::Int)
+    } else if s == "FLOAT" {
+        Ok(DataType::Float)
+    } else if s == "DOUBLE" {
+        Ok(DataType::Double)
     } else if s == "VARCHAR" {
         Ok(DataType::Varchar(None))
     } else if s.starts_with("VARCHAR(") && s.ends_with(')') {
@@ -382,6 +388,10 @@ fn validate_value_type(value: &Value, data_type: &DataType, column_name: &str) -
     match (value, data_type) {
         (Value::Null, _) => Ok(()), // NULL is valid for any type
         (Value::Int(_), DataType::Int) => Ok(()),
+        (Value::Float(_), DataType::Float) => Ok(()),
+        (Value::Float(_), DataType::Double) => Ok(()),
+        (Value::Int(_), DataType::Float) => Ok(()),
+        (Value::Int(_), DataType::Double) => Ok(()),
         (Value::String(_), DataType::Varchar(_)) => Ok(()),
         _ => Err(StorageError::TypeMismatch {
             column: column_name.to_string(),
@@ -422,19 +432,25 @@ fn resolve_expression(expr: &Expression, row: &[Value], schema: &[ColumnDefiniti
     }
 }
 
+fn compare_numeric(l: f64, r: f64, op: &Operator) -> bool {
+    match op {
+        Operator::Equals => l == r,
+        Operator::NotEquals => l != r,
+        Operator::GreaterThan => l > r,
+        Operator::LessThan => l < r,
+        Operator::GreaterThanOrEqual => l >= r,
+        Operator::LessThanOrEqual => l <= r,
+        _ => false,
+    }
+}
+
 /// Compare two values using the given operator
 fn compare_values(left: &Value, op: &Operator, right: &Value) -> bool {
     match (left, right) {
-        (Value::Int(l), Value::Int(r)) => match op {
-            Operator::Equals => l == r,
-            Operator::NotEquals => l != r,
-            Operator::GreaterThan => l > r,
-            Operator::LessThan => l < r,
-            Operator::GreaterThanOrEqual => l >= r,
-            Operator::LessThanOrEqual => l <= r,
-            Operator::Like | Operator::In | Operator::NotIn
-            | Operator::Exists | Operator::NotExists => false,
-        },
+        (Value::Int(l), Value::Int(r)) => compare_numeric(*l as f64, *r as f64, op),
+        (Value::Float(l), Value::Float(r)) => compare_numeric(*l, *r, op),
+        (Value::Int(l), Value::Float(r)) => compare_numeric(*l as f64, *r, op),
+        (Value::Float(l), Value::Int(r)) => compare_numeric(*l, *r as f64, op),
         (Value::String(l), Value::String(r)) => match op {
             Operator::Like => like_match(l, r),
             Operator::Equals => l == r,
@@ -443,15 +459,14 @@ fn compare_values(left: &Value, op: &Operator, right: &Value) -> bool {
             Operator::LessThan => l < r,
             Operator::GreaterThanOrEqual => l >= r,
             Operator::LessThanOrEqual => l <= r,
-            Operator::In | Operator::NotIn
-            | Operator::Exists | Operator::NotExists => false,
+            _ => false,
         },
         (Value::Null, Value::Null) => match op {
             Operator::Equals => true,
             Operator::NotEquals => false,
             _ => false,
         },
-        _ => false, // Type mismatch or NULL comparison
+        _ => false,
     }
 }
 
@@ -491,6 +506,7 @@ fn serialize_row(values: &[Value]) -> String {
         .iter()
         .map(|v| match v {
             Value::Int(n) => format!("INT:{}", n),
+            Value::Float(n) => format!("FLOAT:{}", n),
             Value::String(s) => {
                 // Escape pipe and newline characters
                 let escaped = s.replace('\\', "\\\\")
@@ -540,6 +556,10 @@ fn deserialize_row(s: &str) -> Result<Vec<Value>, StorageError> {
             let n = int_str.parse::<i64>()
                 .map_err(|_| StorageError::InvalidData(format!("Invalid integer: {}", int_str)))?;
             values.push(Value::Int(n));
+        } else if let Some(float_str) = part.strip_prefix("FLOAT:") {
+            let n = float_str.parse::<f64>()
+                .map_err(|_| StorageError::InvalidData(format!("Invalid float: {}", float_str)))?;
+            values.push(Value::Float(n));
         } else if let Some(string_val) = part.strip_prefix("STRING:") {
             // Unescape special characters
             let unescaped = string_val

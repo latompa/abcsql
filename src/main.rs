@@ -103,6 +103,8 @@ fn handle_meta_command(cmd: &str, storage: &Storage) {
                     for (i, col) in schema.columns.iter().enumerate() {
                         let type_str = match &col.data_type {
                             parser::DataType::Int => "INT".to_string(),
+                            parser::DataType::Float => "FLOAT".to_string(),
+                            parser::DataType::Double => "DOUBLE".to_string(),
                             parser::DataType::Varchar(Some(n)) => format!("VARCHAR({})", n),
                             parser::DataType::Varchar(None) => "VARCHAR".to_string(),
                         };
@@ -724,23 +726,33 @@ fn compute_aggregate(
     match func {
         parser::AggregateFunc::Count => values.len().to_string(),
         parser::AggregateFunc::Sum => {
-            let sum: i64 = values.iter().filter_map(|v| match v {
-                Value::Int(n) => Some(*n),
-                _ => None,
-            }).sum();
-            sum.to_string()
+            let has_float = values.iter().any(|v| matches!(v, Value::Float(_)));
+            if has_float {
+                let sum: f64 = values.iter().filter_map(|v| match v {
+                    Value::Float(n) => Some(*n),
+                    Value::Int(n) => Some(*n as f64),
+                    _ => None,
+                }).sum();
+                format_value(&Value::Float(sum))
+            } else {
+                let sum: i64 = values.iter().filter_map(|v| match v {
+                    Value::Int(n) => Some(*n),
+                    _ => None,
+                }).sum();
+                sum.to_string()
+            }
         }
         parser::AggregateFunc::Avg => {
-            let nums: Vec<i64> = values.iter().filter_map(|v| match v {
-                Value::Int(n) => Some(*n),
+            let nums: Vec<f64> = values.iter().filter_map(|v| match v {
+                Value::Int(n) => Some(*n as f64),
+                Value::Float(n) => Some(*n),
                 _ => None,
             }).collect();
             if nums.is_empty() {
                 "NULL".to_string()
             } else {
-                let avg = nums.iter().sum::<i64>() as f64 / nums.len() as f64;
-                // Show integer if whole number, otherwise 2 decimal places
-                if avg == avg.floor() {
+                let avg = nums.iter().sum::<f64>() / nums.len() as f64;
+                if avg == avg.floor() && avg.abs() < 1e15 {
                     format!("{}", avg as i64)
                 } else {
                     format!("{:.2}", avg)
@@ -760,13 +772,14 @@ fn compute_aggregate(
 fn cmp_values(a: &Value, b: &Value) -> std::cmp::Ordering {
     match (a, b) {
         (Value::Int(a), Value::Int(b)) => a.cmp(b),
+        (Value::Float(a), Value::Float(b)) => a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
+        (Value::Int(a), Value::Float(b)) => (*a as f64).partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
+        (Value::Float(a), Value::Int(b)) => a.partial_cmp(&(*b as f64)).unwrap_or(std::cmp::Ordering::Equal),
         (Value::String(a), Value::String(b)) => a.cmp(b),
         (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
         (Value::Null, _) => std::cmp::Ordering::Less,
         (_, Value::Null) => std::cmp::Ordering::Greater,
-        // Mixed types: ints before strings
-        (Value::Int(_), Value::String(_)) => std::cmp::Ordering::Less,
-        (Value::String(_), Value::Int(_)) => std::cmp::Ordering::Greater,
+        _ => std::cmp::Ordering::Equal,
     }
 }
 
@@ -929,6 +942,13 @@ fn format_expr(expr: &parser::Expression) -> String {
 fn format_value(value: &Value) -> String {
     match value {
         Value::Int(n) => n.to_string(),
+        Value::Float(n) => {
+            // Use up to 6 significant decimal places, trim trailing zeros
+            let s = format!("{:.6}", n);
+            let s = s.trim_end_matches('0');
+            let s = s.trim_end_matches('.');
+            if s.contains('.') { s.to_string() } else { format!("{}.0", s) }
+        }
         Value::String(s) => s.clone(),
         Value::Null => "NULL".to_string(),
     }
@@ -1056,6 +1076,20 @@ fn resolve_join_expression(
     }
 }
 
+/// Evaluate arithmetic on f64
+fn arith_f64(l: f64, op: &parser::ArithOp, r: f64) -> Option<Value> {
+    let result = match op {
+        parser::ArithOp::Add => l + r,
+        parser::ArithOp::Sub => l - r,
+        parser::ArithOp::Mul => l * r,
+        parser::ArithOp::Div => {
+            if r == 0.0 { return Some(Value::Null); }
+            l / r
+        }
+    };
+    Some(Value::Float(result))
+}
+
 /// Evaluate arithmetic operation on two Values
 fn eval_arith(left: &Value, op: &parser::ArithOp, right: &Value) -> Option<Value> {
     match (left, right) {
@@ -1071,22 +1105,32 @@ fn eval_arith(left: &Value, op: &parser::ArithOp, right: &Value) -> Option<Value
             };
             Some(Value::Int(result))
         }
+        (Value::Float(l), Value::Float(r)) => arith_f64(*l, op, *r),
+        (Value::Int(l), Value::Float(r)) => arith_f64(*l as f64, op, *r),
+        (Value::Float(l), Value::Int(r)) => arith_f64(*l, op, *r as f64),
         _ => Some(Value::Null),
+    }
+}
+
+/// Compare two numeric values as f64
+fn compare_numeric(l: f64, r: f64, op: &parser::Operator) -> bool {
+    match op {
+        parser::Operator::Equals => l == r,
+        parser::Operator::NotEquals => l != r,
+        parser::Operator::GreaterThan => l > r,
+        parser::Operator::LessThan => l < r,
+        parser::Operator::GreaterThanOrEqual => l >= r,
+        parser::Operator::LessThanOrEqual => l <= r,
+        _ => false,
     }
 }
 
 fn compare_values(left: &Value, op: &parser::Operator, right: &Value) -> bool {
     match (left, right) {
-        (Value::Int(l), Value::Int(r)) => match op {
-            parser::Operator::Equals => l == r,
-            parser::Operator::NotEquals => l != r,
-            parser::Operator::GreaterThan => l > r,
-            parser::Operator::LessThan => l < r,
-            parser::Operator::GreaterThanOrEqual => l >= r,
-            parser::Operator::LessThanOrEqual => l <= r,
-            parser::Operator::Like | parser::Operator::In | parser::Operator::NotIn
-            | parser::Operator::Exists | parser::Operator::NotExists => false,
-        },
+        (Value::Int(l), Value::Int(r)) => compare_numeric(*l as f64, *r as f64, op),
+        (Value::Float(l), Value::Float(r)) => compare_numeric(*l, *r, op),
+        (Value::Int(l), Value::Float(r)) => compare_numeric(*l as f64, *r, op),
+        (Value::Float(l), Value::Int(r)) => compare_numeric(*l, *r as f64, op),
         (Value::String(l), Value::String(r)) => match op {
             parser::Operator::Like => like_match(l, r),
             parser::Operator::Equals => l == r,
@@ -1095,8 +1139,7 @@ fn compare_values(left: &Value, op: &parser::Operator, right: &Value) -> bool {
             parser::Operator::LessThan => l < r,
             parser::Operator::GreaterThanOrEqual => l >= r,
             parser::Operator::LessThanOrEqual => l <= r,
-            parser::Operator::In | parser::Operator::NotIn
-            | parser::Operator::Exists | parser::Operator::NotExists => false,
+            _ => false,
         },
         (Value::Null, Value::Null) => match op {
             parser::Operator::Equals => true,

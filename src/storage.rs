@@ -3,7 +3,7 @@ use std::io::{self, Write as IoWrite, BufWriter, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::fmt;
 use std::collections::HashMap;
-use crate::parser::{CreateTableStatement, CreateIndexStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, UpdateStatement, DeleteStatement, Value, Condition, Expression, Operator};
+use crate::parser::{CreateTableStatement, CreateIndexStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, UpdateStatement, DeleteStatement, AlterTableStatement, AlterAction, Value, Condition, Expression, Operator};
 
 /// Storage engine for persisting tables to disk
 pub struct Storage {
@@ -94,14 +94,27 @@ impl Storage {
             return Err(StorageError::TableAlreadyExists(stmt.table_name.clone()));
         }
 
-        // Write schema file
+        self.write_schema_file(&stmt.table_name, &stmt.columns)?;
+
+        // Create empty data file
+        let data_path = self.data_path(&stmt.table_name);
+        fs::File::create(data_path)?;
+
+        // Initialize sequence file for auto_increment columns
+        if stmt.columns.iter().any(|c| c.auto_increment) {
+            let seq_path = self.seq_path(&stmt.table_name);
+            fs::write(seq_path, "0")?;
+        }
+
+        Ok(())
+    }
+
+    /// Write (or overwrite) a schema file for a table
+    fn write_schema_file(&self, table_name: &str, columns: &[ColumnDefinition]) -> Result<(), StorageError> {
+        let schema_path = self.schema_path(table_name);
         let mut file = fs::File::create(schema_path)?;
-
-        // First line: table name
-        writeln!(file, "{}", stmt.table_name)?;
-
-        // Subsequent lines: column definitions (name:TYPE[:flags...])
-        for col in &stmt.columns {
+        writeln!(file, "{}", table_name)?;
+        for col in columns {
             let type_str = data_type_to_string(&col.data_type);
             let mut parts = vec![col.name.as_str(), type_str.as_str()];
             let ai = "AUTO_INCREMENT".to_string();
@@ -116,17 +129,6 @@ impl Storage {
             if let Some(ref fk_str) = fk { parts.push(fk_str); }
             writeln!(file, "{}", parts.join(":"))?;
         }
-
-        // Create empty data file
-        let data_path = self.data_path(&stmt.table_name);
-        fs::File::create(data_path)?;
-
-        // Initialize sequence file for auto_increment columns
-        if stmt.columns.iter().any(|c| c.auto_increment) {
-            let seq_path = self.seq_path(&stmt.table_name);
-            fs::write(seq_path, "0")?;
-        }
-
         Ok(())
     }
 
@@ -512,6 +514,282 @@ impl Storage {
             }
         }
 
+        Ok(())
+    }
+
+    /// Apply an ALTER TABLE statement
+    pub fn alter_table(&self, stmt: &AlterTableStatement) -> Result<(), StorageError> {
+        let schema = self.load_schema(&stmt.table_name)?;
+        match &stmt.action {
+            AlterAction::AddColumn(col) => self.alter_add_column(&schema, col),
+            AlterAction::DropColumn(name) => self.alter_drop_column(&schema, name),
+            AlterAction::RenameColumn { from, to } => self.alter_rename_column(&schema, from, to),
+            AlterAction::RenameTable(new_name) => self.alter_rename_table(&stmt.table_name, new_name),
+        }
+    }
+
+    fn alter_add_column(&self, schema: &CreateTableStatement, col: &ColumnDefinition) -> Result<(), StorageError> {
+        if schema.columns.iter().any(|c| c.name == col.name) {
+            return Err(StorageError::InvalidSchema(
+                format!("column '{}' already exists in table '{}'", col.name, schema.table_name)
+            ));
+        }
+
+        let rows = self.read_rows(&schema.table_name)?;
+
+        // Can't add NOT NULL to an existing non-empty table without a default
+        if col.not_null && !rows.is_empty() {
+            return Err(StorageError::InvalidSchema(
+                format!("cannot add NOT NULL column '{}' to non-empty table", col.name)
+            ));
+        }
+
+        // Adding a UNIQUE column to a non-empty table with existing NULLs is fine
+        // (NULLs don't violate uniqueness). With multiple non-NULL values we'd
+        // already need defaults to populate, so this only matters once defaults exist.
+
+        let mut new_columns = schema.columns.clone();
+        new_columns.push(col.clone());
+
+        // Rewrite data: append Null to each row
+        let data_path = self.data_path(&schema.table_name);
+        let file = fs::File::create(data_path)?;
+        let mut writer = BufWriter::new(file);
+        for row in &rows {
+            let mut new_row = row.clone();
+            new_row.push(Value::Null);
+            writeln!(writer, "{}", serialize_row(&new_row))?;
+        }
+        writer.flush()?;
+
+        self.write_schema_file(&schema.table_name, &new_columns)?;
+
+        // Initialize sequence file if this is the first auto_increment column
+        if col.auto_increment && !schema.columns.iter().any(|c| c.auto_increment) {
+            let seq_path = self.seq_path(&schema.table_name);
+            fs::write(seq_path, "0")?;
+        }
+
+        self.rebuild_indexes_for_table(&schema.table_name)?;
+        Ok(())
+    }
+
+    fn alter_drop_column(&self, schema: &CreateTableStatement, col_name: &str) -> Result<(), StorageError> {
+        let col_idx = schema.columns.iter()
+            .position(|c| c.name == col_name)
+            .ok_or_else(|| StorageError::ColumnNotFound(col_name.to_string()))?;
+
+        if schema.columns.len() == 1 {
+            return Err(StorageError::InvalidSchema(
+                format!("cannot drop last column '{}' from table '{}'", col_name, schema.table_name)
+            ));
+        }
+
+        // Block drop if another table FK-references this column
+        let tables = self.list_tables().map_err(StorageError::IoError)?;
+        for t in &tables {
+            if t == &schema.table_name { continue; }
+            let other = self.load_schema(t)?;
+            for other_col in &other.columns {
+                if let Some(ref fk) = other_col.references {
+                    if fk.table == schema.table_name && fk.column == col_name {
+                        return Err(StorageError::InvalidSchema(
+                            format!("cannot drop '{}.{}': referenced by '{}.{}'", schema.table_name, col_name, t, other_col.name)
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Drop indexes on this column
+        let meta = self.load_index_meta()?;
+        for (idx_name, t, c, _) in &meta {
+            if t == &schema.table_name && c == col_name {
+                self.drop_index(idx_name)?;
+            }
+        }
+
+        // Rewrite data without the dropped column
+        let rows = self.read_rows(&schema.table_name)?;
+        let data_path = self.data_path(&schema.table_name);
+        let file = fs::File::create(data_path)?;
+        let mut writer = BufWriter::new(file);
+        for row in &rows {
+            let new_row: Vec<Value> = row.iter().enumerate()
+                .filter(|(i, _)| *i != col_idx)
+                .map(|(_, v)| v.clone())
+                .collect();
+            writeln!(writer, "{}", serialize_row(&new_row))?;
+        }
+        writer.flush()?;
+
+        let new_columns: Vec<ColumnDefinition> = schema.columns.iter()
+            .filter(|c| c.name != col_name)
+            .cloned()
+            .collect();
+        self.write_schema_file(&schema.table_name, &new_columns)?;
+
+        // Remove sequence file if no auto_increment columns remain
+        let dropped_col = &schema.columns[col_idx];
+        if dropped_col.auto_increment && !new_columns.iter().any(|c| c.auto_increment) {
+            let seq_path = self.seq_path(&schema.table_name);
+            if seq_path.exists() {
+                fs::remove_file(seq_path)?;
+            }
+        }
+
+        self.rebuild_indexes_for_table(&schema.table_name)?;
+        Ok(())
+    }
+
+    fn alter_rename_column(&self, schema: &CreateTableStatement, from: &str, to: &str) -> Result<(), StorageError> {
+        if !schema.columns.iter().any(|c| c.name == from) {
+            return Err(StorageError::ColumnNotFound(from.to_string()));
+        }
+        if schema.columns.iter().any(|c| c.name == to) {
+            return Err(StorageError::InvalidSchema(
+                format!("column '{}' already exists in table '{}'", to, schema.table_name)
+            ));
+        }
+
+        // Rewrite this table's schema with the renamed column
+        let new_columns: Vec<ColumnDefinition> = schema.columns.iter()
+            .map(|c| if c.name == from {
+                let mut nc = c.clone();
+                nc.name = to.to_string();
+                nc
+            } else {
+                c.clone()
+            })
+            .collect();
+        self.write_schema_file(&schema.table_name, &new_columns)?;
+
+        // Update FK references in other tables
+        let tables = self.list_tables().map_err(StorageError::IoError)?;
+        for t in &tables {
+            if t == &schema.table_name { continue; }
+            let other = self.load_schema(t)?;
+            let mut changed = false;
+            let updated: Vec<ColumnDefinition> = other.columns.iter()
+                .map(|c| {
+                    if let Some(ref fk) = c.references {
+                        if fk.table == schema.table_name && fk.column == from {
+                            let mut nc = c.clone();
+                            nc.references = Some(ForeignKeyRef {
+                                table: fk.table.clone(),
+                                column: to.to_string(),
+                            });
+                            changed = true;
+                            return nc;
+                        }
+                    }
+                    c.clone()
+                })
+                .collect();
+            if changed {
+                self.write_schema_file(t, &updated)?;
+            }
+        }
+
+        // Update index metadata column entries
+        let meta = self.load_index_meta()?;
+        let updated_meta: Vec<_> = meta.iter()
+            .map(|(name, t, c, u)| {
+                if t == &schema.table_name && c == from {
+                    (name.clone(), t.clone(), to.to_string(), *u)
+                } else {
+                    (name.clone(), t.clone(), c.clone(), *u)
+                }
+            })
+            .collect();
+        self.write_index_meta(&updated_meta)?;
+
+        Ok(())
+    }
+
+    fn alter_rename_table(&self, old_name: &str, new_name: &str) -> Result<(), StorageError> {
+        if old_name == new_name {
+            return Ok(());
+        }
+        if self.table_exists(new_name) {
+            return Err(StorageError::TableAlreadyExists(new_name.to_string()));
+        }
+
+        // Rewrite schema with new table name (first line) at the new path
+        let schema = self.load_schema(old_name)?;
+        self.write_schema_file(new_name, &schema.columns)?;
+        fs::remove_file(self.schema_path(old_name))?;
+
+        // Rename data file
+        let old_data = self.data_path(old_name);
+        let new_data = self.data_path(new_name);
+        if old_data.exists() {
+            fs::rename(old_data, new_data)?;
+        }
+
+        // Rename sequence file
+        let old_seq = self.seq_path(old_name);
+        let new_seq = self.seq_path(new_name);
+        if old_seq.exists() {
+            fs::rename(old_seq, new_seq)?;
+        }
+
+        // Update index metadata: any index entries owned by old_name now belong to new_name
+        let meta = self.load_index_meta()?;
+        let updated: Vec<_> = meta.iter()
+            .map(|(name, t, c, u)| {
+                let new_t = if t == old_name { new_name.to_string() } else { t.clone() };
+                (name.clone(), new_t, c.clone(), *u)
+            })
+            .collect();
+        self.write_index_meta(&updated)?;
+
+        // Update FK references in other tables
+        let tables = self.list_tables().map_err(StorageError::IoError)?;
+        for t in &tables {
+            if t == new_name { continue; }
+            let other = self.load_schema(t)?;
+            let mut changed = false;
+            let updated_cols: Vec<ColumnDefinition> = other.columns.iter()
+                .map(|c| {
+                    if let Some(ref fk) = c.references {
+                        if fk.table == old_name {
+                            let mut nc = c.clone();
+                            nc.references = Some(ForeignKeyRef {
+                                table: new_name.to_string(),
+                                column: fk.column.clone(),
+                            });
+                            changed = true;
+                            return nc;
+                        }
+                    }
+                    c.clone()
+                })
+                .collect();
+            if changed {
+                self.write_schema_file(t, &updated_cols)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn write_index_meta(&self, entries: &[(String, String, String, bool)]) -> Result<(), StorageError> {
+        let path = self.index_meta_path();
+        if entries.is_empty() {
+            if path.exists() {
+                fs::remove_file(path)?;
+            }
+            return Ok(());
+        }
+        let mut file = fs::File::create(path)?;
+        for (name, table, col, unique) in entries {
+            if *unique {
+                writeln!(file, "{}:{}:{}:UNIQUE", name, table, col)?;
+            } else {
+                writeln!(file, "{}:{}:{}", name, table, col)?;
+            }
+        }
         Ok(())
     }
 
@@ -2563,6 +2841,261 @@ mod tests {
             unique: true,
         });
         assert!(matches!(result, Err(StorageError::DuplicateKey { .. })));
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_alter_add_column() {
+        let temp_dir = std::env::temp_dir().join("abcsql_test_alter_add");
+        let _ = fs::remove_dir_all(&temp_dir);
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        storage.create_table(&CreateTableStatement {
+            table_name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id", DataType::Int),
+                ColumnDefinition::new("name", DataType::Varchar(None)),
+            ],
+        }).unwrap();
+        storage.insert_row(&InsertStatement {
+            table_name: "users".to_string(),
+            values: vec![Value::Int(1), Value::String("Alice".to_string())],
+        }).unwrap();
+
+        storage.alter_table(&AlterTableStatement {
+            table_name: "users".to_string(),
+            action: AlterAction::AddColumn(ColumnDefinition::new("email", DataType::Varchar(None))),
+        }).unwrap();
+
+        let schema = storage.load_schema("users").unwrap();
+        assert_eq!(schema.columns.len(), 3);
+        assert_eq!(schema.columns[2].name, "email");
+
+        // Existing row should now have NULL in the new column
+        let rows = storage.read_rows("users").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].len(), 3);
+        assert_eq!(rows[0][2], Value::Null);
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_alter_add_not_null_to_nonempty_fails() {
+        let temp_dir = std::env::temp_dir().join("abcsql_test_alter_add_nn");
+        let _ = fs::remove_dir_all(&temp_dir);
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        storage.create_table(&CreateTableStatement {
+            table_name: "t".to_string(),
+            columns: vec![ColumnDefinition::new("id", DataType::Int)],
+        }).unwrap();
+        storage.insert_row(&InsertStatement {
+            table_name: "t".to_string(),
+            values: vec![Value::Int(1)],
+        }).unwrap();
+
+        let mut col = ColumnDefinition::new("required", DataType::Int);
+        col.not_null = true;
+        let result = storage.alter_table(&AlterTableStatement {
+            table_name: "t".to_string(),
+            action: AlterAction::AddColumn(col),
+        });
+        assert!(matches!(result, Err(StorageError::InvalidSchema(_))));
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_alter_drop_column() {
+        let temp_dir = std::env::temp_dir().join("abcsql_test_alter_drop");
+        let _ = fs::remove_dir_all(&temp_dir);
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        storage.create_table(&CreateTableStatement {
+            table_name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id", DataType::Int),
+                ColumnDefinition::new("name", DataType::Varchar(None)),
+                ColumnDefinition::new("temp", DataType::Int),
+            ],
+        }).unwrap();
+        storage.insert_row(&InsertStatement {
+            table_name: "users".to_string(),
+            values: vec![Value::Int(1), Value::String("Alice".to_string()), Value::Int(99)],
+        }).unwrap();
+
+        storage.alter_table(&AlterTableStatement {
+            table_name: "users".to_string(),
+            action: AlterAction::DropColumn("temp".to_string()),
+        }).unwrap();
+
+        let schema = storage.load_schema("users").unwrap();
+        assert_eq!(schema.columns.len(), 2);
+        assert!(!schema.columns.iter().any(|c| c.name == "temp"));
+
+        let rows = storage.read_rows("users").unwrap();
+        assert_eq!(rows[0].len(), 2);
+        assert_eq!(rows[0][1], Value::String("Alice".to_string()));
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_alter_drop_column_referenced_by_fk_fails() {
+        let temp_dir = std::env::temp_dir().join("abcsql_test_alter_drop_fk");
+        let _ = fs::remove_dir_all(&temp_dir);
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        let mut id_col = ColumnDefinition::new("id", DataType::Int);
+        id_col.primary_key = true;
+        storage.create_table(&CreateTableStatement {
+            table_name: "users".to_string(),
+            columns: vec![id_col],
+        }).unwrap();
+
+        let mut fk_col = ColumnDefinition::new("user_id", DataType::Int);
+        fk_col.references = Some(ForeignKeyRef { table: "users".to_string(), column: "id".to_string() });
+        storage.create_table(&CreateTableStatement {
+            table_name: "orders".to_string(),
+            columns: vec![ColumnDefinition::new("oid", DataType::Int), fk_col],
+        }).unwrap();
+
+        let result = storage.alter_table(&AlterTableStatement {
+            table_name: "users".to_string(),
+            action: AlterAction::DropColumn("id".to_string()),
+        });
+        assert!(matches!(result, Err(StorageError::InvalidSchema(_))));
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_alter_rename_column_updates_fk() {
+        let temp_dir = std::env::temp_dir().join("abcsql_test_alter_rename_col");
+        let _ = fs::remove_dir_all(&temp_dir);
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        let mut id_col = ColumnDefinition::new("id", DataType::Int);
+        id_col.primary_key = true;
+        storage.create_table(&CreateTableStatement {
+            table_name: "users".to_string(),
+            columns: vec![id_col],
+        }).unwrap();
+
+        let mut fk_col = ColumnDefinition::new("user_id", DataType::Int);
+        fk_col.references = Some(ForeignKeyRef { table: "users".to_string(), column: "id".to_string() });
+        storage.create_table(&CreateTableStatement {
+            table_name: "orders".to_string(),
+            columns: vec![ColumnDefinition::new("oid", DataType::Int), fk_col],
+        }).unwrap();
+
+        storage.alter_table(&AlterTableStatement {
+            table_name: "users".to_string(),
+            action: AlterAction::RenameColumn { from: "id".to_string(), to: "user_id".to_string() },
+        }).unwrap();
+
+        let users = storage.load_schema("users").unwrap();
+        assert_eq!(users.columns[0].name, "user_id");
+
+        let orders = storage.load_schema("orders").unwrap();
+        let fk = orders.columns[1].references.as_ref().unwrap();
+        assert_eq!(fk.column, "user_id");
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_alter_rename_table() {
+        let temp_dir = std::env::temp_dir().join("abcsql_test_alter_rename_tbl");
+        let _ = fs::remove_dir_all(&temp_dir);
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        storage.create_table(&CreateTableStatement {
+            table_name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id", DataType::Int),
+                ColumnDefinition::new("name", DataType::Varchar(None)),
+            ],
+        }).unwrap();
+        storage.insert_row(&InsertStatement {
+            table_name: "users".to_string(),
+            values: vec![Value::Int(1), Value::String("Alice".to_string())],
+        }).unwrap();
+
+        storage.alter_table(&AlterTableStatement {
+            table_name: "users".to_string(),
+            action: AlterAction::RenameTable("members".to_string()),
+        }).unwrap();
+
+        assert!(!storage.table_exists("users"));
+        assert!(storage.table_exists("members"));
+
+        let rows = storage.read_rows("members").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][1], Value::String("Alice".to_string()));
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_alter_drop_column_drops_index() {
+        let temp_dir = std::env::temp_dir().join("abcsql_test_alter_drop_idx");
+        let _ = fs::remove_dir_all(&temp_dir);
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        storage.create_table(&CreateTableStatement {
+            table_name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id", DataType::Int),
+                ColumnDefinition::new("email", DataType::Varchar(None)),
+            ],
+        }).unwrap();
+        storage.create_index(&CreateIndexStatement {
+            index_name: "idx_email".to_string(),
+            table_name: "users".to_string(),
+            column_name: "email".to_string(),
+            unique: false,
+        }).unwrap();
+
+        storage.alter_table(&AlterTableStatement {
+            table_name: "users".to_string(),
+            action: AlterAction::DropColumn("email".to_string()),
+        }).unwrap();
+
+        assert!(storage.find_index("users", "email").unwrap().is_none());
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_alter_rename_column_updates_index_meta() {
+        let temp_dir = std::env::temp_dir().join("abcsql_test_alter_rename_col_idx");
+        let _ = fs::remove_dir_all(&temp_dir);
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        storage.create_table(&CreateTableStatement {
+            table_name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id", DataType::Int),
+                ColumnDefinition::new("email", DataType::Varchar(None)),
+            ],
+        }).unwrap();
+        storage.create_index(&CreateIndexStatement {
+            index_name: "idx_email".to_string(),
+            table_name: "users".to_string(),
+            column_name: "email".to_string(),
+            unique: false,
+        }).unwrap();
+
+        storage.alter_table(&AlterTableStatement {
+            table_name: "users".to_string(),
+            action: AlterAction::RenameColumn { from: "email".to_string(), to: "addr".to_string() },
+        }).unwrap();
+
+        assert!(storage.find_index("users", "email").unwrap().is_none());
+        assert_eq!(storage.find_index("users", "addr").unwrap().as_deref(), Some("idx_email"));
 
         fs::remove_dir_all(&temp_dir).unwrap();
     }

@@ -190,6 +190,24 @@ fn execute_sql(sql: &str, storage: &Storage) {
                 Err(e) => eprintln!("Error: {}", e),
             }
         }
+        SqlStatement::DropTable(drop_stmt) => {
+            if drop_stmt.if_exists && !storage.table_exists(&drop_stmt.table_name) {
+                println!("Table '{}' does not exist", drop_stmt.table_name);
+                return;
+            }
+            let name = drop_stmt.table_name.clone();
+            match storage.drop_table(&name) {
+                Ok(_) => println!("Dropped table '{}'", name),
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        }
+        SqlStatement::AlterTable(alter_stmt) => {
+            let name = alter_stmt.table_name.clone();
+            match storage.alter_table(&alter_stmt) {
+                Ok(_) => println!("Altered table '{}'", name),
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        }
     }
 }
 

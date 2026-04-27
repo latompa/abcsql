@@ -31,7 +31,8 @@
 - [x] FOREIGN KEY constraint
 - [x] NOT NULL constraint
 - [x] UNIQUE constraint
-- [ ] ALTER TABLE statement
+- [x] ALTER TABLE statement
+- [x] DROP TABLE statement
 
 ## Additional
 - [ ] COALESCE

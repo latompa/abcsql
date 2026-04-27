@@ -14,6 +14,8 @@ pub enum SqlStatement {
     CreateTable(CreateTableStatement),
     CreateIndex(CreateIndexStatement),
     DropIndex(DropIndexStatement),
+    DropTable(DropTableStatement),
+    AlterTable(AlterTableStatement),
     Insert(InsertStatement),
     Select(SelectStatement),
     Update(UpdateStatement),
@@ -37,6 +39,26 @@ pub struct CreateIndexStatement {
 #[derive(Debug, PartialEq, Clone)]
 pub struct DropIndexStatement {
     pub index_name: String,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct DropTableStatement {
+    pub table_name: String,
+    pub if_exists: bool,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct AlterTableStatement {
+    pub table_name: String,
+    pub action: AlterAction,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum AlterAction {
+    AddColumn(ColumnDefinition),
+    DropColumn(String),
+    RenameColumn { from: String, to: String },
+    RenameTable(String),
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -235,7 +257,8 @@ pub fn parse_sql(input: &str) -> IResult<&str, SqlStatement> {
     let (input, stmt) = nom::branch::alt((
         parse_insert,
         parse_create,
-        parse_drop_index,
+        parse_drop,
+        parse_alter,
         parse_select,
         parse_update,
         parse_delete,
@@ -501,10 +524,14 @@ pub fn parse_delete(input: &str) -> IResult<&str, SqlStatement> {
     })))
 }
 
-// DROP INDEX index_name;
-pub fn parse_drop_index(input: &str) -> IResult<&str, SqlStatement> {
+// DROP INDEX name; / DROP TABLE [IF EXISTS] name;
+pub fn parse_drop(input: &str) -> IResult<&str, SqlStatement> {
     let (input, _) = tag("DROP")(input)?;
     let (input, _) = multispace1(input)?;
+    nom::branch::alt((parse_drop_index_inner, parse_drop_table_inner))(input)
+}
+
+fn parse_drop_index_inner(input: &str) -> IResult<&str, SqlStatement> {
     let (input, _) = tag("INDEX")(input)?;
     let (input, _) = multispace1(input)?;
     let (input, index_name) = parse_identifier(input)?;
@@ -514,6 +541,87 @@ pub fn parse_drop_index(input: &str) -> IResult<&str, SqlStatement> {
     Ok((input, SqlStatement::DropIndex(DropIndexStatement {
         index_name: index_name.to_string(),
     })))
+}
+
+fn parse_drop_table_inner(input: &str) -> IResult<&str, SqlStatement> {
+    let (input, _) = tag("TABLE")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, if_exists) = nom::combinator::opt(
+        nom::sequence::terminated(tag("IF EXISTS"), multispace1)
+    )(input)?;
+    let (input, table_name) = parse_identifier(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
+
+    Ok((input, SqlStatement::DropTable(DropTableStatement {
+        table_name: table_name.to_string(),
+        if_exists: if_exists.is_some(),
+    })))
+}
+
+// ALTER TABLE name { ADD COLUMN col TYPE [constraints]
+//                  | DROP COLUMN col
+//                  | RENAME COLUMN a TO b
+//                  | RENAME TO new_name }
+pub fn parse_alter(input: &str) -> IResult<&str, SqlStatement> {
+    let (input, _) = tag("ALTER")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, _) = tag("TABLE")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, table_name) = parse_identifier(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, action) = nom::branch::alt((
+        parse_alter_add_column,
+        parse_alter_drop_column,
+        parse_alter_rename,
+    ))(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
+
+    Ok((input, SqlStatement::AlterTable(AlterTableStatement {
+        table_name: table_name.to_string(),
+        action,
+    })))
+}
+
+fn parse_alter_add_column(input: &str) -> IResult<&str, AlterAction> {
+    let (input, _) = tag("ADD")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, _) = nom::combinator::opt(
+        nom::sequence::terminated(tag("COLUMN"), multispace1)
+    )(input)?;
+    let (input, col) = parse_column_definition(input)?;
+    Ok((input, AlterAction::AddColumn(col)))
+}
+
+fn parse_alter_drop_column(input: &str) -> IResult<&str, AlterAction> {
+    let (input, _) = tag("DROP")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, _) = nom::combinator::opt(
+        nom::sequence::terminated(tag("COLUMN"), multispace1)
+    )(input)?;
+    let (input, name) = parse_identifier(input)?;
+    Ok((input, AlterAction::DropColumn(name.to_string())))
+}
+
+// RENAME [COLUMN a] TO b — column rename if "COLUMN" present, table rename otherwise
+fn parse_alter_rename(input: &str) -> IResult<&str, AlterAction> {
+    let (input, _) = tag("RENAME")(input)?;
+    let (input, _) = multispace1(input)?;
+    if let Ok((input, _)) = tag::<&str, &str, nom::error::Error<&str>>("COLUMN")(input) {
+        let (input, _) = multispace1(input)?;
+        let (input, from) = parse_identifier(input)?;
+        let (input, _) = multispace1(input)?;
+        let (input, _) = tag("TO")(input)?;
+        let (input, _) = multispace1(input)?;
+        let (input, to) = parse_identifier(input)?;
+        Ok((input, AlterAction::RenameColumn { from: from.to_string(), to: to.to_string() }))
+    } else {
+        let (input, _) = tag("TO")(input)?;
+        let (input, _) = multispace1(input)?;
+        let (input, new_name) = parse_identifier(input)?;
+        Ok((input, AlterAction::RenameTable(new_name.to_string())))
+    }
 }
 
 /// Parse SELECT into a SelectStatement (used by both top-level and subqueries)
@@ -2510,6 +2618,106 @@ mod tests {
                 assert_eq!(di.index_name, "idx_name");
             }
             _ => panic!("Expected DropIndex"),
+        }
+    }
+
+    #[test]
+    fn test_parse_drop_table() {
+        let (_, stmt) = parse_sql("DROP TABLE users;").unwrap();
+        match stmt {
+            SqlStatement::DropTable(d) => {
+                assert_eq!(d.table_name, "users");
+                assert!(!d.if_exists);
+            }
+            _ => panic!("Expected DropTable"),
+        }
+    }
+
+    #[test]
+    fn test_parse_drop_table_if_exists() {
+        let (_, stmt) = parse_sql("DROP TABLE IF EXISTS users;").unwrap();
+        match stmt {
+            SqlStatement::DropTable(d) => {
+                assert_eq!(d.table_name, "users");
+                assert!(d.if_exists);
+            }
+            _ => panic!("Expected DropTable"),
+        }
+    }
+
+    #[test]
+    fn test_parse_alter_add_column() {
+        let (_, stmt) = parse_sql("ALTER TABLE users ADD COLUMN age INT;").unwrap();
+        match stmt {
+            SqlStatement::AlterTable(a) => {
+                assert_eq!(a.table_name, "users");
+                match a.action {
+                    AlterAction::AddColumn(col) => {
+                        assert_eq!(col.name, "age");
+                        assert_eq!(col.data_type, DataType::Int);
+                    }
+                    _ => panic!("Expected AddColumn"),
+                }
+            }
+            _ => panic!("Expected AlterTable"),
+        }
+    }
+
+    #[test]
+    fn test_parse_alter_add_column_no_keyword() {
+        // COLUMN keyword is optional in many SQL dialects
+        let (_, stmt) = parse_sql("ALTER TABLE users ADD age INT NOT NULL;").unwrap();
+        match stmt {
+            SqlStatement::AlterTable(a) => match a.action {
+                AlterAction::AddColumn(col) => {
+                    assert_eq!(col.name, "age");
+                    assert!(col.not_null);
+                }
+                _ => panic!("Expected AddColumn"),
+            }
+            _ => panic!("Expected AlterTable"),
+        }
+    }
+
+    #[test]
+    fn test_parse_alter_drop_column() {
+        let (_, stmt) = parse_sql("ALTER TABLE users DROP COLUMN age;").unwrap();
+        match stmt {
+            SqlStatement::AlterTable(a) => match a.action {
+                AlterAction::DropColumn(name) => assert_eq!(name, "age"),
+                _ => panic!("Expected DropColumn"),
+            }
+            _ => panic!("Expected AlterTable"),
+        }
+    }
+
+    #[test]
+    fn test_parse_alter_rename_column() {
+        let (_, stmt) = parse_sql("ALTER TABLE users RENAME COLUMN name TO full_name;").unwrap();
+        match stmt {
+            SqlStatement::AlterTable(a) => match a.action {
+                AlterAction::RenameColumn { from, to } => {
+                    assert_eq!(from, "name");
+                    assert_eq!(to, "full_name");
+                }
+                _ => panic!("Expected RenameColumn"),
+            }
+            _ => panic!("Expected AlterTable"),
+        }
+    }
+
+    #[test]
+    fn test_parse_alter_rename_table() {
+        let (_, stmt) = parse_sql("ALTER TABLE users RENAME TO members;").unwrap();
+        match stmt {
+            SqlStatement::AlterTable(a) => {
+                assert_eq!(a.table_name, "users");
+                match a.action {
+                    AlterAction::RenameTable(new_name) => assert_eq!(new_name, "members"),
+                    _ => panic!("Expected RenameTable"),
+                }
+            }
+            _ => panic!("Expected AlterTable"),
         }
     }
 }

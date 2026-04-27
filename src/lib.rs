@@ -53,6 +53,19 @@ pub fn execute(storage: &Storage, sql: &str) -> Result<String, String> {
                 .map(|_| format!("Dropped index '{}'", idx_stmt.index_name))
                 .map_err(|e| e.to_string())
         }
+        SqlStatement::DropTable(stmt) => {
+            if stmt.if_exists && !storage.table_exists(&stmt.table_name) {
+                return Ok(format!("Table '{}' does not exist", stmt.table_name));
+            }
+            storage.drop_table(&stmt.table_name)
+                .map(|_| format!("Dropped table '{}'", stmt.table_name))
+                .map_err(|e| e.to_string())
+        }
+        SqlStatement::AlterTable(stmt) => {
+            storage.alter_table(&stmt)
+                .map(|_| format!("Altered table '{}'", stmt.table_name))
+                .map_err(|e| e.to_string())
+        }
     }
 }
 

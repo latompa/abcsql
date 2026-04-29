@@ -130,6 +130,7 @@ pub struct SelectStatement {
     pub where_clause: Option<WhereClause>,
     pub joins: Vec<JoinClause>,
     pub group_by: Vec<SelectColumn>,
+    pub having: Option<WhereClause>,
     pub order_by: Vec<OrderByClause>,
     pub limit: Option<u64>,
 }
@@ -215,6 +216,8 @@ pub enum Expression {
     BinaryOp(Box<Expression>, ArithOp, Box<Expression>),
     Literal(Value),
     Subquery(Box<SelectStatement>),
+    // Aggregate function call (used in HAVING clauses): COUNT(*), SUM(col), etc.
+    Aggregate(AggregateFunc, Box<SelectColumn>),
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -658,6 +661,7 @@ pub fn parse_select_statement(input: &str) -> IResult<&str, SelectStatement> {
     let (input, joins) = nom::multi::many0(parse_join)(input)?;
     let (input, where_clause) = nom::combinator::opt(parse_where)(input)?;
     let (input, group_by) = parse_group_by_clause(input)?;
+    let (input, having) = parse_having_clause(input)?;
     let (input, order_by) = parse_order_by_clause(input)?;
     let (input, limit) = parse_limit_clause(input)?;
 
@@ -670,6 +674,7 @@ pub fn parse_select_statement(input: &str) -> IResult<&str, SelectStatement> {
         where_clause,
         joins,
         group_by,
+        having,
         order_by,
         limit,
     }))
@@ -816,6 +821,20 @@ fn parse_group_by_clause(input: &str) -> IResult<&str, Vec<SelectColumn>> {
             Ok((input, cols))
         }
         Err(_) => Ok((input, Vec::new())),
+    }
+}
+
+/// Parse HAVING clause (returns None if not present)
+fn parse_having_clause(input: &str) -> IResult<&str, Option<WhereClause>> {
+    let (input, _) = multispace0(input)?;
+    let result = tag::<&str, &str, nom::error::Error<&str>>("HAVING")(input);
+    match result {
+        Ok((input, _)) => {
+            let (input, _) = multispace1(input)?;
+            let (input, condition) = parse_condition(input)?;
+            Ok((input, Some(WhereClause { condition })))
+        }
+        Err(_) => Ok((input, None)),
     }
 }
 
@@ -1028,14 +1047,45 @@ fn parse_term(input: &str) -> IResult<&str, Expression> {
     Ok((input, left))
 }
 
-/// Parse atomic expression: subquery, column, table.column, or literal
+/// Parse atomic expression: subquery, aggregate, column, table.column, or literal
 fn parse_atom(input: &str) -> IResult<&str, Expression> {
     nom::branch::alt((
         parse_expression_subquery,
+        parse_expression_aggregate,
         parse_expression_qualified_column,
         parse_expression_literal,
         parse_expression_simple_column,
     ))(input)
+}
+
+/// Parse an aggregate function call as an expression: COUNT(*), SUM(col), AVG(t.col), etc.
+fn parse_expression_aggregate(input: &str) -> IResult<&str, Expression> {
+    let (input, func_name) = nom::branch::alt((
+        tag("COUNT"),
+        tag("SUM"),
+        tag("AVG"),
+        tag("MIN"),
+        tag("MAX"),
+    ))(input)?;
+    let func = match func_name {
+        "COUNT" => AggregateFunc::Count,
+        "SUM" => AggregateFunc::Sum,
+        "AVG" => AggregateFunc::Avg,
+        "MIN" => AggregateFunc::Min,
+        "MAX" => AggregateFunc::Max,
+        _ => unreachable!(),
+    };
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, inner) = nom::branch::alt((
+        parse_all_column,
+        parse_qualified_column,
+        parse_simple_column,
+    ))(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, Expression::Aggregate(func, Box::new(inner))))
 }
 
 /// Parse (SELECT ...) as a scalar subquery expression
@@ -1939,6 +1989,76 @@ mod tests {
         match stmt {
             SqlStatement::Select(sel) => {
                 assert!(sel.group_by.is_empty());
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_having_simple() {
+        let sql = "SELECT name, COUNT(*) FROM users GROUP BY name HAVING COUNT(*) > 1;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert_eq!(sel.group_by.len(), 1);
+                let having = sel.having.expect("HAVING clause");
+                assert_eq!(having.condition.operator, Operator::GreaterThan);
+                match having.condition.left {
+                    Expression::Aggregate(AggregateFunc::Count, ref inner) => {
+                        assert_eq!(**inner, SelectColumn::All);
+                    }
+                    other => panic!("expected COUNT(*) aggregate, got {:?}", other),
+                }
+                assert_eq!(having.condition.right, Expression::Literal(Value::Int(1)));
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_having_sum_column() {
+        let sql = "SELECT dept, SUM(salary) FROM emp GROUP BY dept HAVING SUM(salary) > 100000;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                let having = sel.having.expect("HAVING clause");
+                match having.condition.left {
+                    Expression::Aggregate(AggregateFunc::Sum, ref inner) => {
+                        assert_eq!(**inner, SelectColumn::Column("salary".to_string()));
+                    }
+                    other => panic!("expected SUM(salary), got {:?}", other),
+                }
+                assert_eq!(having.condition.right, Expression::Literal(Value::Int(100000)));
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_having_with_order_by_limit() {
+        let sql = "SELECT name, COUNT(*) FROM users GROUP BY name HAVING COUNT(*) >= 2 ORDER BY name LIMIT 10;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert!(sel.having.is_some());
+                assert_eq!(sel.order_by.len(), 1);
+                assert_eq!(sel.limit, Some(10));
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_no_having() {
+        let sql = "SELECT name, COUNT(*) FROM users GROUP BY name;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert!(sel.having.is_none());
             }
             _ => panic!("Expected Select"),
         }

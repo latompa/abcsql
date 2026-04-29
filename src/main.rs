@@ -371,7 +371,7 @@ fn materialize_cte(
     });
 
     if has_aggregates || !query.group_by.is_empty() {
-        return materialize_aggregate_cte(&query.columns, &filtered, &combined_cols, &query.group_by);
+        return materialize_aggregate_cte(&query.columns, &filtered, &combined_cols, &query.group_by, query.having.as_ref(), storage);
     }
 
     // Determine output columns with alias support
@@ -430,12 +430,14 @@ fn materialize_cte(
     CteData { columns: result_cols, rows: result_rows }
 }
 
-/// Materialize an aggregate CTE (GROUP BY or aggregate functions)
+/// Materialize an aggregate CTE (GROUP BY or aggregate functions, with optional HAVING)
 fn materialize_aggregate_cte(
     columns: &[parser::SelectColumn],
     rows: &[Vec<Value>],
     combined_cols: &[ResultColumn],
     group_by: &[parser::SelectColumn],
+    having: Option<&parser::WhereClause>,
+    storage: &Storage,
 ) -> CteData {
     let group_indices: Vec<usize> = group_by.iter()
         .filter_map(|c| resolve_column_index(c, combined_cols))
@@ -455,6 +457,14 @@ fn materialize_aggregate_cte(
     }
     if group_by.is_empty() {
         groups = vec![rows.iter().collect()];
+    }
+
+    // Apply HAVING filter on groups
+    if let Some(wc) = having {
+        groups.retain(|g| {
+            let owned: Vec<Vec<Value>> = g.iter().map(|r| (*r).clone()).collect();
+            evaluate_having_condition(&wc.condition, &owned, combined_cols, storage)
+        });
     }
 
     let active_columns: Vec<&parser::SelectColumn> = columns.iter()
@@ -597,7 +607,7 @@ fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) {
     let has_group_by = !stmt.group_by.is_empty();
 
     if has_aggregates || has_group_by {
-        execute_aggregate(&stmt.columns, &filtered_rows, &combined_cols, &stmt.group_by, &stmt.order_by, stmt.limit, stmt.distinct);
+        execute_aggregate(&stmt.columns, &filtered_rows, &combined_cols, &stmt.group_by, stmt.having.as_ref(), &stmt.order_by, stmt.limit, stmt.distinct, storage);
     } else {
         execute_normal_select(&stmt.columns, filtered_rows, &combined_cols, &stmt.order_by, stmt.limit, stmt.distinct);
     }
@@ -678,15 +688,17 @@ fn compute_column_value(
     }
 }
 
-/// Execute a SELECT with aggregate functions, with optional GROUP BY
+/// Execute a SELECT with aggregate functions, with optional GROUP BY and HAVING
 fn execute_aggregate(
     columns: &[parser::SelectColumn],
     rows: &[Vec<Value>],
     combined_cols: &[ResultColumn],
     group_by: &[parser::SelectColumn],
+    having: Option<&parser::WhereClause>,
     order_by: &[parser::OrderByClause],
     limit: Option<u64>,
     distinct: bool,
+    storage: &Storage,
 ) {
     // Build header
     let header_names: Vec<String> = columns.iter()
@@ -716,6 +728,17 @@ fn execute_aggregate(
             }
         }
         group_map
+    };
+
+    // Apply HAVING filter on groups (post-aggregation)
+    let groups: Vec<Vec<&Vec<Value>>> = match having {
+        Some(wc) => groups.into_iter()
+            .filter(|g| {
+                let owned: Vec<Vec<Value>> = g.iter().map(|r| (*r).clone()).collect();
+                evaluate_having_condition(&wc.condition, &owned, combined_cols, storage)
+            })
+            .collect(),
+        None => groups,
     };
 
     // Compute result rows from groups
@@ -1036,6 +1059,22 @@ fn format_expr(expr: &parser::Expression) -> String {
             format!("{} {} {}", format_expr(l), op_str, format_expr(r))
         }
         parser::Expression::Subquery(_) => "(subquery)".to_string(),
+        parser::Expression::Aggregate(func, inner) => {
+            let func_name = match func {
+                parser::AggregateFunc::Count => "COUNT",
+                parser::AggregateFunc::Sum => "SUM",
+                parser::AggregateFunc::Avg => "AVG",
+                parser::AggregateFunc::Min => "MIN",
+                parser::AggregateFunc::Max => "MAX",
+            };
+            let inner_name = match inner.as_ref() {
+                parser::SelectColumn::All => "*".to_string(),
+                parser::SelectColumn::Column(n) => n.clone(),
+                parser::SelectColumn::QualifiedColumn(t, n) => format!("{}.{}", t, n),
+                _ => "?".to_string(),
+            };
+            format!("{}({})", func_name, inner_name)
+        }
     }
 }
 
@@ -1090,6 +1129,57 @@ fn evaluate_join_condition(
     match (&left_val, &right_val) {
         (Some(l), Some(r)) => compare_values(l, &condition.operator, r),
         _ => false,
+    }
+}
+
+/// Evaluate a HAVING condition over a group of rows. Aggregates are computed
+/// across the whole group; bare columns resolve from the first row (assumes the
+/// column is part of the GROUP BY key, like standard SQL).
+fn evaluate_having_condition(
+    condition: &parser::Condition,
+    group: &[Vec<Value>],
+    cols: &[ResultColumn],
+    storage: &Storage,
+) -> bool {
+    let left_val = resolve_having_expression(&condition.left, group, cols, storage);
+    let right_val = resolve_having_expression(&condition.right, group, cols, storage);
+    match (&left_val, &right_val) {
+        (Some(l), Some(r)) => compare_values(l, &condition.operator, r),
+        _ => false,
+    }
+}
+
+/// Resolve an expression in HAVING context. Aggregates compute over the group;
+/// bare columns resolve from the first row of the group.
+fn resolve_having_expression(
+    expr: &parser::Expression,
+    group: &[Vec<Value>],
+    cols: &[ResultColumn],
+    storage: &Storage,
+) -> Option<Value> {
+    match expr {
+        parser::Expression::Aggregate(func, inner) => {
+            let result_str = compute_aggregate(func, inner, group, cols);
+            if result_str == "NULL" {
+                Some(Value::Null)
+            } else if let Ok(n) = result_str.parse::<i64>() {
+                Some(Value::Int(n))
+            } else if let Ok(f) = result_str.parse::<f64>() {
+                Some(Value::Float(f))
+            } else {
+                Some(Value::String(result_str))
+            }
+        }
+        parser::Expression::BinaryOp(left, op, right) => {
+            let l = resolve_having_expression(left, group, cols, storage)?;
+            let r = resolve_having_expression(right, group, cols, storage)?;
+            eval_arith(&l, op, &r)
+        }
+        // For non-aggregate atoms, fall back to row-level resolution against the first row.
+        _ => {
+            let row = group.first()?;
+            resolve_join_expression(expr, row, cols, storage)
+        }
     }
 }
 
@@ -1174,6 +1264,8 @@ fn resolve_join_expression(
             let right_val = resolve_join_expression(right, row, cols, storage)?;
             eval_arith(&left_val, op, &right_val)
         }
+        // Aggregates aren't valid in row-level (WHERE/JOIN ON) contexts; HAVING uses its own evaluator.
+        parser::Expression::Aggregate(_, _) => None,
     }
 }
 

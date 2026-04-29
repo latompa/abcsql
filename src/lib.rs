@@ -207,6 +207,7 @@ fn resolve_expr(expr: &parser::Expression, row: &[Value], cols: &[(String, Strin
         }
         parser::Expression::Subquery(_) => None,
         parser::Expression::BinaryOp(_, _, _) => None,
+        parser::Expression::Aggregate(_, _) => None,
     }
 }
 

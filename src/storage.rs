@@ -1205,6 +1205,7 @@ fn resolve_expression(expr: &Expression, row: &[Value], schema: &[ColumnDefiniti
         }
         Expression::Subquery(_) => None,
         Expression::BinaryOp(_, _, _) => None,
+        Expression::Aggregate(_, _) => None,
     }
 }
 

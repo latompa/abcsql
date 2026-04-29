@@ -1179,12 +1179,18 @@ fn validate_timestamp_format(s: &str, column_name: &str) -> Result<(), StorageEr
 
 /// Evaluate a WHERE condition against a row
 fn evaluate_condition(condition: &Condition, row: &[Value], schema: &[ColumnDefinition]) -> bool {
+    if condition.operator == Operator::IsNull || condition.operator == Operator::IsNotNull {
+        let left_val = resolve_expression(&condition.left, row, schema);
+        let is_null = matches!(left_val, Some(Value::Null) | None);
+        return if condition.operator == Operator::IsNull { is_null } else { !is_null };
+    }
+
     let left_val = resolve_expression(&condition.left, row, schema);
     let right_val = resolve_expression(&condition.right, row, schema);
 
     match (&left_val, &right_val) {
         (Some(l), Some(r)) => compare_values(l, &condition.operator, r),
-        _ => false, // If we can't resolve either side, condition fails
+        _ => false,
     }
 }
 

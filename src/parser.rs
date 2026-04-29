@@ -241,6 +241,8 @@ pub enum Operator {
     NotIn,
     Exists,
     NotExists,
+    IsNull,
+    IsNotNull,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -965,6 +967,27 @@ pub fn parse_condition(input: &str) -> IResult<&str, Condition> {
 
     let (input, left) = parse_expression(input)?;
     let (input, _) = multispace0(input)?;
+
+    // Try IS NOT NULL / IS NULL
+    if let Ok((input, _)) = tag::<&str, &str, nom::error::Error<&str>>("IS")(input) {
+        let (input, _) = multispace1(input)?;
+        if let Ok((input, _)) = nom::sequence::pair(
+            tag::<&str, &str, nom::error::Error<&str>>("NOT"),
+            nom::sequence::preceded(multispace1::<&str, nom::error::Error<&str>>, tag("NULL")),
+        )(input) {
+            return Ok((input, Condition {
+                left,
+                operator: Operator::IsNotNull,
+                right: Expression::Literal(Value::Null),
+            }));
+        }
+        let (input, _) = tag("NULL")(input)?;
+        return Ok((input, Condition {
+            left,
+            operator: Operator::IsNull,
+            right: Expression::Literal(Value::Null),
+        }));
+    }
 
     // Try parsing NOT IN (SELECT ...) or IN (SELECT ...)
     if let Ok((input, _)) = nom::sequence::pair(
@@ -2266,6 +2289,34 @@ mod tests {
             SqlStatement::Select(sel) => {
                 let wc = sel.where_clause.unwrap();
                 assert_eq!(wc.condition.operator, Operator::NotExists);
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_is_null() {
+        let sql = "SELECT * FROM users WHERE email IS NULL;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                let wc = sel.where_clause.unwrap();
+                assert_eq!(wc.condition.operator, Operator::IsNull);
+                assert_eq!(wc.condition.left, Expression::Column("email".to_string()));
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_is_not_null() {
+        let sql = "SELECT * FROM users WHERE email IS NOT NULL;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                let wc = sel.where_clause.unwrap();
+                assert_eq!(wc.condition.operator, Operator::IsNotNull);
+                assert_eq!(wc.condition.left, Expression::Column("email".to_string()));
             }
             _ => panic!("Expected Select"),
         }

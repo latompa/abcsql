@@ -1100,6 +1100,13 @@ fn evaluate_join_condition(
     cols: &[ResultColumn],
     storage: &Storage,
 ) -> bool {
+    // Handle IS NULL / IS NOT NULL
+    if condition.operator == parser::Operator::IsNull || condition.operator == parser::Operator::IsNotNull {
+        let left_val = resolve_join_expression(&condition.left, row, cols, storage);
+        let is_null = matches!(left_val, Some(Value::Null) | None);
+        return if condition.operator == parser::Operator::IsNull { is_null } else { !is_null };
+    }
+
     // Handle EXISTS / NOT EXISTS
     if condition.operator == parser::Operator::Exists || condition.operator == parser::Operator::NotExists {
         if let parser::Expression::Subquery(subquery) = &condition.right {
@@ -1141,6 +1148,12 @@ fn evaluate_having_condition(
     cols: &[ResultColumn],
     storage: &Storage,
 ) -> bool {
+    if condition.operator == parser::Operator::IsNull || condition.operator == parser::Operator::IsNotNull {
+        let left_val = resolve_having_expression(&condition.left, group, cols, storage);
+        let is_null = matches!(left_val, Some(Value::Null) | None);
+        return if condition.operator == parser::Operator::IsNull { is_null } else { !is_null };
+    }
+
     let left_val = resolve_having_expression(&condition.left, group, cols, storage);
     let right_val = resolve_having_expression(&condition.right, group, cols, storage);
     match (&left_val, &right_val) {

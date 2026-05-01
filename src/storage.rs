@@ -3,7 +3,7 @@ use std::io::{self, Write as IoWrite, BufWriter, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::fmt;
 use std::collections::HashMap;
-use crate::parser::{CreateTableStatement, CreateIndexStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, UpdateStatement, DeleteStatement, AlterTableStatement, AlterAction, Value, Condition, Expression, Operator, ScalarFunc, apply_scalar_func};
+use crate::parser::{CreateTableStatement, CreateIndexStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, UpdateStatement, DeleteStatement, AlterTableStatement, AlterAction, Value, Condition, Expression, Operator, apply_scalar_func, apply_round, apply_concat, apply_substr};
 
 /// Storage engine for persisting tables to disk
 pub struct Storage {
@@ -1294,6 +1294,21 @@ fn resolve_expression(expr: &Expression, row: &[Value], schema: &[ColumnDefiniti
                 (Some(l), Some(r)) if l == r => Some(Value::Null),
                 _ => va,
             }
+        }
+        Expression::Round(val, places) => {
+            let v = resolve_expression(val, row, schema)?;
+            let p = places.as_ref().and_then(|e| resolve_expression(e, row, schema));
+            apply_round(v, p)
+        }
+        Expression::Concat(exprs) => {
+            let parts: Vec<Option<Value>> = exprs.iter().map(|e| resolve_expression(e, row, schema)).collect();
+            apply_concat(parts)
+        }
+        Expression::Substr(s, start, len) => {
+            let sv = resolve_expression(s, row, schema)?;
+            let startv = resolve_expression(start, row, schema)?;
+            let lenv = len.as_ref().and_then(|e| resolve_expression(e, row, schema));
+            apply_substr(sv, startv, lenv)
         }
         Expression::BinaryOp(_, _, _) => None,
         Expression::Aggregate(_, _) => None,

@@ -222,6 +222,9 @@ pub enum ScalarFunc {
     Lower,
     Length,
     Trim,
+    Abs,
+    Ceil,
+    Floor,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -299,6 +302,12 @@ pub enum Expression {
     Coalesce(Vec<Expression>),
     // NULLIF(expr, expr) — NULL if both args are equal, else first arg
     NullIf(Box<Expression>, Box<Expression>),
+    // ROUND(expr [, places])
+    Round(Box<Expression>, Option<Box<Expression>>),
+    // CONCAT(expr, expr, ...)
+    Concat(Vec<Expression>),
+    // SUBSTR(str, start [, len]) — 1-indexed
+    Substr(Box<Expression>, Box<Expression>, Option<Box<Expression>>),
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -896,7 +905,8 @@ fn parse_arith_select_column(input: &str) -> IResult<&str, SelectColumn> {
     let (new_input, expr) = parse_expression(input)?;
     match &expr {
         Expression::BinaryOp(_, _, _) | Expression::Case(_, _) | Expression::ScalarFunc(_, _)
-        | Expression::Coalesce(_) | Expression::NullIf(_, _) => Ok((new_input, SelectColumn::Expr(expr))),
+        | Expression::Coalesce(_) | Expression::NullIf(_, _)
+        | Expression::Round(_, _) | Expression::Concat(_) | Expression::Substr(_, _, _) => Ok((new_input, SelectColumn::Expr(expr))),
         _ => Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag))),
     }
 }
@@ -1329,6 +1339,9 @@ fn parse_atom(input: &str) -> IResult<&str, Expression> {
         parse_expression_subquery,
         parse_expression_coalesce,
         parse_expression_nullif,
+        parse_expression_round,
+        parse_expression_concat,
+        parse_expression_substr,
         parse_expression_scalar_func,
         parse_expression_aggregate,
         parse_expression_qualified_column,
@@ -1372,12 +1385,19 @@ fn parse_expression_scalar_func(input: &str) -> IResult<&str, Expression> {
         tag_no_case("LOWER"),
         tag_no_case("LENGTH"),
         tag_no_case("TRIM"),
+        tag_no_case("ABS"),
+        tag_no_case("CEILING"),
+        tag_no_case("CEIL"),
+        tag_no_case("FLOOR"),
     ))(input)?;
     let func = match func_name.to_uppercase().as_str() {
-        "UPPER" => ScalarFunc::Upper,
-        "LOWER" => ScalarFunc::Lower,
-        "LENGTH" => ScalarFunc::Length,
-        "TRIM" => ScalarFunc::Trim,
+        "UPPER"   => ScalarFunc::Upper,
+        "LOWER"   => ScalarFunc::Lower,
+        "LENGTH"  => ScalarFunc::Length,
+        "TRIM"    => ScalarFunc::Trim,
+        "ABS"     => ScalarFunc::Abs,
+        "CEILING" | "CEIL" => ScalarFunc::Ceil,
+        "FLOOR"   => ScalarFunc::Floor,
         _ => unreachable!(),
     };
     let (input, _) = multispace0(input)?;
@@ -1387,6 +1407,56 @@ fn parse_expression_scalar_func(input: &str) -> IResult<&str, Expression> {
     let (input, _) = multispace0(input)?;
     let (input, _) = nom_char(')')(input)?;
     Ok((input, Expression::ScalarFunc(func, Box::new(expr))))
+}
+
+fn parse_expression_round(input: &str) -> IResult<&str, Expression> {
+    let (input, _) = tag_no_case("ROUND")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, val) = parse_expression(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, places) = nom::combinator::opt(nom::sequence::preceded(
+        nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+        parse_expression,
+    ))(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, Expression::Round(Box::new(val), places.map(Box::new))))
+}
+
+fn parse_expression_concat(input: &str) -> IResult<&str, Expression> {
+    let (input, _) = tag_no_case("CONCAT")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, exprs) = nom::multi::separated_list1(
+        nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+        parse_expression,
+    )(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, Expression::Concat(exprs)))
+}
+
+fn parse_expression_substr(input: &str) -> IResult<&str, Expression> {
+    let (input, _) = nom::branch::alt((tag_no_case("SUBSTRING"), tag_no_case("SUBSTR")))(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, s) = parse_expression(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(',')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, start) = parse_expression(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, len) = nom::combinator::opt(nom::sequence::preceded(
+        nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+        parse_expression,
+    ))(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, Expression::Substr(Box::new(s), Box::new(start), len.map(Box::new))))
 }
 
 fn parse_expression_case(input: &str) -> IResult<&str, Expression> {
@@ -1469,13 +1539,68 @@ fn parse_expression_subquery(input: &str) -> IResult<&str, Expression> {
     Ok((input, Expression::Subquery(Box::new(stmt))))
 }
 
-/// Apply a scalar string function to a resolved Value
+/// Evaluate ROUND(val, places)
+pub fn apply_round(val: Value, places: Option<Value>) -> Option<Value> {
+    let decimals = match places {
+        Some(Value::Int(n)) => n,
+        None => 0,
+        _ => return None,
+    };
+    match val {
+        Value::Int(n) => Some(Value::Int(n)),
+        Value::Float(f) => {
+            let factor = 10f64.powi(decimals as i32);
+            Some(Value::Float((f * factor).round() / factor))
+        }
+        _ => None,
+    }
+}
+
+/// Evaluate CONCAT(values)
+pub fn apply_concat(parts: Vec<Option<Value>>) -> Option<Value> {
+    let mut result = String::new();
+    for part in parts {
+        match part {
+            Some(Value::String(s)) => result.push_str(&s),
+            Some(Value::Int(n))    => result.push_str(&n.to_string()),
+            Some(Value::Float(f))  => result.push_str(&f.to_string()),
+            Some(Value::Bool(b))   => result.push_str(if b { "true" } else { "false" }),
+            Some(Value::Null) | None => return None,
+        }
+    }
+    Some(Value::String(result))
+}
+
+/// Evaluate SUBSTR(str, start [, len]) — 1-indexed, like SQL
+pub fn apply_substr(s: Value, start: Value, len: Option<Value>) -> Option<Value> {
+    let s = match s { Value::String(s) => s, _ => return None };
+    let start = match start { Value::Int(n) => n, _ => return None };
+    // SQL SUBSTR is 1-indexed; clamp to valid range
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len() as i64;
+    let idx = if start >= 1 { (start - 1).min(n) as usize } else { 0 };
+    let slice = &chars[idx..];
+    let result: String = match len {
+        Some(Value::Int(l)) => slice.iter().take(l.max(0) as usize).collect(),
+        None => slice.iter().collect(),
+        _ => return None,
+    };
+    Some(Value::String(result))
+}
+
+/// Apply a single-arg scalar function to a resolved Value
 pub fn apply_scalar_func(func: &ScalarFunc, val: Value) -> Option<Value> {
     match (func, val) {
-        (ScalarFunc::Upper, Value::String(s)) => Some(Value::String(s.to_uppercase())),
-        (ScalarFunc::Lower, Value::String(s)) => Some(Value::String(s.to_lowercase())),
+        (ScalarFunc::Upper,  Value::String(s)) => Some(Value::String(s.to_uppercase())),
+        (ScalarFunc::Lower,  Value::String(s)) => Some(Value::String(s.to_lowercase())),
         (ScalarFunc::Length, Value::String(s)) => Some(Value::Int(s.len() as i64)),
-        (ScalarFunc::Trim,  Value::String(s)) => Some(Value::String(s.trim().to_string())),
+        (ScalarFunc::Trim,   Value::String(s)) => Some(Value::String(s.trim().to_string())),
+        (ScalarFunc::Abs, Value::Int(n))    => Some(Value::Int(n.abs())),
+        (ScalarFunc::Abs, Value::Float(f))  => Some(Value::Float(f.abs())),
+        (ScalarFunc::Ceil,  Value::Float(f)) => Some(Value::Float(f.ceil())),
+        (ScalarFunc::Ceil,  Value::Int(n))   => Some(Value::Int(n)),
+        (ScalarFunc::Floor, Value::Float(f)) => Some(Value::Float(f.floor())),
+        (ScalarFunc::Floor, Value::Int(n))   => Some(Value::Int(n)),
         _ => None,
     }
 }
@@ -3706,6 +3831,137 @@ mod tests {
         match stmt {
             SqlStatement::Select(sel) => {
                 assert!(matches!(sel.where_clause.unwrap().condition.left(), Expression::Coalesce(_)));
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_abs() {
+        let sql = "SELECT ABS(balance) FROM accounts;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert!(matches!(&sel.columns[0], SelectColumn::Expr(Expression::ScalarFunc(ScalarFunc::Abs, _))));
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ceil_floor() {
+        let sql = "SELECT CEIL(price), FLOOR(price) FROM products;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert!(matches!(&sel.columns[0], SelectColumn::Expr(Expression::ScalarFunc(ScalarFunc::Ceil, _))));
+                assert!(matches!(&sel.columns[1], SelectColumn::Expr(Expression::ScalarFunc(ScalarFunc::Floor, _))));
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ceiling_alias() {
+        let sql = "SELECT CEILING(price) FROM products;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert!(matches!(&sel.columns[0], SelectColumn::Expr(Expression::ScalarFunc(ScalarFunc::Ceil, _))));
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_round_no_places() {
+        let sql = "SELECT ROUND(price) FROM products;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                match &sel.columns[0] {
+                    SelectColumn::Expr(Expression::Round(val, places)) => {
+                        assert_eq!(**val, Expression::Column("price".to_string()));
+                        assert!(places.is_none());
+                    }
+                    _ => panic!("Expected Round"),
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_round_with_places() {
+        let sql = "SELECT ROUND(price, 2) FROM products;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                match &sel.columns[0] {
+                    SelectColumn::Expr(Expression::Round(val, Some(places))) => {
+                        assert_eq!(**val, Expression::Column("price".to_string()));
+                        assert_eq!(**places, Expression::Literal(Value::Int(2)));
+                    }
+                    _ => panic!("Expected Round with places"),
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_concat() {
+        let sql = "SELECT CONCAT(first_name, ' ', last_name) FROM users;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                match &sel.columns[0] {
+                    SelectColumn::Expr(Expression::Concat(parts)) => {
+                        assert_eq!(parts.len(), 3);
+                        assert_eq!(parts[0], Expression::Column("first_name".to_string()));
+                        assert_eq!(parts[1], Expression::Literal(Value::String(" ".to_string())));
+                        assert_eq!(parts[2], Expression::Column("last_name".to_string()));
+                    }
+                    _ => panic!("Expected Concat"),
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_substr_two_args() {
+        let sql = "SELECT SUBSTR(name, 2) FROM users;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                match &sel.columns[0] {
+                    SelectColumn::Expr(Expression::Substr(s, start, len)) => {
+                        assert_eq!(**s, Expression::Column("name".to_string()));
+                        assert_eq!(**start, Expression::Literal(Value::Int(2)));
+                        assert!(len.is_none());
+                    }
+                    _ => panic!("Expected Substr"),
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_substr_three_args() {
+        let sql = "SELECT SUBSTRING(name, 1, 5) FROM users;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                match &sel.columns[0] {
+                    SelectColumn::Expr(Expression::Substr(s, start, Some(len))) => {
+                        assert_eq!(**s, Expression::Column("name".to_string()));
+                        assert_eq!(**start, Expression::Literal(Value::Int(1)));
+                        assert_eq!(**len, Expression::Literal(Value::Int(5)));
+                    }
+                    _ => panic!("Expected Substr with length"),
+                }
             }
             _ => panic!("Expected Select"),
         }

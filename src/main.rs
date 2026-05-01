@@ -1154,6 +1154,9 @@ fn format_expr(expr: &parser::Expression) -> String {
                 parser::ScalarFunc::Lower => "lower",
                 parser::ScalarFunc::Length => "length",
                 parser::ScalarFunc::Trim => "trim",
+                parser::ScalarFunc::Abs => "abs",
+                parser::ScalarFunc::Ceil => "ceil",
+                parser::ScalarFunc::Floor => "floor",
             };
             format!("{}({})", name, format_expr(inner))
         }
@@ -1162,6 +1165,18 @@ fn format_expr(expr: &parser::Expression) -> String {
             format!("coalesce({})", args.join(", "))
         }
         parser::Expression::NullIf(a, b) => format!("nullif({}, {})", format_expr(a), format_expr(b)),
+        parser::Expression::Round(val, places) => match places {
+            Some(p) => format!("round({}, {})", format_expr(val), format_expr(p)),
+            None => format!("round({})", format_expr(val)),
+        },
+        parser::Expression::Concat(exprs) => {
+            let args: Vec<String> = exprs.iter().map(format_expr).collect();
+            format!("concat({})", args.join(", "))
+        }
+        parser::Expression::Substr(s, start, len) => match len {
+            Some(l) => format!("substr({}, {}, {})", format_expr(s), format_expr(start), format_expr(l)),
+            None => format!("substr({}, {})", format_expr(s), format_expr(start)),
+        },
         parser::Expression::Case(_, _) => "case".to_string(),
         parser::Expression::Aggregate(func, inner) => {
             let func_name = match func {
@@ -1436,6 +1451,21 @@ fn resolve_join_expression(
                 (Some(l), Some(r)) if l == r => Some(Value::Null),
                 _ => va,
             }
+        }
+        parser::Expression::Round(val, places) => {
+            let v = resolve_join_expression(val, row, cols, storage)?;
+            let p = places.as_ref().and_then(|e| resolve_join_expression(e, row, cols, storage));
+            parser::apply_round(v, p)
+        }
+        parser::Expression::Concat(exprs) => {
+            let parts: Vec<Option<Value>> = exprs.iter().map(|e| resolve_join_expression(e, row, cols, storage)).collect();
+            parser::apply_concat(parts)
+        }
+        parser::Expression::Substr(s, start, len) => {
+            let sv = resolve_join_expression(s, row, cols, storage)?;
+            let startv = resolve_join_expression(start, row, cols, storage)?;
+            let lenv = len.as_ref().and_then(|e| resolve_join_expression(e, row, cols, storage));
+            parser::apply_substr(sv, startv, lenv)
         }
         // Aggregates aren't valid in row-level (WHERE/JOIN ON) contexts; HAVING uses its own evaluator.
         parser::Expression::Aggregate(_, _) => None,

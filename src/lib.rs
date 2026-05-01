@@ -258,6 +258,21 @@ fn resolve_expr(expr: &parser::Expression, row: &[Value], cols: &[(String, Strin
                 _ => va,
             }
         }
+        parser::Expression::Round(val, places) => {
+            let v = resolve_expr(val, row, cols)?;
+            let p = places.as_ref().and_then(|e| resolve_expr(e, row, cols));
+            parser::apply_round(v, p)
+        }
+        parser::Expression::Concat(exprs) => {
+            let parts: Vec<Option<Value>> = exprs.iter().map(|e| resolve_expr(e, row, cols)).collect();
+            parser::apply_concat(parts)
+        }
+        parser::Expression::Substr(s, start, len) => {
+            let sv = resolve_expr(s, row, cols)?;
+            let startv = resolve_expr(start, row, cols)?;
+            let lenv = len.as_ref().and_then(|e| resolve_expr(e, row, cols));
+            parser::apply_substr(sv, startv, lenv)
+        }
         parser::Expression::BinaryOp(_, _, _) => None,
         parser::Expression::Aggregate(_, _) => None,
         parser::Expression::Case(_, _) => None,

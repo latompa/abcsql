@@ -78,6 +78,7 @@ pub struct ForeignKeyRef {
     pub column: String,
 }
 
+#[cfg(test)]
 impl ColumnDefinition {
     pub fn new(name: &str, data_type: DataType) -> Self {
         Self { name: name.to_string(), data_type, auto_increment: false, primary_key: false, not_null: false, unique: false, references: None }
@@ -107,6 +108,7 @@ pub enum InsertSource {
     Select(Box<SelectStatement>),
 }
 
+#[cfg(test)]
 impl InsertStatement {
     pub fn values(&self) -> &[Value] {
         match &self.source {

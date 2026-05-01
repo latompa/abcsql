@@ -161,7 +161,8 @@ fn execute_sql(sql: &str, storage: &Storage) {
             }
         }
         SqlStatement::Select(select_stmt) => {
-            execute_select(&select_stmt, storage);
+            let (headers, rows) = execute_select(&select_stmt, storage);
+            print_table(&headers, &rows);
         }
         SqlStatement::Update(update_stmt) => {
             match storage.update_rows(&update_stmt) {
@@ -497,7 +498,7 @@ fn materialize_aggregate_cte(
     CteData { columns: result_cols, rows: result_rows }
 }
 
-fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) {
+fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) -> (Vec<String>, Vec<Vec<String>>) {
     // Materialize CTEs
     let mut cte_map: HashMap<String, CteData> = HashMap::new();
     for cte in &stmt.ctes {
@@ -514,7 +515,7 @@ fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Error: {}", e);
-            return;
+            return (Vec::new(), Vec::new());
         }
     };
 
@@ -531,7 +532,7 @@ fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("Error: {}", e);
-                return;
+                return (Vec::new(), Vec::new());
             }
         };
 
@@ -606,11 +607,31 @@ fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) {
     let has_aggregates = stmt.columns.iter().any(|c| matches!(c, parser::SelectColumn::Aggregate(_, _)));
     let has_group_by = !stmt.group_by.is_empty();
 
-    if has_aggregates || has_group_by {
-        execute_aggregate(&stmt.columns, &filtered_rows, &combined_cols, &stmt.group_by, stmt.having.as_ref(), &stmt.order_by, stmt.limit, stmt.distinct, storage);
+    let (headers, mut rows) = if has_aggregates || has_group_by {
+        collect_aggregate_rows(&stmt.columns, &filtered_rows, &combined_cols, &stmt.group_by, stmt.having.as_ref(), &stmt.order_by, stmt.limit, stmt.distinct, storage)
     } else {
-        execute_normal_select(&stmt.columns, filtered_rows, &combined_cols, &stmt.order_by, stmt.limit, stmt.distinct);
+        collect_normal_rows(&stmt.columns, filtered_rows, &combined_cols, &stmt.order_by, stmt.limit, stmt.distinct)
+    };
+
+    // Handle UNION / UNION ALL
+    if let Some((union_type, right_stmt)) = &stmt.union {
+        let (_, right_rows) = execute_select(right_stmt, storage);
+        rows.extend(right_rows);
+        if *union_type == parser::UnionType::Union {
+            // Deduplicate: retain first occurrence of each row
+            let mut seen: Vec<Vec<String>> = Vec::new();
+            rows.retain(|row| {
+                if seen.contains(row) {
+                    false
+                } else {
+                    seen.push(row.clone());
+                    true
+                }
+            });
+        }
     }
+
+    (headers, rows)
 }
 
 /// Resolve a SelectColumn to a column index in the combined result set
@@ -689,7 +710,7 @@ fn compute_column_value(
 }
 
 /// Execute a SELECT with aggregate functions, with optional GROUP BY and HAVING
-fn execute_aggregate(
+fn collect_aggregate_rows(
     columns: &[parser::SelectColumn],
     rows: &[Vec<Value>],
     combined_cols: &[ResultColumn],
@@ -699,7 +720,7 @@ fn execute_aggregate(
     limit: Option<u64>,
     distinct: bool,
     storage: &Storage,
-) {
+) -> (Vec<String>, Vec<Vec<String>>) {
     // Build header
     let header_names: Vec<String> = columns.iter()
         .filter(|c| !matches!(c, parser::SelectColumn::All))
@@ -789,37 +810,7 @@ fn execute_aggregate(
         result_rows.truncate(n as usize);
     }
 
-    if result_rows.is_empty() {
-        println!("(0 rows)");
-        return;
-    }
-
-    // Calculate column widths and print
-    let mut widths: Vec<usize> = header_names.iter().map(|h| h.len()).collect();
-    for row in &result_rows {
-        for (i, val) in row.iter().enumerate() {
-            if val.len() > widths[i] {
-                widths[i] = val.len();
-            }
-        }
-    }
-
-    let header: Vec<String> = header_names.iter().enumerate()
-        .map(|(i, name)| format!("{:width$}", name, width = widths[i]))
-        .collect();
-    println!("{}", header.join(" | "));
-
-    let sep: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
-    println!("{}", sep.join("-+-"));
-
-    for row in &result_rows {
-        let vals: Vec<String> = row.iter().enumerate()
-            .map(|(i, v)| format!("{:width$}", v, width = widths[i]))
-            .collect();
-        println!("{}", vals.join(" | "));
-    }
-
-    println!("({} rows)", result_rows.len());
+    (header_names, result_rows)
 }
 
 /// Compute a single aggregate value
@@ -907,14 +898,14 @@ fn cmp_values(a: &Value, b: &Value) -> std::cmp::Ordering {
 }
 
 /// Execute a normal (non-aggregate) SELECT with optional ORDER BY
-fn execute_normal_select(
+fn collect_normal_rows(
     columns: &[parser::SelectColumn],
     mut rows: Vec<Vec<Value>>,
     combined_cols: &[ResultColumn],
     order_by: &[parser::OrderByClause],
     limit: Option<u64>,
     distinct: bool,
-) {
+) -> (Vec<String>, Vec<Vec<String>>) {
     // Apply ORDER BY
     if !order_by.is_empty() {
         rows.sort_by(|a, b| {
@@ -1002,40 +993,41 @@ fn execute_normal_select(
         rows.truncate(n as usize);
     }
 
+    let headers: Vec<String> = display_columns.iter().map(|(_, name)| name.clone()).collect();
+    let result_rows: Vec<Vec<String>> = rows.iter()
+        .map(|row| display_columns.iter().map(|(src, _)| format_value(&get_val(row, src))).collect())
+        .collect();
+
+    (headers, result_rows)
+}
+
+/// Print a query result table to stdout
+fn print_table(headers: &[String], rows: &[Vec<String>]) {
     if rows.is_empty() {
         println!("(0 rows)");
         return;
     }
 
-    // Calculate column widths
-    let mut widths: Vec<usize> = display_columns.iter().map(|(_, name)| name.len()).collect();
-    for row in &rows {
-        for (i, (src, _)) in display_columns.iter().enumerate() {
-            let val_len = format_value(&get_val(row, src)).len();
-            if val_len > widths[i] {
-                widths[i] = val_len;
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
+    for row in rows {
+        for (i, val) in row.iter().enumerate() {
+            if val.len() > widths[i] {
+                widths[i] = val.len();
             }
         }
     }
 
-    // Print header
-    let header: Vec<String> = display_columns.iter()
-        .enumerate()
-        .map(|(i, (_, name))| format!("{:width$}", name, width = widths[i]))
+    let header: Vec<String> = headers.iter().enumerate()
+        .map(|(i, name)| format!("{:width$}", name, width = widths[i]))
         .collect();
     println!("{}", header.join(" | "));
 
-    // Print separator
     let sep: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
     println!("{}", sep.join("-+-"));
 
-    // Print rows
-    for row in &rows {
-        let values: Vec<String> = display_columns.iter()
-            .enumerate()
-            .map(|(i, (src, _))| {
-                format!("{:width$}", format_value(&get_val(row, src)), width = widths[i])
-            })
+    for row in rows {
+        let values: Vec<String> = row.iter().enumerate()
+            .map(|(i, v)| format!("{:width$}", v, width = widths[i]))
             .collect();
         println!("{}", values.join(" | "));
     }

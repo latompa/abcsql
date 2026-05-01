@@ -133,6 +133,13 @@ pub struct SelectStatement {
     pub having: Option<WhereClause>,
     pub order_by: Vec<OrderByClause>,
     pub limit: Option<u64>,
+    pub union: Option<(UnionType, Box<SelectStatement>)>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum UnionType {
+    Union,
+    UnionAll,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -667,6 +674,23 @@ pub fn parse_select_statement(input: &str) -> IResult<&str, SelectStatement> {
     let (input, order_by) = parse_order_by_clause(input)?;
     let (input, limit) = parse_limit_clause(input)?;
 
+    // Try to parse UNION [ALL] SELECT ...
+    let (input, union) = {
+        let input_before_union = input;
+        if let Ok((input, _)) = nom::sequence::preceded(
+            multispace0::<&str, nom::error::Error<&str>>,
+            tag("UNION"),
+        )(input) {
+            let (input, _) = multispace1(input)?;
+            let (input, all) = nom::combinator::opt(nom::sequence::terminated(tag("ALL"), multispace1))(input)?;
+            let union_type = if all.is_some() { UnionType::UnionAll } else { UnionType::Union };
+            let (input, right) = parse_select_statement(input)?;
+            (input, Some((union_type, Box::new(right))))
+        } else {
+            (input_before_union, None)
+        }
+    };
+
     Ok((input, SelectStatement {
         ctes: Vec::new(),
         columns,
@@ -679,6 +703,7 @@ pub fn parse_select_statement(input: &str) -> IResult<&str, SelectStatement> {
         having,
         order_by,
         limit,
+        union,
     }))
 }
 
@@ -889,7 +914,7 @@ fn parse_limit_clause(input: &str) -> IResult<&str, Option<u64>> {
 
 /// Check if identifier is a reserved keyword that can't be used as an alias
 fn is_reserved_keyword(s: &str) -> bool {
-    matches!(s.to_uppercase().as_str(), "ON" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "WHERE" | "ORDER" | "GROUP" | "LIMIT" | "HAVING")
+    matches!(s.to_uppercase().as_str(), "ON" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "WHERE" | "ORDER" | "GROUP" | "LIMIT" | "HAVING" | "UNION" | "ALL")
 }
 
 /// Parse optional table alias, rejecting reserved keywords
@@ -2318,6 +2343,43 @@ mod tests {
                 assert_eq!(wc.condition.operator, Operator::IsNotNull);
                 assert_eq!(wc.condition.left, Expression::Column("email".to_string()));
             }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_union() {
+        let sql = "SELECT id FROM users UNION SELECT id FROM admins;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                let (union_type, right) = sel.union.unwrap();
+                assert_eq!(union_type, UnionType::Union);
+                assert_eq!(right.from, FromClause::Table("admins".to_string()));
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_union_all() {
+        let sql = "SELECT id FROM users UNION ALL SELECT id FROM admins;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                let (union_type, _) = sel.union.unwrap();
+                assert_eq!(union_type, UnionType::UnionAll);
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_no_union() {
+        let sql = "SELECT id FROM users;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => assert!(sel.union.is_none()),
             _ => panic!("Expected Select"),
         }
     }

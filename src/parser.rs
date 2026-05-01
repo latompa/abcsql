@@ -244,6 +244,8 @@ pub enum Expression {
     Subquery(Box<SelectStatement>),
     // Aggregate function call (used in HAVING clauses): COUNT(*), SUM(col), etc.
     Aggregate(AggregateFunc, Box<SelectColumn>),
+    // CASE WHEN cond THEN expr ... [ELSE expr] END
+    Case(Vec<(Condition, Expression)>, Option<Box<Expression>>),
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -802,9 +804,8 @@ fn parse_select_column(input: &str) -> IResult<&str, SelectColumn> {
 /// Parse arithmetic expression as a select column (only matches if there's an operator)
 fn parse_arith_select_column(input: &str) -> IResult<&str, SelectColumn> {
     let (new_input, expr) = parse_expression(input)?;
-    // Only succeed if the expression actually contains arithmetic
     match &expr {
-        Expression::BinaryOp(_, _, _) => Ok((new_input, SelectColumn::Expr(expr))),
+        Expression::BinaryOp(_, _, _) | Expression::Case(_, _) => Ok((new_input, SelectColumn::Expr(expr))),
         _ => Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag))),
     }
 }
@@ -948,7 +949,7 @@ fn parse_limit_clause(input: &str) -> IResult<&str, Option<u64>> {
 
 /// Check if identifier is a reserved keyword that can't be used as an alias
 fn is_reserved_keyword(s: &str) -> bool {
-    matches!(s.to_uppercase().as_str(), "ON" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "WHERE" | "ORDER" | "GROUP" | "LIMIT" | "HAVING" | "UNION" | "ALL")
+    matches!(s.to_uppercase().as_str(), "ON" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "WHERE" | "ORDER" | "GROUP" | "LIMIT" | "HAVING" | "UNION" | "ALL" | "CASE" | "WHEN" | "THEN" | "ELSE" | "END")
 }
 
 /// Parse optional table alias, rejecting reserved keywords
@@ -1170,15 +1171,56 @@ fn parse_term(input: &str) -> IResult<&str, Expression> {
     Ok((input, left))
 }
 
-/// Parse atomic expression: subquery, aggregate, column, table.column, or literal
+/// Parse atomic expression: subquery, aggregate, CASE, column, table.column, or literal
 fn parse_atom(input: &str) -> IResult<&str, Expression> {
     nom::branch::alt((
+        parse_expression_case,
         parse_expression_subquery,
         parse_expression_aggregate,
         parse_expression_qualified_column,
         parse_expression_literal,
         parse_expression_simple_column,
     ))(input)
+}
+
+fn parse_expression_case(input: &str) -> IResult<&str, Expression> {
+    let (input, _) = tag_no_case("CASE")(input)?;
+    let (input, _) = multispace1(input)?;
+
+    let mut branches: Vec<(Condition, Expression)> = Vec::new();
+    let mut input = input;
+    loop {
+        let (input_after_when, _) = match tag_no_case::<&str, &str, nom::error::Error<&str>>("WHEN")(input) {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+        let (input_after_when, _) = multispace1(input_after_when)?;
+        let (input_after_when, condition) = parse_condition(input_after_when)?;
+        let (input_after_when, _) = multispace1(input_after_when)?;
+        let (input_after_when, _) = tag_no_case("THEN")(input_after_when)?;
+        let (input_after_when, _) = multispace1(input_after_when)?;
+        let (input_after_when, result) = parse_expression(input_after_when)?;
+        let (input_after_when, _) = multispace0(input_after_when)?;
+        branches.push((condition, result));
+        input = input_after_when;
+    }
+
+    if branches.is_empty() {
+        return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)));
+    }
+
+    let (input, else_expr) = if let Ok((i, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("ELSE")(input) {
+        let (i, _) = multispace1(i)?;
+        let (i, expr) = parse_expression(i)?;
+        let (i, _) = multispace1(i)?;
+        (i, Some(Box::new(expr)))
+    } else {
+        (input, None)
+    };
+
+    let (input, _) = tag_no_case("END")(input)?;
+
+    Ok((input, Expression::Case(branches, else_expr)))
 }
 
 /// Parse an aggregate function call as an expression: COUNT(*), SUM(col), AVG(t.col), etc.
@@ -2474,6 +2516,65 @@ mod tests {
         let (_, stmt) = parse_sql(sql).unwrap();
         match stmt {
             SqlStatement::Select(sel) => assert!(sel.union.is_none()),
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_case_simple() {
+        let sql = "SELECT CASE WHEN age > 18 THEN 'adult' ELSE 'minor' END FROM users;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                match &sel.columns[0] {
+                    SelectColumn::Expr(Expression::Case(branches, else_expr)) => {
+                        assert_eq!(branches.len(), 1);
+                        assert!(else_expr.is_some());
+                    }
+                    _ => panic!("Expected Case expression"),
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_case_multiple_when() {
+        let sql = "SELECT CASE WHEN score >= 90 THEN 'A' WHEN score >= 80 THEN 'B' ELSE 'C' END AS grade FROM students;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                match &sel.columns[0] {
+                    SelectColumn::Alias(inner, alias) => {
+                        assert_eq!(alias, "grade");
+                        match inner.as_ref() {
+                            SelectColumn::Expr(Expression::Case(branches, _)) => {
+                                assert_eq!(branches.len(), 2);
+                            }
+                            _ => panic!("Expected Case inside Alias"),
+                        }
+                    }
+                    _ => panic!("Expected Alias(Case)"),
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_case_no_else() {
+        let sql = "SELECT CASE WHEN active = TRUE THEN 'yes' END FROM users;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                match &sel.columns[0] {
+                    SelectColumn::Expr(Expression::Case(branches, else_expr)) => {
+                        assert_eq!(branches.len(), 1);
+                        assert!(else_expr.is_none());
+                    }
+                    _ => panic!("Expected Case expression"),
+                }
+            }
             _ => panic!("Expected Select"),
         }
     }

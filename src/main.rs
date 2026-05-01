@@ -1107,6 +1107,7 @@ fn format_expr(expr: &parser::Expression) -> String {
             format!("{} {} {}", format_expr(l), op_str, format_expr(r))
         }
         parser::Expression::Subquery(_) => "(subquery)".to_string(),
+        parser::Expression::Case(_, _) => "case".to_string(),
         parser::Expression::Aggregate(func, inner) => {
             let func_name = match func {
                 parser::AggregateFunc::Count => "COUNT",
@@ -1346,6 +1347,14 @@ fn resolve_join_expression(
         }
         // Aggregates aren't valid in row-level (WHERE/JOIN ON) contexts; HAVING uses its own evaluator.
         parser::Expression::Aggregate(_, _) => None,
+        parser::Expression::Case(branches, else_expr) => {
+            for (condition, result) in branches {
+                if evaluate_join_condition(condition, row, cols, storage) {
+                    return resolve_join_expression(result, row, cols, storage);
+                }
+            }
+            else_expr.as_ref().and_then(|e| resolve_join_expression(e, row, cols, storage))
+        }
     }
 }
 

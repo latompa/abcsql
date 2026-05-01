@@ -1226,6 +1226,14 @@ fn resolve_expression(expr: &Expression, row: &[Value], schema: &[ColumnDefiniti
         Expression::Subquery(_) => None,
         Expression::BinaryOp(_, _, _) => None,
         Expression::Aggregate(_, _) => None,
+        Expression::Case(branches, else_expr) => {
+            for (condition, result) in branches {
+                if evaluate_condition(condition, row, schema) {
+                    return resolve_expression(result, row, schema);
+                }
+            }
+            else_expr.as_ref().and_then(|e| resolve_expression(e, row, schema))
+        }
     }
 }
 

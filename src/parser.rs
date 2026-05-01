@@ -224,6 +224,7 @@ pub enum JoinType {
     Inner,
     Left,
     Right,
+    Full,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -972,7 +973,7 @@ fn parse_limit_clause(input: &str) -> IResult<&str, Option<u64>> {
 
 /// Check if identifier is a reserved keyword that can't be used as an alias
 fn is_reserved_keyword(s: &str) -> bool {
-    matches!(s.to_uppercase().as_str(), "ON" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "WHERE" | "ORDER" | "GROUP" | "LIMIT" | "HAVING" | "UNION" | "ALL" | "CASE" | "WHEN" | "THEN" | "ELSE" | "END" | "AND" | "OR" | "NOT")
+    matches!(s.to_uppercase().as_str(), "ON" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "OUTER" | "WHERE" | "ORDER" | "GROUP" | "LIMIT" | "HAVING" | "UNION" | "ALL" | "CASE" | "WHEN" | "THEN" | "ELSE" | "END" | "AND" | "OR" | "NOT")
 }
 
 /// Parse optional table alias, rejecting reserved keywords
@@ -992,6 +993,8 @@ pub fn parse_join(input: &str) -> IResult<&str, JoinClause> {
         nom::combinator::map(tag_no_case("INNER JOIN"), |_| JoinType::Inner),
         nom::combinator::map(tag_no_case("LEFT JOIN"), |_| JoinType::Left),
         nom::combinator::map(tag_no_case("RIGHT JOIN"), |_| JoinType::Right),
+        nom::combinator::map(tag_no_case("FULL OUTER JOIN"), |_| JoinType::Full),
+        nom::combinator::map(tag_no_case("FULL JOIN"), |_| JoinType::Full),
         nom::combinator::map(tag_no_case("JOIN"), |_| JoinType::Inner),
     ))(input)?;
     let (input, _) = multispace1(input)?;
@@ -1738,6 +1741,8 @@ mod tests {
             ("INNER JOIN", JoinType::Inner),
             ("LEFT JOIN", JoinType::Left),
             ("RIGHT JOIN", JoinType::Right),
+            ("FULL JOIN", JoinType::Full),
+            ("FULL OUTER JOIN", JoinType::Full),
             ("JOIN", JoinType::Inner), // JOIN defaults to INNER
         ];
 

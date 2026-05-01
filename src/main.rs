@@ -606,14 +606,14 @@ fn prepare_rows(
                     matched = true;
                 }
             }
-            if !matched && join.join_type == parser::JoinType::Left {
+            if !matched && matches!(join.join_type, parser::JoinType::Left | parser::JoinType::Full) {
                 let mut row = left_row.clone();
                 row.extend(std::iter::repeat(Value::Null).take(join_result_cols.len()));
                 new_rows.push(row);
             }
         }
 
-        if join.join_type == parser::JoinType::Right {
+        if matches!(join.join_type, parser::JoinType::Right | parser::JoinType::Full) {
             for right_row in &join_rows {
                 let has_match = combined_rows.iter().any(|left_row| {
                     let mut candidate: Vec<Value> = left_row.clone();

@@ -1,6 +1,6 @@
 use nom::{
     IResult,
-    bytes::complete::{tag, take_while1},
+    bytes::complete::{tag, tag_no_case, take_while1},
     character::complete::{multispace0, multispace1, char as nom_char},
     combinator::recognize,
     sequence::{delimited, tuple},
@@ -285,7 +285,7 @@ pub fn parse_sql(input: &str) -> IResult<&str, SqlStatement> {
 
 /// Parse CREATE TABLE statement
 pub fn parse_create(input: &str) -> IResult<&str, SqlStatement> {
-    let (input, _) = tag("CREATE")(input)?;
+    let (input, _) = tag_no_case("CREATE")(input)?;
     let (input, _) = multispace1(input)?;
     nom::branch::alt((
         parse_create_table_inner,
@@ -295,7 +295,7 @@ pub fn parse_create(input: &str) -> IResult<&str, SqlStatement> {
 }
 
 fn parse_create_table_inner(input: &str) -> IResult<&str, SqlStatement> {
-    let (input, _) = tag("TABLE")(input)?;
+    let (input, _) = tag_no_case("TABLE")(input)?;
     let (input, _) = multispace1(input)?;
     let (input, table_name) = parse_identifier(input)?;
     let (input, _) = multispace0(input)?;
@@ -315,13 +315,13 @@ fn parse_create_table_inner(input: &str) -> IResult<&str, SqlStatement> {
 
 // CREATE UNIQUE INDEX index_name ON table(column);
 fn parse_create_unique_index_inner(input: &str) -> IResult<&str, SqlStatement> {
-    let (input, _) = tag("UNIQUE")(input)?;
+    let (input, _) = tag_no_case("UNIQUE")(input)?;
     let (input, _) = multispace1(input)?;
-    let (input, _) = tag("INDEX")(input)?;
+    let (input, _) = tag_no_case("INDEX")(input)?;
     let (input, _) = multispace1(input)?;
     let (input, index_name) = parse_identifier(input)?;
     let (input, _) = multispace1(input)?;
-    let (input, _) = tag("ON")(input)?;
+    let (input, _) = tag_no_case("ON")(input)?;
     let (input, _) = multispace1(input)?;
     let (input, table_name) = parse_identifier(input)?;
     let (input, _) = multispace0(input)?;
@@ -341,11 +341,11 @@ fn parse_create_unique_index_inner(input: &str) -> IResult<&str, SqlStatement> {
 
 // CREATE INDEX index_name ON table(column);
 fn parse_create_index_inner(input: &str) -> IResult<&str, SqlStatement> {
-    let (input, _) = tag("INDEX")(input)?;
+    let (input, _) = tag_no_case("INDEX")(input)?;
     let (input, _) = multispace1(input)?;
     let (input, index_name) = parse_identifier(input)?;
     let (input, _) = multispace1(input)?;
-    let (input, _) = tag("ON")(input)?;
+    let (input, _) = tag_no_case("ON")(input)?;
     let (input, _) = multispace1(input)?;
     let (input, table_name) = parse_identifier(input)?;
     let (input, _) = multispace0(input)?;
@@ -370,13 +370,13 @@ fn parse_column_definition(input: &str) -> IResult<&str, ColumnDefinition> {
     let (input, _) = multispace1(input)?;
     let (input, data_type) = parse_data_type(input)?;
     let (input, _) = multispace0(input)?;
-    let (input, nn) = nom::combinator::opt(tag("NOT NULL"))(input)?;
+    let (input, nn) = nom::combinator::opt(tag_no_case("NOT NULL"))(input)?;
     let (input, _) = multispace0(input)?;
-    let (input, uniq) = nom::combinator::opt(tag("UNIQUE"))(input)?;
+    let (input, uniq) = nom::combinator::opt(tag_no_case("UNIQUE"))(input)?;
     let (input, _) = multispace0(input)?;
     let (input, auto_inc) = nom::combinator::opt(tag("AUTO_INCREMENT"))(input)?;
     let (input, _) = multispace0(input)?;
-    let (input, pk) = nom::combinator::opt(tag("PRIMARY KEY"))(input)?;
+    let (input, pk) = nom::combinator::opt(tag_no_case("PRIMARY KEY"))(input)?;
     let (input, _) = multispace0(input)?;
     let (input, fk_ref) = nom::combinator::opt(parse_references)(input)?;
     let (input, _) = multispace0(input)?;
@@ -394,7 +394,7 @@ fn parse_column_definition(input: &str) -> IResult<&str, ColumnDefinition> {
 
 // Parse REFERENCES table(column)
 fn parse_references(input: &str) -> IResult<&str, ForeignKeyRef> {
-    let (input, _) = tag("REFERENCES")(input)?;
+    let (input, _) = tag_no_case("REFERENCES")(input)?;
     let (input, _) = multispace1(input)?;
     let (input, table) = parse_identifier(input)?;
     let (input, _) = nom_char('(')(input)?;
@@ -417,37 +417,37 @@ fn parse_data_type(input: &str) -> IResult<&str, DataType> {
 }
 
 fn parse_date_type(input: &str) -> IResult<&str, DataType> {
-    let (input, _) = tag("DATE")(input)?;
+    let (input, _) = tag_no_case("DATE")(input)?;
     Ok((input, DataType::Date))
 }
 
 fn parse_timestamp_type(input: &str) -> IResult<&str, DataType> {
-    let (input, _) = tag("TIMESTAMP")(input)?;
+    let (input, _) = tag_no_case("TIMESTAMP")(input)?;
     Ok((input, DataType::Timestamp))
 }
 
 fn parse_boolean_type(input: &str) -> IResult<&str, DataType> {
-    let (input, _) = nom::branch::alt((tag("BOOLEAN"), tag("BOOL")))(input)?;
+    let (input, _) = nom::branch::alt((tag_no_case("BOOLEAN"), tag_no_case("BOOL")))(input)?;
     Ok((input, DataType::Boolean))
 }
 
 fn parse_int_type(input: &str) -> IResult<&str, DataType> {
-    let (input, _) = tag("INT")(input)?;
+    let (input, _) = tag_no_case("INT")(input)?;
     Ok((input, DataType::Int))
 }
 
 fn parse_float_type(input: &str) -> IResult<&str, DataType> {
-    let (input, _) = tag("FLOAT")(input)?;
+    let (input, _) = tag_no_case("FLOAT")(input)?;
     Ok((input, DataType::Float))
 }
 
 fn parse_double_type(input: &str) -> IResult<&str, DataType> {
-    let (input, _) = tag("DOUBLE")(input)?;
+    let (input, _) = tag_no_case("DOUBLE")(input)?;
     Ok((input, DataType::Double))
 }
 
 fn parse_varchar_type(input: &str) -> IResult<&str, DataType> {
-    let (input, _) = tag("VARCHAR")(input)?;
+    let (input, _) = tag_no_case("VARCHAR")(input)?;
     let (input, size) = nom::combinator::opt(delimited(
         nom_char('('),
         nom::character::complete::u64,
@@ -459,13 +459,13 @@ fn parse_varchar_type(input: &str) -> IResult<&str, DataType> {
 
 /// Parse INSERT statement
 pub fn parse_insert(input: &str) -> IResult<&str, SqlStatement> {
-    let (input, _) = tag("INSERT")(input)?;
+    let (input, _) = tag_no_case("INSERT")(input)?;
     let (input, _) = multispace1(input)?;
-    let (input, _) = tag("INTO")(input)?;
+    let (input, _) = tag_no_case("INTO")(input)?;
     let (input, _) = multispace1(input)?;
     let (input, table_name) = parse_identifier(input)?;
     let (input, _) = multispace0(input)?;
-    let (input, _) = tag("VALUES")(input)?;
+    let (input, _) = tag_no_case("VALUES")(input)?;
     let (input, _) = multispace0(input)?;
     let (input, values) = delimited(
         nom_char('('),
@@ -486,11 +486,11 @@ pub fn parse_insert(input: &str) -> IResult<&str, SqlStatement> {
 
 /// Parse UPDATE statement
 pub fn parse_update(input: &str) -> IResult<&str, SqlStatement> {
-    let (input, _) = tag("UPDATE")(input)?;
+    let (input, _) = tag_no_case("UPDATE")(input)?;
     let (input, _) = multispace1(input)?;
     let (input, table_name) = parse_identifier(input)?;
     let (input, _) = multispace1(input)?;
-    let (input, _) = tag("SET")(input)?;
+    let (input, _) = tag_no_case("SET")(input)?;
     let (input, _) = multispace1(input)?;
     let (input, assignments) = separated_list0(
         delimited(multispace0, nom_char(','), multispace0),
@@ -525,9 +525,9 @@ fn parse_assignment(input: &str) -> IResult<&str, Assignment> {
 
 /// Parse DELETE statement
 pub fn parse_delete(input: &str) -> IResult<&str, SqlStatement> {
-    let (input, _) = tag("DELETE")(input)?;
+    let (input, _) = tag_no_case("DELETE")(input)?;
     let (input, _) = multispace1(input)?;
-    let (input, _) = tag("FROM")(input)?;
+    let (input, _) = tag_no_case("FROM")(input)?;
     let (input, _) = multispace1(input)?;
     let (input, table_name) = parse_identifier(input)?;
     let (input, where_clause) = nom::combinator::opt(parse_where)(input)?;
@@ -542,13 +542,13 @@ pub fn parse_delete(input: &str) -> IResult<&str, SqlStatement> {
 
 // DROP INDEX name; / DROP TABLE [IF EXISTS] name;
 pub fn parse_drop(input: &str) -> IResult<&str, SqlStatement> {
-    let (input, _) = tag("DROP")(input)?;
+    let (input, _) = tag_no_case("DROP")(input)?;
     let (input, _) = multispace1(input)?;
     nom::branch::alt((parse_drop_index_inner, parse_drop_table_inner))(input)
 }
 
 fn parse_drop_index_inner(input: &str) -> IResult<&str, SqlStatement> {
-    let (input, _) = tag("INDEX")(input)?;
+    let (input, _) = tag_no_case("INDEX")(input)?;
     let (input, _) = multispace1(input)?;
     let (input, index_name) = parse_identifier(input)?;
     let (input, _) = multispace0(input)?;
@@ -560,10 +560,10 @@ fn parse_drop_index_inner(input: &str) -> IResult<&str, SqlStatement> {
 }
 
 fn parse_drop_table_inner(input: &str) -> IResult<&str, SqlStatement> {
-    let (input, _) = tag("TABLE")(input)?;
+    let (input, _) = tag_no_case("TABLE")(input)?;
     let (input, _) = multispace1(input)?;
     let (input, if_exists) = nom::combinator::opt(
-        nom::sequence::terminated(tag("IF EXISTS"), multispace1)
+        nom::sequence::terminated(tag_no_case("IF EXISTS"), multispace1)
     )(input)?;
     let (input, table_name) = parse_identifier(input)?;
     let (input, _) = multispace0(input)?;
@@ -580,9 +580,9 @@ fn parse_drop_table_inner(input: &str) -> IResult<&str, SqlStatement> {
 //                  | RENAME COLUMN a TO b
 //                  | RENAME TO new_name }
 pub fn parse_alter(input: &str) -> IResult<&str, SqlStatement> {
-    let (input, _) = tag("ALTER")(input)?;
+    let (input, _) = tag_no_case("ALTER")(input)?;
     let (input, _) = multispace1(input)?;
-    let (input, _) = tag("TABLE")(input)?;
+    let (input, _) = tag_no_case("TABLE")(input)?;
     let (input, _) = multispace1(input)?;
     let (input, table_name) = parse_identifier(input)?;
     let (input, _) = multispace1(input)?;
@@ -601,20 +601,20 @@ pub fn parse_alter(input: &str) -> IResult<&str, SqlStatement> {
 }
 
 fn parse_alter_add_column(input: &str) -> IResult<&str, AlterAction> {
-    let (input, _) = tag("ADD")(input)?;
+    let (input, _) = tag_no_case("ADD")(input)?;
     let (input, _) = multispace1(input)?;
     let (input, _) = nom::combinator::opt(
-        nom::sequence::terminated(tag("COLUMN"), multispace1)
+        nom::sequence::terminated(tag_no_case("COLUMN"), multispace1)
     )(input)?;
     let (input, col) = parse_column_definition(input)?;
     Ok((input, AlterAction::AddColumn(col)))
 }
 
 fn parse_alter_drop_column(input: &str) -> IResult<&str, AlterAction> {
-    let (input, _) = tag("DROP")(input)?;
+    let (input, _) = tag_no_case("DROP")(input)?;
     let (input, _) = multispace1(input)?;
     let (input, _) = nom::combinator::opt(
-        nom::sequence::terminated(tag("COLUMN"), multispace1)
+        nom::sequence::terminated(tag_no_case("COLUMN"), multispace1)
     )(input)?;
     let (input, name) = parse_identifier(input)?;
     Ok((input, AlterAction::DropColumn(name.to_string())))
@@ -622,18 +622,18 @@ fn parse_alter_drop_column(input: &str) -> IResult<&str, AlterAction> {
 
 // RENAME [COLUMN a] TO b — column rename if "COLUMN" present, table rename otherwise
 fn parse_alter_rename(input: &str) -> IResult<&str, AlterAction> {
-    let (input, _) = tag("RENAME")(input)?;
+    let (input, _) = tag_no_case("RENAME")(input)?;
     let (input, _) = multispace1(input)?;
     if let Ok((input, _)) = tag::<&str, &str, nom::error::Error<&str>>("COLUMN")(input) {
         let (input, _) = multispace1(input)?;
         let (input, from) = parse_identifier(input)?;
         let (input, _) = multispace1(input)?;
-        let (input, _) = tag("TO")(input)?;
+        let (input, _) = tag_no_case("TO")(input)?;
         let (input, _) = multispace1(input)?;
         let (input, to) = parse_identifier(input)?;
         Ok((input, AlterAction::RenameColumn { from: from.to_string(), to: to.to_string() }))
     } else {
-        let (input, _) = tag("TO")(input)?;
+        let (input, _) = tag_no_case("TO")(input)?;
         let (input, _) = multispace1(input)?;
         let (input, new_name) = parse_identifier(input)?;
         Ok((input, AlterAction::RenameTable(new_name.to_string())))
@@ -642,16 +642,16 @@ fn parse_alter_rename(input: &str) -> IResult<&str, AlterAction> {
 
 /// Parse SELECT into a SelectStatement (used by both top-level and subqueries)
 pub fn parse_select_statement(input: &str) -> IResult<&str, SelectStatement> {
-    let (input, _) = tag("SELECT")(input)?;
+    let (input, _) = tag_no_case("SELECT")(input)?;
     let (input, _) = multispace1(input)?;
-    let (input, distinct) = nom::combinator::opt(nom::sequence::terminated(tag("DISTINCT"), multispace1))(input)?;
+    let (input, distinct) = nom::combinator::opt(nom::sequence::terminated(tag_no_case("DISTINCT"), multispace1))(input)?;
     let distinct = distinct.is_some();
     let (input, columns) = separated_list0(
         delimited(multispace0, nom_char(','), multispace0),
         parse_select_column
     )(input)?;
     let (input, _) = multispace1(input)?;
-    let (input, _) = tag("FROM")(input)?;
+    let (input, _) = tag_no_case("FROM")(input)?;
     let (input, _) = multispace1(input)?;
 
     // FROM can be a table name or (SELECT ...) AS alias
@@ -661,7 +661,7 @@ pub fn parse_select_statement(input: &str) -> IResult<&str, SelectStatement> {
         let (input, _) = multispace0(input)?;
         let (input, _) = nom_char(')')(input)?;
         let (input, _) = multispace1(input)?;
-        let (input, _) = tag("AS")(input)?;
+        let (input, _) = tag_no_case("AS")(input)?;
         let (input, _) = multispace1(input)?;
         let (input, alias) = parse_identifier(input)?;
         (input, FromClause::Subquery(Box::new(subquery)), Some(alias.to_string()))
@@ -683,10 +683,10 @@ pub fn parse_select_statement(input: &str) -> IResult<&str, SelectStatement> {
         let input_before_union = input;
         if let Ok((input, _)) = nom::sequence::preceded(
             multispace0::<&str, nom::error::Error<&str>>,
-            tag("UNION"),
+            tag_no_case("UNION"),
         )(input) {
             let (input, _) = multispace1(input)?;
-            let (input, all) = nom::combinator::opt(nom::sequence::terminated(tag("ALL"), multispace1))(input)?;
+            let (input, all) = nom::combinator::opt(nom::sequence::terminated(tag_no_case("ALL"), multispace1))(input)?;
             let union_type = if all.is_some() { UnionType::UnionAll } else { UnionType::Union };
             let (input, right) = parse_select_statement(input)?;
             (input, Some((union_type, Box::new(right))))
@@ -716,7 +716,7 @@ fn parse_cte_definition(input: &str) -> IResult<&str, CteDefinition> {
     let (input, _) = multispace0(input)?;
     let (input, name) = parse_identifier(input)?;
     let (input, _) = multispace1(input)?;
-    let (input, _) = tag("AS")(input)?;
+    let (input, _) = tag_no_case("AS")(input)?;
     let (input, _) = multispace0(input)?;
     let (input, _) = nom_char('(')(input)?;
     let (input, _) = multispace0(input)?;
@@ -782,13 +782,13 @@ fn parse_arith_select_column(input: &str) -> IResult<&str, SelectColumn> {
 /// Parse aggregate function: COUNT(*), SUM(col), AVG(col), MIN(col), MAX(col)
 fn parse_aggregate_column(input: &str) -> IResult<&str, SelectColumn> {
     let (input, func_name) = nom::branch::alt((
-        tag("COUNT"),
-        tag("SUM"),
-        tag("AVG"),
-        tag("MIN"),
-        tag("MAX"),
+        tag_no_case("COUNT"),
+        tag_no_case("SUM"),
+        tag_no_case("AVG"),
+        tag_no_case("MIN"),
+        tag_no_case("MAX"),
     ))(input)?;
-    let func = match func_name {
+    let func = match func_name.to_uppercase().as_str() {
         "COUNT" => AggregateFunc::Count,
         "SUM" => AggregateFunc::Sum,
         "AVG" => AggregateFunc::Avg,
@@ -832,7 +832,7 @@ fn parse_simple_column(input: &str) -> IResult<&str, SelectColumn> {
 /// Parse WHERE clause
 fn parse_where(input: &str) -> IResult<&str, WhereClause> {
     let (input, _) = multispace0(input)?;
-    let (input, _) = tag("WHERE")(input)?;
+    let (input, _) = tag_no_case("WHERE")(input)?;
     let (input, _) = multispace1(input)?;
     let (input, condition) = parse_condition(input)?;
     Ok((input, WhereClause { condition }))
@@ -841,7 +841,7 @@ fn parse_where(input: &str) -> IResult<&str, WhereClause> {
 /// Parse GROUP BY clause (returns empty vec if not present)
 fn parse_group_by_clause(input: &str) -> IResult<&str, Vec<SelectColumn>> {
     let (input, _) = multispace0(input)?;
-    let result = nom::sequence::pair(tag("GROUP"), nom::sequence::preceded(multispace1::<&str, nom::error::Error<&str>>, tag("BY")))(input);
+    let result = nom::sequence::pair(tag_no_case("GROUP"), nom::sequence::preceded(multispace1::<&str, nom::error::Error<&str>>, tag_no_case("BY")))(input);
     match result {
         Ok((input, _)) => {
             let (input, _) = multispace1(input)?;
@@ -872,7 +872,7 @@ fn parse_having_clause(input: &str) -> IResult<&str, Option<WhereClause>> {
 /// Parse ORDER BY clause (returns empty vec if not present)
 fn parse_order_by_clause(input: &str) -> IResult<&str, Vec<OrderByClause>> {
     let (input, _) = multispace0(input)?;
-    let result = nom::sequence::pair(tag("ORDER"), nom::sequence::preceded(multispace1::<&str, nom::error::Error<&str>>, tag("BY")))(input);
+    let result = nom::sequence::pair(tag_no_case("ORDER"), nom::sequence::preceded(multispace1::<&str, nom::error::Error<&str>>, tag_no_case("BY")))(input);
     match result {
         Ok((input, _)) => {
             let (input, _) = multispace1(input)?;
@@ -895,8 +895,8 @@ fn parse_order_by_item(input: &str) -> IResult<&str, OrderByClause> {
     ))(input)?;
     let (input, _) = multispace0(input)?;
     let (input, dir) = nom::combinator::opt(nom::branch::alt((
-        tag("ASC"),
-        tag("DESC"),
+        tag_no_case("ASC"),
+        tag_no_case("DESC"),
     )))(input)?;
     let descending = dir == Some("DESC");
     Ok((input, OrderByClause { column, descending }))
@@ -935,17 +935,17 @@ fn parse_table_alias(input: &str) -> IResult<&str, String> {
 pub fn parse_join(input: &str) -> IResult<&str, JoinClause> {
     let (input, _) = multispace1(input)?;
     let (input, join_type) = nom::branch::alt((
-        nom::combinator::map(tag("INNER JOIN"), |_| JoinType::Inner),
-        nom::combinator::map(tag("LEFT JOIN"), |_| JoinType::Left),
-        nom::combinator::map(tag("RIGHT JOIN"), |_| JoinType::Right),
-        nom::combinator::map(tag("JOIN"), |_| JoinType::Inner),
+        nom::combinator::map(tag_no_case("INNER JOIN"), |_| JoinType::Inner),
+        nom::combinator::map(tag_no_case("LEFT JOIN"), |_| JoinType::Left),
+        nom::combinator::map(tag_no_case("RIGHT JOIN"), |_| JoinType::Right),
+        nom::combinator::map(tag_no_case("JOIN"), |_| JoinType::Inner),
     ))(input)?;
     let (input, _) = multispace1(input)?;
     let (input, table) = parse_identifier(input)?;
     // Parse optional alias, but don't consume reserved keywords like ON
     let (input, alias) = nom::combinator::opt(parse_table_alias)(input)?;
     let (input, _) = multispace1(input)?;
-    let (input, _) = tag("ON")(input)?;
+    let (input, _) = tag_no_case("ON")(input)?;
     let (input, _) = multispace1(input)?;
     let (input, condition) = parse_condition(input)?;
     
@@ -964,7 +964,7 @@ pub fn parse_condition(input: &str) -> IResult<&str, Condition> {
     // Try NOT EXISTS (SELECT ...)
     if let Ok((input, _)) = nom::sequence::pair(
         tag::<&str, &str, nom::error::Error<&str>>("NOT"),
-        nom::sequence::preceded(multispace1::<&str, nom::error::Error<&str>>, tag("EXISTS")),
+        nom::sequence::preceded(multispace1::<&str, nom::error::Error<&str>>, tag_no_case("EXISTS")),
     )(input) {
         let (input, _) = multispace0(input)?;
         let (input, _) = nom_char('(')(input)?;
@@ -1004,7 +1004,7 @@ pub fn parse_condition(input: &str) -> IResult<&str, Condition> {
         let (input, _) = multispace1(input)?;
         if let Ok((input, _)) = nom::sequence::pair(
             tag::<&str, &str, nom::error::Error<&str>>("NOT"),
-            nom::sequence::preceded(multispace1::<&str, nom::error::Error<&str>>, tag("NULL")),
+            nom::sequence::preceded(multispace1::<&str, nom::error::Error<&str>>, tag_no_case("NULL")),
         )(input) {
             return Ok((input, Condition {
                 left,
@@ -1013,7 +1013,7 @@ pub fn parse_condition(input: &str) -> IResult<&str, Condition> {
                 upper_bound: None,
             }));
         }
-        let (input, _) = tag("NULL")(input)?;
+        let (input, _) = tag_no_case("NULL")(input)?;
         return Ok((input, Condition {
             left,
             operator: Operator::IsNull,
@@ -1025,7 +1025,7 @@ pub fn parse_condition(input: &str) -> IResult<&str, Condition> {
     // Try parsing NOT IN (SELECT ...) or IN (SELECT ...)
     if let Ok((input, _)) = nom::sequence::pair(
         tag::<&str, &str, nom::error::Error<&str>>("NOT"),
-        nom::sequence::preceded(multispace1::<&str, nom::error::Error<&str>>, tag("IN")),
+        nom::sequence::preceded(multispace1::<&str, nom::error::Error<&str>>, tag_no_case("IN")),
     )(input) {
         let (input, _) = multispace0(input)?;
         let (input, _) = nom_char('(')(input)?;
@@ -1058,12 +1058,12 @@ pub fn parse_condition(input: &str) -> IResult<&str, Condition> {
     // Try NOT BETWEEN low AND high
     if let Ok((input, _)) = nom::sequence::pair(
         tag::<&str, &str, nom::error::Error<&str>>("NOT"),
-        nom::sequence::preceded(multispace1::<&str, nom::error::Error<&str>>, tag("BETWEEN")),
+        nom::sequence::preceded(multispace1::<&str, nom::error::Error<&str>>, tag_no_case("BETWEEN")),
     )(input) {
         let (input, _) = multispace1(input)?;
         let (input, low) = parse_expression(input)?;
         let (input, _) = multispace1(input)?;
-        let (input, _) = tag("AND")(input)?;
+        let (input, _) = tag_no_case("AND")(input)?;
         let (input, _) = multispace1(input)?;
         let (input, high) = parse_expression(input)?;
         return Ok((input, Condition {
@@ -1079,7 +1079,7 @@ pub fn parse_condition(input: &str) -> IResult<&str, Condition> {
         let (input, _) = multispace1(input)?;
         let (input, low) = parse_expression(input)?;
         let (input, _) = multispace1(input)?;
-        let (input, _) = tag("AND")(input)?;
+        let (input, _) = tag_no_case("AND")(input)?;
         let (input, _) = multispace1(input)?;
         let (input, high) = parse_expression(input)?;
         return Ok((input, Condition {
@@ -1154,13 +1154,13 @@ fn parse_atom(input: &str) -> IResult<&str, Expression> {
 /// Parse an aggregate function call as an expression: COUNT(*), SUM(col), AVG(t.col), etc.
 fn parse_expression_aggregate(input: &str) -> IResult<&str, Expression> {
     let (input, func_name) = nom::branch::alt((
-        tag("COUNT"),
-        tag("SUM"),
-        tag("AVG"),
-        tag("MIN"),
-        tag("MAX"),
+        tag_no_case("COUNT"),
+        tag_no_case("SUM"),
+        tag_no_case("AVG"),
+        tag_no_case("MIN"),
+        tag_no_case("MAX"),
     ))(input)?;
-    let func = match func_name {
+    let func = match func_name.to_uppercase().as_str() {
         "COUNT" => AggregateFunc::Count,
         "SUM" => AggregateFunc::Sum,
         "AVG" => AggregateFunc::Avg,
@@ -1220,7 +1220,7 @@ fn parse_operator(input: &str) -> IResult<&str, Operator> {
         nom::combinator::map(tag("="), |_| Operator::Equals),
         nom::combinator::map(tag(">"), |_| Operator::GreaterThan),
         nom::combinator::map(tag("<"), |_| Operator::LessThan),
-        nom::combinator::map(tag("LIKE"), |_| Operator::Like),
+        nom::combinator::map(tag_no_case("LIKE"), |_| Operator::Like),
     ))(input)
 }
 
@@ -1238,8 +1238,8 @@ fn parse_value(input: &str) -> IResult<&str, Value> {
 }
 
 fn parse_bool_value(input: &str) -> IResult<&str, Value> {
-    let (input, val) = nom::branch::alt((tag("TRUE"), tag("FALSE")))(input)?;
-    Ok((input, Value::Bool(val == "TRUE")))
+    let (input, val) = nom::branch::alt((tag_no_case("TRUE"), tag_no_case("FALSE")))(input)?;
+    Ok((input, Value::Bool(val.eq_ignore_ascii_case("TRUE"))))
 }
 
 /// Parse float literal: digits.digits (must have decimal point)
@@ -1268,7 +1268,7 @@ fn parse_string_value(input: &str) -> IResult<&str, Value> {
 }
 
 fn parse_null_value(input: &str) -> IResult<&str, Value> {
-    let (input, _) = tag("NULL")(input)?;
+    let (input, _) = tag_no_case("NULL")(input)?;
     Ok((input, Value::Null))
 }
 

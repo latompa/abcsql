@@ -1099,6 +1099,16 @@ fn evaluate_join_condition(
         return if condition.operator == parser::Operator::IsNull { is_null } else { !is_null };
     }
 
+    // Handle BETWEEN / NOT BETWEEN
+    if condition.operator == parser::Operator::Between || condition.operator == parser::Operator::NotBetween {
+        let val = resolve_join_expression(&condition.left, row, cols, storage);
+        let low = resolve_join_expression(&condition.right, row, cols, storage);
+        let high = condition.upper_bound.as_ref().and_then(|e| resolve_join_expression(e, row, cols, storage));
+        let in_range = matches!((&val, &low, &high), (Some(v), Some(l), Some(h))
+            if compare_values(v, &parser::Operator::GreaterThanOrEqual, l) && compare_values(v, &parser::Operator::LessThanOrEqual, h));
+        return if condition.operator == parser::Operator::Between { in_range } else { !in_range };
+    }
+
     // Handle EXISTS / NOT EXISTS
     if condition.operator == parser::Operator::Exists || condition.operator == parser::Operator::NotExists {
         if let parser::Expression::Subquery(subquery) = &condition.right {
@@ -1144,6 +1154,15 @@ fn evaluate_having_condition(
         let left_val = resolve_having_expression(&condition.left, group, cols, storage);
         let is_null = matches!(left_val, Some(Value::Null) | None);
         return if condition.operator == parser::Operator::IsNull { is_null } else { !is_null };
+    }
+
+    if condition.operator == parser::Operator::Between || condition.operator == parser::Operator::NotBetween {
+        let val = resolve_having_expression(&condition.left, group, cols, storage);
+        let low = resolve_having_expression(&condition.right, group, cols, storage);
+        let high = condition.upper_bound.as_ref().and_then(|e| resolve_having_expression(e, group, cols, storage));
+        let in_range = matches!((&val, &low, &high), (Some(v), Some(l), Some(h))
+            if compare_values(v, &parser::Operator::GreaterThanOrEqual, l) && compare_values(v, &parser::Operator::LessThanOrEqual, h));
+        return if condition.operator == parser::Operator::Between { in_range } else { !in_range };
     }
 
     let left_val = resolve_having_expression(&condition.left, group, cols, storage);

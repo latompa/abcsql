@@ -214,6 +214,8 @@ pub struct Condition {
     pub left: Expression,
     pub operator: Operator,
     pub right: Expression,
+    // upper bound for BETWEEN / NOT BETWEEN
+    pub upper_bound: Option<Expression>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -250,6 +252,8 @@ pub enum Operator {
     NotExists,
     IsNull,
     IsNotNull,
+    Between,
+    NotBetween,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -972,6 +976,7 @@ pub fn parse_condition(input: &str) -> IResult<&str, Condition> {
             left: Expression::Literal(Value::Null),
             operator: Operator::NotExists,
             right: Expression::Subquery(Box::new(subquery)),
+            upper_bound: None,
         }));
     }
 
@@ -987,6 +992,7 @@ pub fn parse_condition(input: &str) -> IResult<&str, Condition> {
             left: Expression::Literal(Value::Null),
             operator: Operator::Exists,
             right: Expression::Subquery(Box::new(subquery)),
+            upper_bound: None,
         }));
     }
 
@@ -1004,6 +1010,7 @@ pub fn parse_condition(input: &str) -> IResult<&str, Condition> {
                 left,
                 operator: Operator::IsNotNull,
                 right: Expression::Literal(Value::Null),
+                upper_bound: None,
             }));
         }
         let (input, _) = tag("NULL")(input)?;
@@ -1011,6 +1018,7 @@ pub fn parse_condition(input: &str) -> IResult<&str, Condition> {
             left,
             operator: Operator::IsNull,
             right: Expression::Literal(Value::Null),
+            upper_bound: None,
         }));
     }
 
@@ -1029,6 +1037,7 @@ pub fn parse_condition(input: &str) -> IResult<&str, Condition> {
             left,
             operator: Operator::NotIn,
             right: Expression::Subquery(Box::new(subquery)),
+            upper_bound: None,
         }));
     }
     if let Ok((input, _)) = tag::<&str, &str, nom::error::Error<&str>>("IN")(input) {
@@ -1042,6 +1051,42 @@ pub fn parse_condition(input: &str) -> IResult<&str, Condition> {
             left,
             operator: Operator::In,
             right: Expression::Subquery(Box::new(subquery)),
+            upper_bound: None,
+        }));
+    }
+
+    // Try NOT BETWEEN low AND high
+    if let Ok((input, _)) = nom::sequence::pair(
+        tag::<&str, &str, nom::error::Error<&str>>("NOT"),
+        nom::sequence::preceded(multispace1::<&str, nom::error::Error<&str>>, tag("BETWEEN")),
+    )(input) {
+        let (input, _) = multispace1(input)?;
+        let (input, low) = parse_expression(input)?;
+        let (input, _) = multispace1(input)?;
+        let (input, _) = tag("AND")(input)?;
+        let (input, _) = multispace1(input)?;
+        let (input, high) = parse_expression(input)?;
+        return Ok((input, Condition {
+            left,
+            operator: Operator::NotBetween,
+            right: low,
+            upper_bound: Some(high),
+        }));
+    }
+
+    // Try BETWEEN low AND high
+    if let Ok((input, _)) = tag::<&str, &str, nom::error::Error<&str>>("BETWEEN")(input) {
+        let (input, _) = multispace1(input)?;
+        let (input, low) = parse_expression(input)?;
+        let (input, _) = multispace1(input)?;
+        let (input, _) = tag("AND")(input)?;
+        let (input, _) = multispace1(input)?;
+        let (input, high) = parse_expression(input)?;
+        return Ok((input, Condition {
+            left,
+            operator: Operator::Between,
+            right: low,
+            upper_bound: Some(high),
         }));
     }
 
@@ -1049,7 +1094,7 @@ pub fn parse_condition(input: &str) -> IResult<&str, Condition> {
     let (input, _) = multispace0(input)?;
     let (input, right) = parse_expression(input)?;
 
-    Ok((input, Condition { left, operator, right }))
+    Ok((input, Condition { left, operator, right, upper_bound: None }))
 }
 
 /// Try to parse an arithmetic operator surrounded by optional whitespace
@@ -2380,6 +2425,36 @@ mod tests {
         let (_, stmt) = parse_sql(sql).unwrap();
         match stmt {
             SqlStatement::Select(sel) => assert!(sel.union.is_none()),
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_between() {
+        let sql = "SELECT * FROM users WHERE age BETWEEN 18 AND 65;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                let wc = sel.where_clause.unwrap();
+                assert_eq!(wc.condition.operator, Operator::Between);
+                assert_eq!(wc.condition.left, Expression::Column("age".to_string()));
+                assert_eq!(wc.condition.right, Expression::Literal(Value::Int(18)));
+                assert_eq!(wc.condition.upper_bound, Some(Expression::Literal(Value::Int(65))));
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_not_between() {
+        let sql = "SELECT * FROM users WHERE age NOT BETWEEN 18 AND 65;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                let wc = sel.where_clause.unwrap();
+                assert_eq!(wc.condition.operator, Operator::NotBetween);
+                assert_eq!(wc.condition.upper_bound, Some(Expression::Literal(Value::Int(65))));
+            }
             _ => panic!("Expected Select"),
         }
     }

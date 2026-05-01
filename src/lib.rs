@@ -66,6 +66,19 @@ pub fn execute(storage: &Storage, sql: &str) -> Result<String, String> {
                 .map(|_| format!("Altered table '{}'", stmt.table_name))
                 .map_err(|e| e.to_string())
         }
+        SqlStatement::CreateView(stmt) => {
+            storage.create_view(&stmt.view_name, &stmt.select_sql)
+                .map(|_| format!("Created view '{}'", stmt.view_name))
+                .map_err(|e| e.to_string())
+        }
+        SqlStatement::DropView(stmt) => {
+            if stmt.if_exists && !storage.view_exists(&stmt.view_name) {
+                return Ok(format!("View '{}' does not exist", stmt.view_name));
+            }
+            storage.drop_view(&stmt.view_name)
+                .map(|_| format!("Dropped view '{}'", stmt.view_name))
+                .map_err(|e| e.to_string())
+        }
     }
 }
 
@@ -75,6 +88,16 @@ fn execute_select_to_string(
     storage: &Storage,
 ) -> Result<String, String> {
     let table_name = stmt.from.table_name().ok_or("Subquery FROM not supported here")?;
+
+    // If FROM names a view, expand it by re-running the view's SELECT
+    if let Ok(Some(view_sql)) = storage.load_view(table_name) {
+        let inner_stmt = match parser::parse_sql(&view_sql) {
+            Ok((_, parser::SqlStatement::Select(s))) => s,
+            _ => return Err(format!("View '{}' contains invalid SQL", table_name)),
+        };
+        return execute_select_to_string(&inner_stmt, storage);
+    }
+
     let from_schema = storage.load_schema(table_name).map_err(|e| e.to_string())?;
 
     // Try to use an index if WHERE is a simple column = literal equality

@@ -810,6 +810,41 @@ impl Storage {
         self.data_dir.join(format!("{}.seq", table_name))
     }
 
+    fn view_path(&self, view_name: &str) -> PathBuf {
+        self.data_dir.join(format!("{}.view", view_name))
+    }
+
+    /// Create a view by persisting its SELECT SQL to disk
+    pub fn create_view(&self, view_name: &str, select_sql: &str) -> Result<(), StorageError> {
+        let path = self.view_path(view_name);
+        if path.exists() {
+            return Err(StorageError::InvalidSchema(format!("View '{}' already exists", view_name)));
+        }
+        fs::write(path, select_sql).map_err(StorageError::IoError)
+    }
+
+    /// Load a view's SELECT SQL from disk
+    pub fn load_view(&self, view_name: &str) -> Result<Option<String>, StorageError> {
+        let path = self.view_path(view_name);
+        if !path.exists() {
+            return Ok(None);
+        }
+        fs::read_to_string(path).map(Some).map_err(StorageError::IoError)
+    }
+
+    /// Drop a view
+    pub fn drop_view(&self, view_name: &str) -> Result<(), StorageError> {
+        let path = self.view_path(view_name);
+        if !path.exists() {
+            return Err(StorageError::TableNotFound(format!("View '{}' not found", view_name)));
+        }
+        fs::remove_file(path).map_err(StorageError::IoError)
+    }
+
+    pub fn view_exists(&self, view_name: &str) -> bool {
+        self.view_path(view_name).exists()
+    }
+
     /// Read and increment the auto_increment counter
     fn next_auto_increment(&self, table_name: &str) -> Result<i64, StorageError> {
         let seq_path = self.seq_path(table_name);

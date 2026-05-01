@@ -216,6 +216,22 @@ fn execute_sql(sql: &str, storage: &Storage) {
                 Err(e) => eprintln!("Error: {}", e),
             }
         }
+        SqlStatement::CreateView(stmt) => {
+            match storage.create_view(&stmt.view_name, &stmt.select_sql) {
+                Ok(_) => println!("Created view '{}'", stmt.view_name),
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        }
+        SqlStatement::DropView(stmt) => {
+            if stmt.if_exists && !storage.view_exists(&stmt.view_name) {
+                println!("View '{}' does not exist", stmt.view_name);
+                return;
+            }
+            match storage.drop_view(&stmt.view_name) {
+                Ok(_) => println!("Dropped view '{}'", stmt.view_name),
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        }
     }
 }
 
@@ -253,6 +269,30 @@ fn load_table_with_index(
             .collect();
         return Ok((cols, cte.rows.clone()));
     }
+
+    // Expand view if name refers to one
+    if let Ok(Some(view_sql)) = storage.load_view(name) {
+        let view_stmt = match parser::parse_sql(&view_sql) {
+            Ok((_, parser::SqlStatement::Select(s))) => s,
+            _ => return Err(format!("View '{}' contains invalid SQL", name)),
+        };
+        let (headers, string_rows) = execute_select(&view_stmt, storage);
+        // Re-materialise as Value rows using the string representation
+        let cols: Vec<ResultColumn> = headers.iter()
+            .map(|h| ResultColumn { table: name.to_string(), name: h.clone() })
+            .collect();
+        let rows: Vec<Vec<Value>> = string_rows.iter()
+            .map(|row| row.iter().map(|cell| {
+                if cell == "NULL" { Value::Null }
+                else if let Ok(i) = cell.parse::<i64>() { Value::Int(i) }
+                else if let Ok(f) = cell.parse::<f64>() { Value::Float(f) }
+                else if cell == "true" || cell == "false" { Value::Bool(cell == "true") }
+                else { Value::String(cell.clone()) }
+            }).collect())
+            .collect();
+        return Ok((cols, rows));
+    }
+
     let schema = storage.load_schema(name).map_err(|e| e.to_string())?;
 
     // Try index lookup if we have a hint

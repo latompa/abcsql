@@ -13,8 +13,10 @@ use nom::{
 pub enum SqlStatement {
     CreateTable(CreateTableStatement),
     CreateIndex(CreateIndexStatement),
+    CreateView(CreateViewStatement),
     DropIndex(DropIndexStatement),
     DropTable(DropTableStatement),
+    DropView(DropViewStatement),
     AlterTable(AlterTableStatement),
     Insert(InsertStatement),
     Select(SelectStatement),
@@ -44,6 +46,19 @@ pub struct DropIndexStatement {
 #[derive(Debug, PartialEq, Clone)]
 pub struct DropTableStatement {
     pub table_name: String,
+    pub if_exists: bool,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct CreateViewStatement {
+    pub view_name: String,
+    pub select_sql: String, // stored as raw SQL for persistence
+    pub select: SelectStatement,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct DropViewStatement {
+    pub view_name: String,
     pub if_exists: bool,
 }
 
@@ -326,15 +341,37 @@ pub fn parse_sql(input: &str) -> IResult<&str, SqlStatement> {
     Ok((input, stmt))
 }
 
-/// Parse CREATE TABLE statement
+/// Parse CREATE TABLE / INDEX / VIEW statement
 pub fn parse_create(input: &str) -> IResult<&str, SqlStatement> {
     let (input, _) = tag_no_case("CREATE")(input)?;
     let (input, _) = multispace1(input)?;
     nom::branch::alt((
+        parse_create_view_inner,
         parse_create_table_inner,
         parse_create_unique_index_inner,
         parse_create_index_inner,
     ))(input)
+}
+
+fn parse_create_view_inner(input: &str) -> IResult<&str, SqlStatement> {
+    let (input, _) = tag_no_case("VIEW")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, view_name) = parse_identifier(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, _) = tag_no_case("AS")(input)?;
+    let (input, _) = multispace1(input)?;
+    let select_sql_start = input;
+    let (input, select) = parse_select_statement(input)?;
+    // Capture the raw SQL consumed (strip trailing semicolon/whitespace)
+    let consumed_len = select_sql_start.len() - input.len();
+    let select_sql = select_sql_start[..consumed_len].trim_end_matches(';').trim().to_string();
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
+    Ok((input, SqlStatement::CreateView(CreateViewStatement {
+        view_name: view_name.to_string(),
+        select_sql,
+        select,
+    })))
 }
 
 fn parse_create_table_inner(input: &str) -> IResult<&str, SqlStatement> {
@@ -600,7 +637,22 @@ pub fn parse_delete(input: &str) -> IResult<&str, SqlStatement> {
 pub fn parse_drop(input: &str) -> IResult<&str, SqlStatement> {
     let (input, _) = tag_no_case("DROP")(input)?;
     let (input, _) = multispace1(input)?;
-    nom::branch::alt((parse_drop_index_inner, parse_drop_table_inner))(input)
+    nom::branch::alt((parse_drop_view_inner, parse_drop_index_inner, parse_drop_table_inner))(input)
+}
+
+fn parse_drop_view_inner(input: &str) -> IResult<&str, SqlStatement> {
+    let (input, _) = tag_no_case("VIEW")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, if_exists) = nom::combinator::opt(
+        nom::sequence::terminated(tag_no_case("IF EXISTS"), multispace1)
+    )(input)?;
+    let (input, view_name) = parse_identifier(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
+    Ok((input, SqlStatement::DropView(DropViewStatement {
+        view_name: view_name.to_string(),
+        if_exists: if_exists.is_some(),
+    })))
 }
 
 fn parse_drop_index_inner(input: &str) -> IResult<&str, SqlStatement> {
@@ -973,7 +1025,7 @@ fn parse_limit_clause(input: &str) -> IResult<&str, Option<u64>> {
 
 /// Check if identifier is a reserved keyword that can't be used as an alias
 fn is_reserved_keyword(s: &str) -> bool {
-    matches!(s.to_uppercase().as_str(), "ON" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "OUTER" | "WHERE" | "ORDER" | "GROUP" | "LIMIT" | "HAVING" | "UNION" | "ALL" | "CASE" | "WHEN" | "THEN" | "ELSE" | "END" | "AND" | "OR" | "NOT")
+    matches!(s.to_uppercase().as_str(), "ON" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "OUTER" | "WHERE" | "ORDER" | "GROUP" | "LIMIT" | "HAVING" | "UNION" | "ALL" | "CASE" | "WHEN" | "THEN" | "ELSE" | "END" | "AND" | "OR" | "NOT" | "AS" | "VIEW")
 }
 
 /// Parse optional table alias, rejecting reserved keywords
@@ -3431,6 +3483,44 @@ mod tests {
                 }
             }
             _ => panic!("Expected AlterTable"),
+        }
+    }
+
+    #[test]
+    fn test_parse_create_view() {
+        let sql = "CREATE VIEW active_users AS SELECT * FROM users WHERE active = 1;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::CreateView(v) => {
+                assert_eq!(v.view_name, "active_users");
+                assert!(v.select_sql.contains("SELECT"));
+                assert_eq!(v.select.from, FromClause::Table("users".to_string()));
+            }
+            _ => panic!("Expected CreateView"),
+        }
+    }
+
+    #[test]
+    fn test_parse_drop_view() {
+        let (_, stmt) = parse_sql("DROP VIEW active_users;").unwrap();
+        match stmt {
+            SqlStatement::DropView(v) => {
+                assert_eq!(v.view_name, "active_users");
+                assert!(!v.if_exists);
+            }
+            _ => panic!("Expected DropView"),
+        }
+    }
+
+    #[test]
+    fn test_parse_drop_view_if_exists() {
+        let (_, stmt) = parse_sql("DROP VIEW IF EXISTS active_users;").unwrap();
+        match stmt {
+            SqlStatement::DropView(v) => {
+                assert_eq!(v.view_name, "active_users");
+                assert!(v.if_exists);
+            }
+            _ => panic!("Expected DropView"),
         }
     }
 }

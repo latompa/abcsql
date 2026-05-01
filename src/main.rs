@@ -309,18 +309,18 @@ fn load_from_with_index(
 // Extract a simple (column_name, literal_value) from a WHERE column = literal condition
 fn extract_index_hint(where_clause: &Option<parser::WhereClause>) -> Option<(String, parser::Value)> {
     let wc = where_clause.as_ref()?;
-    if wc.condition.operator != parser::Operator::Equals {
-        return None;
-    }
-    match (&wc.condition.left, &wc.condition.right) {
-        (parser::Expression::Column(col), parser::Expression::Literal(val)) => {
-            Some((col.clone(), val.clone()))
+    if let parser::Condition::Comparison { left, operator: parser::Operator::Equals, right, .. } = &wc.condition {
+        match (left, right) {
+            (parser::Expression::Column(col), parser::Expression::Literal(val)) => {
+                return Some((col.clone(), val.clone()));
+            }
+            (parser::Expression::Literal(val), parser::Expression::Column(col)) => {
+                return Some((col.clone(), val.clone()));
+            }
+            _ => {}
         }
-        (parser::Expression::Literal(val), parser::Expression::Column(col)) => {
-            Some((col.clone(), val.clone()))
-        }
-        _ => None,
     }
+    None
 }
 
 /// Get the effective name for a FROM clause (table name or alias)
@@ -1149,52 +1149,57 @@ fn evaluate_join_condition(
     cols: &[ResultColumn],
     storage: &Storage,
 ) -> bool {
-    // Handle IS NULL / IS NOT NULL
-    if condition.operator == parser::Operator::IsNull || condition.operator == parser::Operator::IsNotNull {
-        let left_val = resolve_join_expression(&condition.left, row, cols, storage);
-        let is_null = matches!(left_val, Some(Value::Null) | None);
-        return if condition.operator == parser::Operator::IsNull { is_null } else { !is_null };
-    }
-
-    // Handle BETWEEN / NOT BETWEEN
-    if condition.operator == parser::Operator::Between || condition.operator == parser::Operator::NotBetween {
-        let val = resolve_join_expression(&condition.left, row, cols, storage);
-        let low = resolve_join_expression(&condition.right, row, cols, storage);
-        let high = condition.upper_bound.as_ref().and_then(|e| resolve_join_expression(e, row, cols, storage));
-        let in_range = matches!((&val, &low, &high), (Some(v), Some(l), Some(h))
-            if compare_values(v, &parser::Operator::GreaterThanOrEqual, l) && compare_values(v, &parser::Operator::LessThanOrEqual, h));
-        return if condition.operator == parser::Operator::Between { in_range } else { !in_range };
-    }
-
-    // Handle EXISTS / NOT EXISTS
-    if condition.operator == parser::Operator::Exists || condition.operator == parser::Operator::NotExists {
-        if let parser::Expression::Subquery(subquery) = &condition.right {
-            let subquery_values = execute_subquery(subquery, storage);
-            let exists = !subquery_values.is_empty();
-            return if condition.operator == parser::Operator::NotExists { !exists } else { exists };
+    match condition {
+        parser::Condition::And(left, right) => {
+            evaluate_join_condition(left, row, cols, storage) && evaluate_join_condition(right, row, cols, storage)
         }
-        return false;
-    }
-
-    // Handle IN / NOT IN (subquery) specially
-    if condition.operator == parser::Operator::In || condition.operator == parser::Operator::NotIn {
-        if let parser::Expression::Subquery(subquery) = &condition.right {
-            let left_val = resolve_join_expression(&condition.left, row, cols, storage);
-            if let Some(left) = left_val {
-                let subquery_values = execute_subquery(subquery, storage);
-                let contains = subquery_values.contains(&left);
-                return if condition.operator == parser::Operator::NotIn { !contains } else { contains };
+        parser::Condition::Or(left, right) => {
+            evaluate_join_condition(left, row, cols, storage) || evaluate_join_condition(right, row, cols, storage)
+        }
+        parser::Condition::Comparison { left, operator, right, upper_bound } => {
+            if *operator == parser::Operator::IsNull || *operator == parser::Operator::IsNotNull {
+                let left_val = resolve_join_expression(left, row, cols, storage);
+                let is_null = matches!(left_val, Some(Value::Null) | None);
+                return if *operator == parser::Operator::IsNull { is_null } else { !is_null };
             }
-            return false;
+
+            if *operator == parser::Operator::Between || *operator == parser::Operator::NotBetween {
+                let val = resolve_join_expression(left, row, cols, storage);
+                let low = resolve_join_expression(right, row, cols, storage);
+                let high = upper_bound.as_ref().and_then(|e| resolve_join_expression(e, row, cols, storage));
+                let in_range = matches!((&val, &low, &high), (Some(v), Some(l), Some(h))
+                    if compare_values(v, &parser::Operator::GreaterThanOrEqual, l) && compare_values(v, &parser::Operator::LessThanOrEqual, h));
+                return if *operator == parser::Operator::Between { in_range } else { !in_range };
+            }
+
+            if *operator == parser::Operator::Exists || *operator == parser::Operator::NotExists {
+                if let parser::Expression::Subquery(subquery) = right {
+                    let subquery_values = execute_subquery(subquery, storage);
+                    let exists = !subquery_values.is_empty();
+                    return if *operator == parser::Operator::NotExists { !exists } else { exists };
+                }
+                return false;
+            }
+
+            if *operator == parser::Operator::In || *operator == parser::Operator::NotIn {
+                if let parser::Expression::Subquery(subquery) = right {
+                    let left_val = resolve_join_expression(left, row, cols, storage);
+                    if let Some(lv) = left_val {
+                        let subquery_values = execute_subquery(subquery, storage);
+                        let contains = subquery_values.contains(&lv);
+                        return if *operator == parser::Operator::NotIn { !contains } else { contains };
+                    }
+                    return false;
+                }
+            }
+
+            let left_val = resolve_join_expression(left, row, cols, storage);
+            let right_val = resolve_join_expression(right, row, cols, storage);
+            match (&left_val, &right_val) {
+                (Some(l), Some(r)) => compare_values(l, operator, r),
+                _ => false,
+            }
         }
-    }
-
-    let left_val = resolve_join_expression(&condition.left, row, cols, storage);
-    let right_val = resolve_join_expression(&condition.right, row, cols, storage);
-
-    match (&left_val, &right_val) {
-        (Some(l), Some(r)) => compare_values(l, &condition.operator, r),
-        _ => false,
     }
 }
 
@@ -1207,26 +1212,36 @@ fn evaluate_having_condition(
     cols: &[ResultColumn],
     storage: &Storage,
 ) -> bool {
-    if condition.operator == parser::Operator::IsNull || condition.operator == parser::Operator::IsNotNull {
-        let left_val = resolve_having_expression(&condition.left, group, cols, storage);
-        let is_null = matches!(left_val, Some(Value::Null) | None);
-        return if condition.operator == parser::Operator::IsNull { is_null } else { !is_null };
-    }
+    match condition {
+        parser::Condition::And(left, right) => {
+            evaluate_having_condition(left, group, cols, storage) && evaluate_having_condition(right, group, cols, storage)
+        }
+        parser::Condition::Or(left, right) => {
+            evaluate_having_condition(left, group, cols, storage) || evaluate_having_condition(right, group, cols, storage)
+        }
+        parser::Condition::Comparison { left, operator, right, upper_bound } => {
+            if *operator == parser::Operator::IsNull || *operator == parser::Operator::IsNotNull {
+                let left_val = resolve_having_expression(left, group, cols, storage);
+                let is_null = matches!(left_val, Some(Value::Null) | None);
+                return if *operator == parser::Operator::IsNull { is_null } else { !is_null };
+            }
 
-    if condition.operator == parser::Operator::Between || condition.operator == parser::Operator::NotBetween {
-        let val = resolve_having_expression(&condition.left, group, cols, storage);
-        let low = resolve_having_expression(&condition.right, group, cols, storage);
-        let high = condition.upper_bound.as_ref().and_then(|e| resolve_having_expression(e, group, cols, storage));
-        let in_range = matches!((&val, &low, &high), (Some(v), Some(l), Some(h))
-            if compare_values(v, &parser::Operator::GreaterThanOrEqual, l) && compare_values(v, &parser::Operator::LessThanOrEqual, h));
-        return if condition.operator == parser::Operator::Between { in_range } else { !in_range };
-    }
+            if *operator == parser::Operator::Between || *operator == parser::Operator::NotBetween {
+                let val = resolve_having_expression(left, group, cols, storage);
+                let low = resolve_having_expression(right, group, cols, storage);
+                let high = upper_bound.as_ref().and_then(|e| resolve_having_expression(e, group, cols, storage));
+                let in_range = matches!((&val, &low, &high), (Some(v), Some(l), Some(h))
+                    if compare_values(v, &parser::Operator::GreaterThanOrEqual, l) && compare_values(v, &parser::Operator::LessThanOrEqual, h));
+                return if *operator == parser::Operator::Between { in_range } else { !in_range };
+            }
 
-    let left_val = resolve_having_expression(&condition.left, group, cols, storage);
-    let right_val = resolve_having_expression(&condition.right, group, cols, storage);
-    match (&left_val, &right_val) {
-        (Some(l), Some(r)) => compare_values(l, &condition.operator, r),
-        _ => false,
+            let left_val = resolve_having_expression(left, group, cols, storage);
+            let right_val = resolve_having_expression(right, group, cols, storage);
+            match (&left_val, &right_val) {
+                (Some(l), Some(r)) => compare_values(l, operator, r),
+                _ => false,
+            }
+        }
     }
 }
 

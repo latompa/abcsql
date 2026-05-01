@@ -79,19 +79,19 @@ fn execute_select_to_string(
 
     // Try to use an index if WHERE is a simple column = literal equality
     let from_rows = if let Some(ref wc) = stmt.where_clause {
-        if wc.condition.operator == parser::Operator::Equals {
-            let hint = match (&wc.condition.left, &wc.condition.right) {
+        let hint = if let parser::Condition::Comparison { left, operator: parser::Operator::Equals, right, .. } = &wc.condition {
+            match (left, right) {
                 (parser::Expression::Column(col), parser::Expression::Literal(val)) => Some((col.as_str(), val)),
                 (parser::Expression::Literal(val), parser::Expression::Column(col)) => Some((col.as_str(), val)),
                 _ => None,
-            };
-            if let Some((col, val)) = hint {
-                if let Ok(Some(idx_name)) = storage.find_index(table_name, col) {
-                    if let Ok(Some(row_nums)) = storage.lookup_index(&idx_name, val) {
-                        storage.read_rows_by_numbers(table_name, &row_nums).map_err(|e| e.to_string())?
-                    } else {
-                        storage.read_rows(table_name).map_err(|e| e.to_string())?
-                    }
+            }
+        } else {
+            None
+        };
+        if let Some((col, val)) = hint {
+            if let Ok(Some(idx_name)) = storage.find_index(table_name, col) {
+                if let Ok(Some(row_nums)) = storage.lookup_index(&idx_name, val) {
+                    storage.read_rows_by_numbers(table_name, &row_nums).map_err(|e| e.to_string())?
                 } else {
                     storage.read_rows(table_name).map_err(|e| e.to_string())?
                 }
@@ -188,11 +188,21 @@ fn execute_select_to_string(
 }
 
 fn eval_condition(cond: &parser::Condition, row: &[Value], cols: &[(String, String)]) -> bool {
-    let left = resolve_expr(&cond.left, row, cols);
-    let right = resolve_expr(&cond.right, row, cols);
-    match (left, right) {
-        (Some(l), Some(r)) => compare(&l, &cond.operator, &r),
-        _ => false,
+    match cond {
+        parser::Condition::And(left, right) => {
+            eval_condition(left, row, cols) && eval_condition(right, row, cols)
+        }
+        parser::Condition::Or(left, right) => {
+            eval_condition(left, row, cols) || eval_condition(right, row, cols)
+        }
+        parser::Condition::Comparison { left, operator, right, .. } => {
+            let lv = resolve_expr(left, row, cols);
+            let rv = resolve_expr(right, row, cols);
+            match (lv, rv) {
+                (Some(l), Some(r)) => compare(&l, operator, &r),
+                _ => false,
+            }
+        }
     }
 }
 

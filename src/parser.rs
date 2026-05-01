@@ -227,12 +227,32 @@ pub enum JoinType {
 }
 
 #[derive(Debug, PartialEq, Clone)]
-pub struct Condition {
-    pub left: Expression,
-    pub operator: Operator,
-    pub right: Expression,
-    // upper bound for BETWEEN / NOT BETWEEN
-    pub upper_bound: Option<Expression>,
+pub enum Condition {
+    Comparison {
+        left: Expression,
+        operator: Operator,
+        right: Expression,
+        // upper bound for BETWEEN / NOT BETWEEN
+        upper_bound: Option<Expression>,
+    },
+    And(Box<Condition>, Box<Condition>),
+    Or(Box<Condition>, Box<Condition>),
+}
+
+#[cfg(test)]
+impl Condition {
+    pub fn left(&self) -> Expression {
+        if let Condition::Comparison { left, .. } = self { left.clone() } else { panic!("not a comparison") }
+    }
+    pub fn right(&self) -> Expression {
+        if let Condition::Comparison { right, .. } = self { right.clone() } else { panic!("not a comparison") }
+    }
+    pub fn operator(&self) -> Operator {
+        if let Condition::Comparison { operator, .. } = self { operator.clone() } else { panic!("not a comparison") }
+    }
+    pub fn upper_bound(&self) -> Option<Expression> {
+        if let Condition::Comparison { upper_bound, .. } = self { upper_bound.clone() } else { None }
+    }
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -949,7 +969,7 @@ fn parse_limit_clause(input: &str) -> IResult<&str, Option<u64>> {
 
 /// Check if identifier is a reserved keyword that can't be used as an alias
 fn is_reserved_keyword(s: &str) -> bool {
-    matches!(s.to_uppercase().as_str(), "ON" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "WHERE" | "ORDER" | "GROUP" | "LIMIT" | "HAVING" | "UNION" | "ALL" | "CASE" | "WHEN" | "THEN" | "ELSE" | "END")
+    matches!(s.to_uppercase().as_str(), "ON" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "WHERE" | "ORDER" | "GROUP" | "LIMIT" | "HAVING" | "UNION" | "ALL" | "CASE" | "WHEN" | "THEN" | "ELSE" | "END" | "AND" | "OR")
 }
 
 /// Parse optional table alias, rejecting reserved keywords
@@ -988,9 +1008,55 @@ pub fn parse_join(input: &str) -> IResult<&str, JoinClause> {
     }))
 }
 
-/// Parse condition: EXISTS/NOT EXISTS, expression IN/NOT IN, or expression op expression
+/// Parse condition with OR (lowest precedence), AND, then a primary comparison
 pub fn parse_condition(input: &str) -> IResult<&str, Condition> {
+    let (mut input, mut cond) = parse_and_condition(input)?;
+    loop {
+        let (i, _) = multispace0(input)?;
+        match tag_no_case::<&str, &str, nom::error::Error<&str>>("OR")(i) {
+            Ok((i, _)) if i.starts_with(' ') || i.starts_with('\t') || i.starts_with('\n') || i.starts_with('(') => {
+                let (i, _) = multispace0(i)?;
+                let (i, right) = parse_and_condition(i)?;
+                cond = Condition::Or(Box::new(cond), Box::new(right));
+                input = i;
+            }
+            _ => break,
+        }
+    }
+    Ok((input, cond))
+}
+
+fn parse_and_condition(input: &str) -> IResult<&str, Condition> {
+    let (mut input, mut cond) = parse_primary_condition(input)?;
+    loop {
+        let (i, _) = multispace0(input)?;
+        // "AND" inside BETWEEN is consumed by parse_primary_condition, so any "AND" here is logical
+        match tag_no_case::<&str, &str, nom::error::Error<&str>>("AND")(i) {
+            Ok((i, _)) if i.starts_with(' ') || i.starts_with('\t') || i.starts_with('\n') || i.starts_with('(') => {
+                let (i, _) = multispace0(i)?;
+                let (i, right) = parse_primary_condition(i)?;
+                cond = Condition::And(Box::new(cond), Box::new(right));
+                input = i;
+            }
+            _ => break,
+        }
+    }
+    Ok((input, cond))
+}
+
+/// Parse a single comparison or a parenthesized condition group
+fn parse_primary_condition(input: &str) -> IResult<&str, Condition> {
     let (input, _) = multispace0(input)?;
+
+    // Parenthesized sub-condition: (cond AND/OR cond ...)
+    if let Ok((input, _)) = nom_char::<&str, nom::error::Error<&str>>('(')(input) {
+        // Only treat as parenthesized condition if it doesn't look like EXISTS(SELECT
+        let (input, _) = multispace0(input)?;
+        let (input, inner) = parse_condition(input)?;
+        let (input, _) = multispace0(input)?;
+        let (input, _) = nom_char(')')(input)?;
+        return Ok((input, inner));
+    }
 
     // Try NOT EXISTS (SELECT ...)
     if let Ok((input, _)) = nom::sequence::pair(
@@ -1003,7 +1069,7 @@ pub fn parse_condition(input: &str) -> IResult<&str, Condition> {
         let (input, subquery) = parse_select_statement(input)?;
         let (input, _) = multispace0(input)?;
         let (input, _) = nom_char(')')(input)?;
-        return Ok((input, Condition {
+        return Ok((input, Condition::Comparison {
             left: Expression::Literal(Value::Null),
             operator: Operator::NotExists,
             right: Expression::Subquery(Box::new(subquery)),
@@ -1019,7 +1085,7 @@ pub fn parse_condition(input: &str) -> IResult<&str, Condition> {
         let (input, subquery) = parse_select_statement(input)?;
         let (input, _) = multispace0(input)?;
         let (input, _) = nom_char(')')(input)?;
-        return Ok((input, Condition {
+        return Ok((input, Condition::Comparison {
             left: Expression::Literal(Value::Null),
             operator: Operator::Exists,
             right: Expression::Subquery(Box::new(subquery)),
@@ -1037,7 +1103,7 @@ pub fn parse_condition(input: &str) -> IResult<&str, Condition> {
             tag::<&str, &str, nom::error::Error<&str>>("NOT"),
             nom::sequence::preceded(multispace1::<&str, nom::error::Error<&str>>, tag_no_case("NULL")),
         )(input) {
-            return Ok((input, Condition {
+            return Ok((input, Condition::Comparison {
                 left,
                 operator: Operator::IsNotNull,
                 right: Expression::Literal(Value::Null),
@@ -1045,7 +1111,7 @@ pub fn parse_condition(input: &str) -> IResult<&str, Condition> {
             }));
         }
         let (input, _) = tag_no_case("NULL")(input)?;
-        return Ok((input, Condition {
+        return Ok((input, Condition::Comparison {
             left,
             operator: Operator::IsNull,
             right: Expression::Literal(Value::Null),
@@ -1064,7 +1130,7 @@ pub fn parse_condition(input: &str) -> IResult<&str, Condition> {
         let (input, subquery) = parse_select_statement(input)?;
         let (input, _) = multispace0(input)?;
         let (input, _) = nom_char(')')(input)?;
-        return Ok((input, Condition {
+        return Ok((input, Condition::Comparison {
             left,
             operator: Operator::NotIn,
             right: Expression::Subquery(Box::new(subquery)),
@@ -1078,7 +1144,7 @@ pub fn parse_condition(input: &str) -> IResult<&str, Condition> {
         let (input, subquery) = parse_select_statement(input)?;
         let (input, _) = multispace0(input)?;
         let (input, _) = nom_char(')')(input)?;
-        return Ok((input, Condition {
+        return Ok((input, Condition::Comparison {
             left,
             operator: Operator::In,
             right: Expression::Subquery(Box::new(subquery)),
@@ -1097,7 +1163,7 @@ pub fn parse_condition(input: &str) -> IResult<&str, Condition> {
         let (input, _) = tag_no_case("AND")(input)?;
         let (input, _) = multispace1(input)?;
         let (input, high) = parse_expression(input)?;
-        return Ok((input, Condition {
+        return Ok((input, Condition::Comparison {
             left,
             operator: Operator::NotBetween,
             right: low,
@@ -1113,7 +1179,7 @@ pub fn parse_condition(input: &str) -> IResult<&str, Condition> {
         let (input, _) = tag_no_case("AND")(input)?;
         let (input, _) = multispace1(input)?;
         let (input, high) = parse_expression(input)?;
-        return Ok((input, Condition {
+        return Ok((input, Condition::Comparison {
             left,
             operator: Operator::Between,
             right: low,
@@ -1125,7 +1191,7 @@ pub fn parse_condition(input: &str) -> IResult<&str, Condition> {
     let (input, _) = multispace0(input)?;
     let (input, right) = parse_expression(input)?;
 
-    Ok((input, Condition { left, operator, right, upper_bound: None }))
+    Ok((input, Condition::Comparison { left, operator, right, upper_bound: None }))
 }
 
 /// Try to parse an arithmetic operator surrounded by optional whitespace
@@ -1545,12 +1611,12 @@ mod tests {
             SqlStatement::Select(sel) => {
                 assert!(sel.where_clause.is_some());
                 let where_clause = sel.where_clause.unwrap();
-                match where_clause.condition.left {
+                match where_clause.condition.left() {
                     Expression::Column(name) => assert_eq!(name, "id"),
                     _ => panic!("Expected Column expression"),
                 }
-                assert_eq!(where_clause.condition.operator, Operator::Equals);
-                match where_clause.condition.right {
+                assert_eq!(where_clause.condition.operator(), Operator::Equals);
+                match where_clause.condition.right() {
                     Expression::Literal(Value::Int(1)) => {},
                     _ => panic!("Expected Int literal"),
                 }
@@ -1567,7 +1633,7 @@ mod tests {
         match stmt {
             SqlStatement::Select(sel) => {
                 let where_clause = sel.where_clause.unwrap();
-                match where_clause.condition.right {
+                match where_clause.condition.right() {
                     Expression::Literal(Value::String(s)) => assert_eq!(s, "Alice"),
                     _ => panic!("Expected String literal"),
                 }
@@ -1593,7 +1659,7 @@ mod tests {
             match stmt {
                 SqlStatement::Select(sel) => {
                     let where_clause = sel.where_clause.unwrap();
-                    assert_eq!(where_clause.condition.operator, expected_op);
+                    assert_eq!(where_clause.condition.operator(), expected_op);
                 }
                 _ => panic!("Expected Select"),
             }
@@ -1616,7 +1682,7 @@ mod tests {
                 let join = &sel.joins[0];
                 assert_eq!(join.table, "orders");
                 assert_eq!(join.join_type, JoinType::Inner);
-                match &join.on.left {
+                match &join.on.left() {
                     Expression::QualifiedColumn(table, col) => {
                         assert_eq!(table, "users");
                         assert_eq!(col, "id");
@@ -1845,7 +1911,7 @@ mod tests {
                 assert_eq!(del.table_name, "users");
                 assert!(del.where_clause.is_some());
                 let wc = del.where_clause.unwrap();
-                match wc.condition.left {
+                match wc.condition.left() {
                     Expression::Column(name) => assert_eq!(name, "id"),
                     _ => panic!("Expected Column"),
                 }
@@ -1890,7 +1956,7 @@ mod tests {
         match stmt {
             SqlStatement::Delete(del) => {
                 let wc = del.where_clause.unwrap();
-                match wc.condition.right {
+                match wc.condition.right() {
                     Expression::Literal(Value::String(s)) => assert_eq!(s, "Bob"),
                     _ => panic!("Expected String literal"),
                 }
@@ -2187,14 +2253,14 @@ mod tests {
             SqlStatement::Select(sel) => {
                 assert_eq!(sel.group_by.len(), 1);
                 let having = sel.having.expect("HAVING clause");
-                assert_eq!(having.condition.operator, Operator::GreaterThan);
-                match having.condition.left {
+                assert_eq!(having.condition.operator(), Operator::GreaterThan);
+                match having.condition.left() {
                     Expression::Aggregate(AggregateFunc::Count, ref inner) => {
                         assert_eq!(**inner, SelectColumn::All);
                     }
                     other => panic!("expected COUNT(*) aggregate, got {:?}", other),
                 }
-                assert_eq!(having.condition.right, Expression::Literal(Value::Int(1)));
+                assert_eq!(having.condition.right(), Expression::Literal(Value::Int(1)));
             }
             _ => panic!("Expected Select"),
         }
@@ -2208,13 +2274,13 @@ mod tests {
         match stmt {
             SqlStatement::Select(sel) => {
                 let having = sel.having.expect("HAVING clause");
-                match having.condition.left {
+                match having.condition.left() {
                     Expression::Aggregate(AggregateFunc::Sum, ref inner) => {
                         assert_eq!(**inner, SelectColumn::Column("salary".to_string()));
                     }
                     other => panic!("expected SUM(salary), got {:?}", other),
                 }
-                assert_eq!(having.condition.right, Expression::Literal(Value::Int(100000)));
+                assert_eq!(having.condition.right(), Expression::Literal(Value::Int(100000)));
             }
             _ => panic!("Expected Select"),
         }
@@ -2298,8 +2364,8 @@ mod tests {
         match stmt {
             SqlStatement::Select(sel) => {
                 let wc = sel.where_clause.unwrap();
-                assert_eq!(wc.condition.operator, Operator::Like);
-                match &wc.condition.right {
+                assert_eq!(wc.condition.operator(), Operator::Like);
+                match &wc.condition.right() {
                     Expression::Literal(Value::String(s)) => assert_eq!(s, "A%"),
                     _ => panic!("Expected string literal"),
                 }
@@ -2316,7 +2382,7 @@ mod tests {
         match stmt {
             SqlStatement::Select(sel) => {
                 let wc = sel.where_clause.unwrap();
-                assert_eq!(wc.condition.operator, Operator::Like);
+                assert_eq!(wc.condition.operator(), Operator::Like);
             }
             _ => panic!("Expected Select"),
         }
@@ -2330,12 +2396,12 @@ mod tests {
         match stmt {
             SqlStatement::Select(sel) => {
                 let wc = sel.where_clause.unwrap();
-                assert_eq!(wc.condition.operator, Operator::In);
-                match &wc.condition.left {
+                assert_eq!(wc.condition.operator(), Operator::In);
+                match &wc.condition.left() {
                     Expression::Column(name) => assert_eq!(name, "id"),
                     _ => panic!("Expected column"),
                 }
-                match &wc.condition.right {
+                match &wc.condition.right() {
                     Expression::Subquery(sub) => {
                         assert_eq!(sub.from, FromClause::Table("orders".to_string()));
                         assert_eq!(sub.columns.len(), 1);
@@ -2355,8 +2421,8 @@ mod tests {
         match stmt {
             SqlStatement::Select(sel) => {
                 let wc = sel.where_clause.unwrap();
-                assert_eq!(wc.condition.operator, Operator::In);
-                match &wc.condition.right {
+                assert_eq!(wc.condition.operator(), Operator::In);
+                match &wc.condition.right() {
                     Expression::Subquery(sub) => {
                         assert!(sub.where_clause.is_some());
                     }
@@ -2375,8 +2441,8 @@ mod tests {
         match stmt {
             SqlStatement::Select(sel) => {
                 let wc = sel.where_clause.unwrap();
-                assert_eq!(wc.condition.operator, Operator::Equals);
-                match &wc.condition.right {
+                assert_eq!(wc.condition.operator(), Operator::Equals);
+                match &wc.condition.right() {
                     Expression::Subquery(sub) => {
                         assert_eq!(sub.from, FromClause::Table("users".to_string()));
                     }
@@ -2395,8 +2461,8 @@ mod tests {
         match stmt {
             SqlStatement::Select(sel) => {
                 let wc = sel.where_clause.unwrap();
-                assert_eq!(wc.condition.operator, Operator::GreaterThan);
-                match &wc.condition.right {
+                assert_eq!(wc.condition.operator(), Operator::GreaterThan);
+                match &wc.condition.right() {
                     Expression::Subquery(sub) => {
                         assert_eq!(sub.from, FromClause::Table("products".to_string()));
                     }
@@ -2415,7 +2481,7 @@ mod tests {
         match stmt {
             SqlStatement::Select(sel) => {
                 let wc = sel.where_clause.unwrap();
-                assert_eq!(wc.condition.operator, Operator::NotIn);
+                assert_eq!(wc.condition.operator(), Operator::NotIn);
             }
             _ => panic!("Expected Select"),
         }
@@ -2429,8 +2495,8 @@ mod tests {
         match stmt {
             SqlStatement::Select(sel) => {
                 let wc = sel.where_clause.unwrap();
-                assert_eq!(wc.condition.operator, Operator::Exists);
-                match &wc.condition.right {
+                assert_eq!(wc.condition.operator(), Operator::Exists);
+                match &wc.condition.right() {
                     Expression::Subquery(sub) => {
                         assert_eq!(sub.from, FromClause::Table("orders".to_string()));
                     }
@@ -2449,7 +2515,7 @@ mod tests {
         match stmt {
             SqlStatement::Select(sel) => {
                 let wc = sel.where_clause.unwrap();
-                assert_eq!(wc.condition.operator, Operator::NotExists);
+                assert_eq!(wc.condition.operator(), Operator::NotExists);
             }
             _ => panic!("Expected Select"),
         }
@@ -2462,8 +2528,8 @@ mod tests {
         match stmt {
             SqlStatement::Select(sel) => {
                 let wc = sel.where_clause.unwrap();
-                assert_eq!(wc.condition.operator, Operator::IsNull);
-                assert_eq!(wc.condition.left, Expression::Column("email".to_string()));
+                assert_eq!(wc.condition.operator(), Operator::IsNull);
+                assert_eq!(wc.condition.left(), Expression::Column("email".to_string()));
             }
             _ => panic!("Expected Select"),
         }
@@ -2476,8 +2542,8 @@ mod tests {
         match stmt {
             SqlStatement::Select(sel) => {
                 let wc = sel.where_clause.unwrap();
-                assert_eq!(wc.condition.operator, Operator::IsNotNull);
-                assert_eq!(wc.condition.left, Expression::Column("email".to_string()));
+                assert_eq!(wc.condition.operator(), Operator::IsNotNull);
+                assert_eq!(wc.condition.left(), Expression::Column("email".to_string()));
             }
             _ => panic!("Expected Select"),
         }
@@ -2586,10 +2652,10 @@ mod tests {
         match stmt {
             SqlStatement::Select(sel) => {
                 let wc = sel.where_clause.unwrap();
-                assert_eq!(wc.condition.operator, Operator::Between);
-                assert_eq!(wc.condition.left, Expression::Column("age".to_string()));
-                assert_eq!(wc.condition.right, Expression::Literal(Value::Int(18)));
-                assert_eq!(wc.condition.upper_bound, Some(Expression::Literal(Value::Int(65))));
+                assert_eq!(wc.condition.operator(), Operator::Between);
+                assert_eq!(wc.condition.left(), Expression::Column("age".to_string()));
+                assert_eq!(wc.condition.right(), Expression::Literal(Value::Int(18)));
+                assert_eq!(wc.condition.upper_bound(), Some(Expression::Literal(Value::Int(65))));
             }
             _ => panic!("Expected Select"),
         }
@@ -2602,8 +2668,75 @@ mod tests {
         match stmt {
             SqlStatement::Select(sel) => {
                 let wc = sel.where_clause.unwrap();
-                assert_eq!(wc.condition.operator, Operator::NotBetween);
-                assert_eq!(wc.condition.upper_bound, Some(Expression::Literal(Value::Int(65))));
+                assert_eq!(wc.condition.operator(), Operator::NotBetween);
+                assert_eq!(wc.condition.upper_bound(), Some(Expression::Literal(Value::Int(65))));
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_and_condition() {
+        let sql = "SELECT * FROM users WHERE age > 18 AND name = 'Alice';";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                let wc = sel.where_clause.unwrap();
+                assert!(matches!(wc.condition, Condition::And(_, _)));
+                if let Condition::And(left, right) = wc.condition {
+                    assert_eq!(left.operator(), Operator::GreaterThan);
+                    assert_eq!(right.operator(), Operator::Equals);
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_or_condition() {
+        let sql = "SELECT * FROM users WHERE age < 10 OR age > 90;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                let wc = sel.where_clause.unwrap();
+                assert!(matches!(wc.condition, Condition::Or(_, _)));
+                if let Condition::Or(left, right) = wc.condition {
+                    assert_eq!(left.operator(), Operator::LessThan);
+                    assert_eq!(right.operator(), Operator::GreaterThan);
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_and_or_precedence() {
+        // AND binds tighter: a=1 OR b=2 AND c=3 → a=1 OR (b=2 AND c=3)
+        let sql = "SELECT * FROM users WHERE a = 1 OR b = 2 AND c = 3;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                let wc = sel.where_clause.unwrap();
+                assert!(matches!(wc.condition, Condition::Or(_, _)));
+                if let Condition::Or(_, right) = wc.condition {
+                    assert!(matches!(*right, Condition::And(_, _)));
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_parenthesized_condition() {
+        let sql = "SELECT * FROM users WHERE (a = 1 OR b = 2) AND c = 3;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                let wc = sel.where_clause.unwrap();
+                assert!(matches!(wc.condition, Condition::And(_, _)));
+                if let Condition::And(left, _) = wc.condition {
+                    assert!(matches!(*left, Condition::Or(_, _)));
+                }
             }
             _ => panic!("Expected Select"),
         }
@@ -2737,7 +2870,7 @@ mod tests {
         match stmt {
             SqlStatement::Select(sel) => {
                 let wc = sel.where_clause.unwrap();
-                match &wc.condition.right {
+                match &wc.condition.right() {
                     Expression::BinaryOp(_, ArithOp::Add, _) => {}
                     _ => panic!("Expected BinaryOp Add"),
                 }
@@ -2754,7 +2887,7 @@ mod tests {
         match stmt {
             SqlStatement::Select(sel) => {
                 let wc = sel.where_clause.unwrap();
-                match &wc.condition.right {
+                match &wc.condition.right() {
                     Expression::BinaryOp(_, ArithOp::Mul, _) => {}
                     _ => panic!("Expected BinaryOp Mul"),
                 }
@@ -2772,7 +2905,7 @@ mod tests {
         match stmt {
             SqlStatement::Select(sel) => {
                 let wc = sel.where_clause.unwrap();
-                match &wc.condition.right {
+                match &wc.condition.right() {
                     Expression::BinaryOp(left, ArithOp::Add, right) => {
                         assert_eq!(**left, Expression::Literal(Value::Int(1)));
                         match right.as_ref() {
@@ -2872,7 +3005,7 @@ mod tests {
         match stmt {
             SqlStatement::Select(sel) => {
                 let wc = sel.where_clause.unwrap();
-                match &wc.condition.right {
+                match &wc.condition.right() {
                     Expression::Literal(Value::Float(n)) => {
                         assert!((*n - 3.14).abs() < 0.001);
                     }
@@ -2926,7 +3059,7 @@ mod tests {
         match stmt {
             SqlStatement::Select(sel) => {
                 let wc = sel.where_clause.unwrap();
-                assert_eq!(wc.condition.right, Expression::Literal(Value::Bool(false)));
+                assert_eq!(wc.condition.right(), Expression::Literal(Value::Bool(false)));
             }
             _ => panic!("Expected Select"),
         }

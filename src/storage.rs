@@ -1184,27 +1184,36 @@ fn validate_timestamp_format(s: &str, column_name: &str) -> Result<(), StorageEr
 
 /// Evaluate a WHERE condition against a row
 fn evaluate_condition(condition: &Condition, row: &[Value], schema: &[ColumnDefinition]) -> bool {
-    if condition.operator == Operator::IsNull || condition.operator == Operator::IsNotNull {
-        let left_val = resolve_expression(&condition.left, row, schema);
-        let is_null = matches!(left_val, Some(Value::Null) | None);
-        return if condition.operator == Operator::IsNull { is_null } else { !is_null };
-    }
+    match condition {
+        Condition::And(left, right) => {
+            evaluate_condition(left, row, schema) && evaluate_condition(right, row, schema)
+        }
+        Condition::Or(left, right) => {
+            evaluate_condition(left, row, schema) || evaluate_condition(right, row, schema)
+        }
+        Condition::Comparison { left, operator, right, upper_bound } => {
+            if *operator == Operator::IsNull || *operator == Operator::IsNotNull {
+                let left_val = resolve_expression(left, row, schema);
+                let is_null = matches!(left_val, Some(Value::Null) | None);
+                return if *operator == Operator::IsNull { is_null } else { !is_null };
+            }
 
-    if condition.operator == Operator::Between || condition.operator == Operator::NotBetween {
-        let val = resolve_expression(&condition.left, row, schema);
-        let low = resolve_expression(&condition.right, row, schema);
-        let high = condition.upper_bound.as_ref().and_then(|e| resolve_expression(e, row, schema));
-        let in_range = matches!((&val, &low, &high), (Some(v), Some(l), Some(h))
-            if compare_values(v, &Operator::GreaterThanOrEqual, l) && compare_values(v, &Operator::LessThanOrEqual, h));
-        return if condition.operator == Operator::Between { in_range } else { !in_range };
-    }
+            if *operator == Operator::Between || *operator == Operator::NotBetween {
+                let val = resolve_expression(left, row, schema);
+                let low = resolve_expression(right, row, schema);
+                let high = upper_bound.as_ref().and_then(|e| resolve_expression(e, row, schema));
+                let in_range = matches!((&val, &low, &high), (Some(v), Some(l), Some(h))
+                    if compare_values(v, &Operator::GreaterThanOrEqual, l) && compare_values(v, &Operator::LessThanOrEqual, h));
+                return if *operator == Operator::Between { in_range } else { !in_range };
+            }
 
-    let left_val = resolve_expression(&condition.left, row, schema);
-    let right_val = resolve_expression(&condition.right, row, schema);
-
-    match (&left_val, &right_val) {
-        (Some(l), Some(r)) => compare_values(l, &condition.operator, r),
-        _ => false,
+            let left_val = resolve_expression(left, row, schema);
+            let right_val = resolve_expression(right, row, schema);
+            match (&left_val, &right_val) {
+                (Some(l), Some(r)) => compare_values(l, operator, r),
+                _ => false,
+            }
+        }
     }
 }
 
@@ -1743,7 +1752,7 @@ mod tests {
                 value: Value::String("Alice Updated".to_string()),
             }],
             where_clause: Some(WhereClause {
-                condition: Condition { upper_bound: None,
+                condition: Condition::Comparison { upper_bound: None,
                     left: Expression::Column("id".to_string()),
                     operator: Operator::Equals,
                     right: Expression::Literal(Value::Int(1)),
@@ -1796,7 +1805,7 @@ mod tests {
                 value: Value::Int(0),
             }],
             where_clause: Some(WhereClause {
-                condition: Condition { upper_bound: None,
+                condition: Condition::Comparison { upper_bound: None,
                     left: Expression::Column("active".to_string()),
                     operator: Operator::Equals,
                     right: Expression::Literal(Value::Int(1)),
@@ -1893,7 +1902,7 @@ mod tests {
                 value: Value::Int(99),
             }],
             where_clause: Some(WhereClause {
-                condition: Condition { upper_bound: None,
+                condition: Condition::Comparison { upper_bound: None,
                     left: Expression::Column("id".to_string()),
                     operator: Operator::Equals,
                     right: Expression::Literal(Value::Int(999)),
@@ -2006,7 +2015,7 @@ mod tests {
         let delete_stmt = DeleteStatement {
             table_name: "users".to_string(),
             where_clause: Some(WhereClause {
-                condition: Condition { upper_bound: None,
+                condition: Condition::Comparison { upper_bound: None,
                     left: Expression::Column("id".to_string()),
                     operator: Operator::Equals,
                     right: Expression::Literal(Value::Int(2)),
@@ -2056,7 +2065,7 @@ mod tests {
         let delete_stmt = DeleteStatement {
             table_name: "users".to_string(),
             where_clause: Some(WhereClause {
-                condition: Condition { upper_bound: None,
+                condition: Condition::Comparison { upper_bound: None,
                     left: Expression::Column("active".to_string()),
                     operator: Operator::Equals,
                     right: Expression::Literal(Value::Int(0)),
@@ -2144,7 +2153,7 @@ mod tests {
         let delete_stmt = DeleteStatement {
             table_name: "users".to_string(),
             where_clause: Some(WhereClause {
-                condition: Condition { upper_bound: None,
+                condition: Condition::Comparison { upper_bound: None,
                     left: Expression::Column("id".to_string()),
                     operator: Operator::Equals,
                     right: Expression::Literal(Value::Int(999)),
@@ -2441,7 +2450,7 @@ mod tests {
         let result = storage.delete_rows(&DeleteStatement {
             table_name: "users".to_string(),
             where_clause: Some(crate::parser::WhereClause {
-                condition: Condition { upper_bound: None,
+                condition: Condition::Comparison { upper_bound: None,
                     left: Expression::Column("id".to_string()),
                     operator: Operator::Equals,
                     right: Expression::Literal(Value::Int(1)),
@@ -2454,7 +2463,7 @@ mod tests {
         let result = storage.delete_rows(&DeleteStatement {
             table_name: "users".to_string(),
             where_clause: Some(crate::parser::WhereClause {
-                condition: Condition { upper_bound: None,
+                condition: Condition::Comparison { upper_bound: None,
                     left: Expression::Column("id".to_string()),
                     operator: Operator::Equals,
                     right: Expression::Literal(Value::Int(2)),
@@ -2667,7 +2676,7 @@ mod tests {
         storage.delete_rows(&DeleteStatement {
             table_name: "users".to_string(),
             where_clause: Some(WhereClause {
-                condition: Condition { upper_bound: None,
+                condition: Condition::Comparison { upper_bound: None,
                     left: Expression::Column("name".to_string()),
                     operator: Operator::Equals,
                     right: Expression::Literal(Value::String("Alice".to_string())),

@@ -195,6 +195,7 @@ fn eval_condition(cond: &parser::Condition, row: &[Value], cols: &[(String, Stri
         parser::Condition::Or(left, right) => {
             eval_condition(left, row, cols) || eval_condition(right, row, cols)
         }
+        parser::Condition::Not(inner) => !eval_condition(inner, row, cols),
         parser::Condition::Comparison { left, operator, right, .. } => {
             let lv = resolve_expr(left, row, cols);
             let rv = resolve_expr(right, row, cols);

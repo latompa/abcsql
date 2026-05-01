@@ -237,6 +237,7 @@ pub enum Condition {
     },
     And(Box<Condition>, Box<Condition>),
     Or(Box<Condition>, Box<Condition>),
+    Not(Box<Condition>),
 }
 
 #[cfg(test)]
@@ -969,7 +970,7 @@ fn parse_limit_clause(input: &str) -> IResult<&str, Option<u64>> {
 
 /// Check if identifier is a reserved keyword that can't be used as an alias
 fn is_reserved_keyword(s: &str) -> bool {
-    matches!(s.to_uppercase().as_str(), "ON" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "WHERE" | "ORDER" | "GROUP" | "LIMIT" | "HAVING" | "UNION" | "ALL" | "CASE" | "WHEN" | "THEN" | "ELSE" | "END" | "AND" | "OR")
+    matches!(s.to_uppercase().as_str(), "ON" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "WHERE" | "ORDER" | "GROUP" | "LIMIT" | "HAVING" | "UNION" | "ALL" | "CASE" | "WHEN" | "THEN" | "ELSE" | "END" | "AND" | "OR" | "NOT")
 }
 
 /// Parse optional table alias, rejecting reserved keywords
@@ -1027,14 +1028,14 @@ pub fn parse_condition(input: &str) -> IResult<&str, Condition> {
 }
 
 fn parse_and_condition(input: &str) -> IResult<&str, Condition> {
-    let (mut input, mut cond) = parse_primary_condition(input)?;
+    let (mut input, mut cond) = parse_not_condition(input)?;
     loop {
         let (i, _) = multispace0(input)?;
         // "AND" inside BETWEEN is consumed by parse_primary_condition, so any "AND" here is logical
         match tag_no_case::<&str, &str, nom::error::Error<&str>>("AND")(i) {
             Ok((i, _)) if i.starts_with(' ') || i.starts_with('\t') || i.starts_with('\n') || i.starts_with('(') => {
                 let (i, _) = multispace0(i)?;
-                let (i, right) = parse_primary_condition(i)?;
+                let (i, right) = parse_not_condition(i)?;
                 cond = Condition::And(Box::new(cond), Box::new(right));
                 input = i;
             }
@@ -1042,6 +1043,26 @@ fn parse_and_condition(input: &str) -> IResult<&str, Condition> {
         }
     }
     Ok((input, cond))
+}
+
+fn parse_not_condition(input: &str) -> IResult<&str, Condition> {
+    let (input, _) = multispace0(input)?;
+
+    // Logical NOT — but NOT EXISTS is handled inside parse_primary_condition,
+    // so skip if "NOT" is followed (after whitespace) by "EXISTS".
+    if let Ok((after_not, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("NOT")(input) {
+        let sep = after_not.starts_with(' ') || after_not.starts_with('\t')
+            || after_not.starts_with('\n') || after_not.starts_with('(');
+        let trimmed = after_not.trim_start();
+        let is_exists = trimmed.to_uppercase().starts_with("EXISTS");
+        if sep && !is_exists {
+            let (after_not, _) = multispace0(after_not)?;
+            let (after_not, inner) = parse_not_condition(after_not)?;
+            return Ok((after_not, Condition::Not(Box::new(inner))));
+        }
+    }
+
+    parse_primary_condition(input)
 }
 
 /// Parse a single comparison or a parenthesized condition group
@@ -2737,6 +2758,52 @@ mod tests {
                 if let Condition::And(left, _) = wc.condition {
                     assert!(matches!(*left, Condition::Or(_, _)));
                 }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_not_simple() {
+        let sql = "SELECT * FROM users WHERE NOT active = 1;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                let wc = sel.where_clause.unwrap();
+                assert!(matches!(wc.condition, Condition::Not(_)));
+                if let Condition::Not(inner) = wc.condition {
+                    assert_eq!(inner.operator(), Operator::Equals);
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_not_parenthesized() {
+        let sql = "SELECT * FROM users WHERE NOT (age > 18 AND active = 1);";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                let wc = sel.where_clause.unwrap();
+                assert!(matches!(wc.condition, Condition::Not(_)));
+                if let Condition::Not(inner) = wc.condition {
+                    assert!(matches!(*inner, Condition::And(_, _)));
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_not_exists_unaffected() {
+        // NOT EXISTS should still parse as a Comparison, not a Not(Exists(...))
+        let sql = "SELECT * FROM users WHERE NOT EXISTS (SELECT id FROM orders WHERE user_id = 1);";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                let wc = sel.where_clause.unwrap();
+                assert_eq!(wc.condition.operator(), Operator::NotExists);
             }
             _ => panic!("Expected Select"),
         }

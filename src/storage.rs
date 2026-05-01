@@ -1191,6 +1191,7 @@ fn evaluate_condition(condition: &Condition, row: &[Value], schema: &[ColumnDefi
         Condition::Or(left, right) => {
             evaluate_condition(left, row, schema) || evaluate_condition(right, row, schema)
         }
+        Condition::Not(inner) => !evaluate_condition(inner, row, schema),
         Condition::Comparison { left, operator, right, upper_bound } => {
             if *operator == Operator::IsNull || *operator == Operator::IsNotNull {
                 let left_val = resolve_expression(left, row, schema);

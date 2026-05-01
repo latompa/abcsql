@@ -1156,6 +1156,7 @@ fn evaluate_join_condition(
         parser::Condition::Or(left, right) => {
             evaluate_join_condition(left, row, cols, storage) || evaluate_join_condition(right, row, cols, storage)
         }
+        parser::Condition::Not(inner) => !evaluate_join_condition(inner, row, cols, storage),
         parser::Condition::Comparison { left, operator, right, upper_bound } => {
             if *operator == parser::Operator::IsNull || *operator == parser::Operator::IsNotNull {
                 let left_val = resolve_join_expression(left, row, cols, storage);
@@ -1219,6 +1220,7 @@ fn evaluate_having_condition(
         parser::Condition::Or(left, right) => {
             evaluate_having_condition(left, group, cols, storage) || evaluate_having_condition(right, group, cols, storage)
         }
+        parser::Condition::Not(inner) => !evaluate_having_condition(inner, group, cols, storage),
         parser::Condition::Comparison { left, operator, right, upper_bound } => {
             if *operator == parser::Operator::IsNull || *operator == parser::Operator::IsNotNull {
                 let left_val = resolve_having_expression(left, group, cols, storage);

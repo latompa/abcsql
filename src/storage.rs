@@ -134,19 +134,24 @@ impl Storage {
 
     /// Insert a row of data into a table
     pub fn insert_row(&self, stmt: &InsertStatement) -> Result<(), StorageError> {
+        let values = match &stmt.source {
+            crate::parser::InsertSource::Values(v) => v,
+            crate::parser::InsertSource::Select(_) => panic!("insert_row called with Select source — caller must resolve to values first"),
+        };
+
         // Load schema to validate the insert
         let schema = self.load_schema(&stmt.table_name)?;
 
         // Validate column count
-        if stmt.values.len() != schema.columns.len() {
+        if values.len() != schema.columns.len() {
             return Err(StorageError::ColumnCountMismatch {
                 expected: schema.columns.len(),
-                got: stmt.values.len(),
+                got: values.len(),
             });
         }
 
         // Build final values, filling in auto_increment where NULL is provided
-        let mut final_values = stmt.values.clone();
+        let mut final_values = values.clone();
         for (i, col_def) in schema.columns.iter().enumerate() {
             if col_def.auto_increment && final_values[i] == Value::Null {
                 let next_val = self.next_auto_increment(&stmt.table_name)?;
@@ -1534,22 +1539,22 @@ mod tests {
         // Insert data
         let insert_stmt = InsertStatement {
             table_name: "users".to_string(),
-            values: vec![
+            source: crate::parser::InsertSource::Values(vec![
                 Value::Int(1),
                 Value::String("Alice".to_string()),
                 Value::String("alice@example.com".to_string()),
-            ],
+            ]),
         };
         storage.insert_row(&insert_stmt).unwrap();
 
         // Insert more data
         let insert_stmt2 = InsertStatement {
             table_name: "users".to_string(),
-            values: vec![
+            source: crate::parser::InsertSource::Values(vec![
                 Value::Int(2),
                 Value::String("Bob".to_string()),
                 Value::String("bob@example.com".to_string()),
-            ],
+            ]),
         };
         storage.insert_row(&insert_stmt2).unwrap();
 
@@ -1589,11 +1594,11 @@ mod tests {
 
         let insert_stmt = InsertStatement {
             table_name: "products".to_string(),
-            values: vec![
+            source: crate::parser::InsertSource::Values(vec![
                 Value::Int(1),
                 Value::String("Widget".to_string()),
                 Value::Null,
-            ],
+            ]),
         };
         storage.insert_row(&insert_stmt).unwrap();
 
@@ -1623,7 +1628,7 @@ mod tests {
         // Try to insert with wrong number of columns
         let insert_stmt = InsertStatement {
             table_name: "test".to_string(),
-            values: vec![Value::Int(1)], // Missing one column
+            source: crate::parser::InsertSource::Values(vec![Value::Int(1)]), // Missing one column
         };
 
         let result = storage.insert_row(&insert_stmt);
@@ -1651,10 +1656,10 @@ mod tests {
         // Try to insert string into int column
         let insert_stmt = InsertStatement {
             table_name: "test".to_string(),
-            values: vec![
+            source: crate::parser::InsertSource::Values(vec![
                 Value::String("not a number".to_string()),
                 Value::String("Alice".to_string()),
-            ],
+            ]),
         };
 
         let result = storage.insert_row(&insert_stmt);
@@ -1713,11 +1718,11 @@ mod tests {
 
         let insert1 = crate::parser::InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Int(1), Value::String("Alice".to_string())],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(1), Value::String("Alice".to_string())]),
         };
         let insert2 = crate::parser::InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Int(2), Value::String("Bob".to_string())],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(2), Value::String("Bob".to_string())]),
         };
         storage.insert_row(&insert1).unwrap();
         storage.insert_row(&insert2).unwrap();
@@ -1770,7 +1775,7 @@ mod tests {
         for i in 1..=3 {
             let insert = crate::parser::InsertStatement {
                 table_name: "users".to_string(),
-                values: vec![Value::Int(i), Value::Int(1)],
+                source: crate::parser::InsertSource::Values(vec![Value::Int(i), Value::Int(1)]),
             };
             storage.insert_row(&insert).unwrap();
         }
@@ -1823,7 +1828,7 @@ mod tests {
         for i in 1..=3 {
             let insert = crate::parser::InsertStatement {
                 table_name: "users".to_string(),
-                values: vec![Value::Int(i), Value::String("old".to_string())],
+                source: crate::parser::InsertSource::Values(vec![Value::Int(i), Value::String("old".to_string())]),
             };
             storage.insert_row(&insert).unwrap();
         }
@@ -1868,7 +1873,7 @@ mod tests {
 
         let insert = crate::parser::InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Int(1)],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(1)]),
         };
         storage.insert_row(&insert).unwrap();
 
@@ -1984,7 +1989,7 @@ mod tests {
         for (id, name) in [(1, "Alice"), (2, "Bob"), (3, "Charlie")] {
             let insert = crate::parser::InsertStatement {
                 table_name: "users".to_string(),
-                values: vec![Value::Int(id), Value::String(name.to_string())],
+                source: crate::parser::InsertSource::Values(vec![Value::Int(id), Value::String(name.to_string())]),
             };
             storage.insert_row(&insert).unwrap();
         }
@@ -2034,7 +2039,7 @@ mod tests {
         for (id, active) in [(1, 1), (2, 0), (3, 1), (4, 0)] {
             let insert = crate::parser::InsertStatement {
                 table_name: "users".to_string(),
-                values: vec![Value::Int(id), Value::Int(active)],
+                source: crate::parser::InsertSource::Values(vec![Value::Int(id), Value::Int(active)]),
             };
             storage.insert_row(&insert).unwrap();
         }
@@ -2084,7 +2089,7 @@ mod tests {
         for i in 1..=5 {
             let insert = crate::parser::InsertStatement {
                 table_name: "users".to_string(),
-                values: vec![Value::Int(i)],
+                source: crate::parser::InsertSource::Values(vec![Value::Int(i)]),
             };
             storage.insert_row(&insert).unwrap();
         }
@@ -2123,7 +2128,7 @@ mod tests {
 
         let insert = crate::parser::InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Int(1)],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(1)]),
         };
         storage.insert_row(&insert).unwrap();
 
@@ -2184,7 +2189,7 @@ mod tests {
 
         let insert = InsertStatement {
             table_name: "events".to_string(),
-            values: vec![Value::String("launch".to_string()), Value::String("2024-03-15".to_string())],
+            source: crate::parser::InsertSource::Values(vec![Value::String("launch".to_string()), Value::String("2024-03-15".to_string())]),
         };
         storage.insert_row(&insert).unwrap();
 
@@ -2194,9 +2199,9 @@ mod tests {
         // invalid date should fail
         let bad_insert = InsertStatement {
             table_name: "events".to_string(),
-            values: vec![Value::String("oops".to_string()), Value::String("not-a-date".to_string())],
+            source: crate::parser::InsertSource::Values(vec![Value::String("oops".to_string()), Value::String("not-a-date".to_string())]),
         };
-        assert!(bad_insert.values.len() == 2);
+        assert!(bad_insert.values().len() == 2);
         assert!(storage.insert_row(&bad_insert).is_err());
 
         fs::remove_dir_all(&temp_dir).unwrap();
@@ -2218,7 +2223,7 @@ mod tests {
 
         let insert = InsertStatement {
             table_name: "logs".to_string(),
-            values: vec![Value::String("hello".to_string()), Value::String("2024-03-15 14:30:00".to_string())],
+            source: crate::parser::InsertSource::Values(vec![Value::String("hello".to_string()), Value::String("2024-03-15 14:30:00".to_string())]),
         };
         storage.insert_row(&insert).unwrap();
 
@@ -2228,7 +2233,7 @@ mod tests {
         // invalid timestamp should fail
         let bad_insert = InsertStatement {
             table_name: "logs".to_string(),
-            values: vec![Value::String("bad".to_string()), Value::String("2024-03-15".to_string())],
+            source: crate::parser::InsertSource::Values(vec![Value::String("bad".to_string()), Value::String("2024-03-15".to_string())]),
         };
         assert!(storage.insert_row(&bad_insert).is_err());
 
@@ -2252,13 +2257,13 @@ mod tests {
         // Insert with NULL for auto_increment column
         let insert1 = InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Null, Value::String("Alice".to_string())],
+            source: crate::parser::InsertSource::Values(vec![Value::Null, Value::String("Alice".to_string())]),
         };
         storage.insert_row(&insert1).unwrap();
 
         let insert2 = InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Null, Value::String("Bob".to_string())],
+            source: crate::parser::InsertSource::Values(vec![Value::Null, Value::String("Bob".to_string())]),
         };
         storage.insert_row(&insert2).unwrap();
 
@@ -2269,7 +2274,7 @@ mod tests {
         // Can also supply an explicit value
         let insert3 = InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Int(10), Value::String("Charlie".to_string())],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(10), Value::String("Charlie".to_string())]),
         };
         storage.insert_row(&insert3).unwrap();
 
@@ -2295,21 +2300,21 @@ mod tests {
 
         let insert1 = InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Int(1), Value::String("Alice".to_string())],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(1), Value::String("Alice".to_string())]),
         };
         storage.insert_row(&insert1).unwrap();
 
         // Duplicate key should fail
         let insert2 = InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Int(1), Value::String("Bob".to_string())],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(1), Value::String("Bob".to_string())]),
         };
         assert!(matches!(storage.insert_row(&insert2), Err(StorageError::DuplicateKey { .. })));
 
         // Different key should succeed
         let insert3 = InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Int(2), Value::String("Bob".to_string())],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(2), Value::String("Bob".to_string())]),
         };
         storage.insert_row(&insert3).unwrap();
 
@@ -2333,7 +2338,7 @@ mod tests {
         // NULL primary key should fail
         let insert = InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Null, Value::String("Alice".to_string())],
+            source: crate::parser::InsertSource::Values(vec![Value::Null, Value::String("Alice".to_string())]),
         };
         assert!(matches!(storage.insert_row(&insert), Err(StorageError::NullConstraint { .. })));
 
@@ -2356,7 +2361,7 @@ mod tests {
         storage.create_table(&create_users).unwrap();
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Int(1), Value::String("Alice".to_string())],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(1), Value::String("Alice".to_string())]),
         }).unwrap();
 
         // Child table with FK
@@ -2373,13 +2378,13 @@ mod tests {
         // Valid FK reference
         storage.insert_row(&InsertStatement {
             table_name: "orders".to_string(),
-            values: vec![Value::Int(1), Value::Int(1)],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(1), Value::Int(1)]),
         }).unwrap();
 
         // Invalid FK reference should fail
         let result = storage.insert_row(&InsertStatement {
             table_name: "orders".to_string(),
-            values: vec![Value::Int(2), Value::Int(999)],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(2), Value::Int(999)]),
         });
         assert!(matches!(result, Err(StorageError::ForeignKeyViolation { .. })));
 
@@ -2402,11 +2407,11 @@ mod tests {
         storage.create_table(&create_users).unwrap();
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Int(1), Value::String("Alice".to_string())],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(1), Value::String("Alice".to_string())]),
         }).unwrap();
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Int(2), Value::String("Bob".to_string())],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(2), Value::String("Bob".to_string())]),
         }).unwrap();
 
         // Child table with FK
@@ -2421,7 +2426,7 @@ mod tests {
         storage.create_table(&create_orders).unwrap();
         storage.insert_row(&InsertStatement {
             table_name: "orders".to_string(),
-            values: vec![Value::Int(1), Value::Int(1)],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(1), Value::Int(1)]),
         }).unwrap();
 
         // Deleting referenced parent should fail
@@ -2471,13 +2476,13 @@ mod tests {
         // Valid insert
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Int(1), Value::String("Alice".to_string())],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(1), Value::String("Alice".to_string())]),
         }).unwrap();
 
         // NULL in NOT NULL column should fail
         let result = storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Int(2), Value::Null],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(2), Value::Null]),
         });
         assert!(matches!(result, Err(StorageError::NullConstraint { .. })));
 
@@ -2501,24 +2506,24 @@ mod tests {
 
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Int(1), Value::String("a@b.com".to_string())],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(1), Value::String("a@b.com".to_string())]),
         }).unwrap();
 
         // Duplicate unique value should fail
         let result = storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Int(2), Value::String("a@b.com".to_string())],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(2), Value::String("a@b.com".to_string())]),
         });
         assert!(matches!(result, Err(StorageError::DuplicateKey { .. })));
 
         // NULL values don't violate uniqueness
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Int(3), Value::Null],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(3), Value::Null]),
         }).unwrap();
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Int(4), Value::Null],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(4), Value::Null]),
         }).unwrap();
 
         fs::remove_dir_all(&temp_dir).unwrap();
@@ -2540,15 +2545,15 @@ mod tests {
 
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Int(1), Value::String("Alice".to_string())],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(1), Value::String("Alice".to_string())]),
         }).unwrap();
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Int(2), Value::String("Bob".to_string())],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(2), Value::String("Bob".to_string())]),
         }).unwrap();
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Int(3), Value::String("Alice".to_string())],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(3), Value::String("Alice".to_string())]),
         }).unwrap();
 
         // Create index on name column
@@ -2596,7 +2601,7 @@ mod tests {
 
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Int(1), Value::String("Alice".to_string())],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(1), Value::String("Alice".to_string())]),
         }).unwrap();
 
         storage.create_index(&CreateIndexStatement {
@@ -2609,7 +2614,7 @@ mod tests {
         // Insert another row — index should be rebuilt
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Int(2), Value::String("Bob".to_string())],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(2), Value::String("Bob".to_string())]),
         }).unwrap();
 
         let result = storage.lookup_index("idx_name", &Value::String("Bob".to_string())).unwrap();
@@ -2636,11 +2641,11 @@ mod tests {
 
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Int(1), Value::String("Alice".to_string())],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(1), Value::String("Alice".to_string())]),
         }).unwrap();
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Int(2), Value::String("Bob".to_string())],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(2), Value::String("Bob".to_string())]),
         }).unwrap();
 
         storage.create_index(&CreateIndexStatement {
@@ -2757,15 +2762,15 @@ mod tests {
 
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Int(1), Value::String("Alice".to_string())],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(1), Value::String("Alice".to_string())]),
         }).unwrap();
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Int(2), Value::String("Bob".to_string())],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(2), Value::String("Bob".to_string())]),
         }).unwrap();
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Int(3), Value::String("Charlie".to_string())],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(3), Value::String("Charlie".to_string())]),
         }).unwrap();
 
         // Read only rows 0 and 2
@@ -2793,7 +2798,7 @@ mod tests {
 
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Int(1), Value::String("a@b.com".to_string())],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(1), Value::String("a@b.com".to_string())]),
         }).unwrap();
 
         // Create unique index on email
@@ -2807,20 +2812,20 @@ mod tests {
         // Inserting a duplicate email should fail
         let result = storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Int(2), Value::String("a@b.com".to_string())],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(2), Value::String("a@b.com".to_string())]),
         });
         assert!(matches!(result, Err(StorageError::DuplicateKey { .. })));
 
         // Inserting a different email should succeed
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Int(3), Value::String("c@d.com".to_string())],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(3), Value::String("c@d.com".to_string())]),
         }).unwrap();
 
         // NULL should not violate unique index
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Int(4), Value::Null],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(4), Value::Null]),
         }).unwrap();
 
         fs::remove_dir_all(&temp_dir).unwrap();
@@ -2842,11 +2847,11 @@ mod tests {
 
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Int(1), Value::String("Alice".to_string())],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(1), Value::String("Alice".to_string())]),
         }).unwrap();
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Int(2), Value::String("Alice".to_string())],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(2), Value::String("Alice".to_string())]),
         }).unwrap();
 
         // Creating a unique index should fail because duplicates exist
@@ -2876,7 +2881,7 @@ mod tests {
         }).unwrap();
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Int(1), Value::String("Alice".to_string())],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(1), Value::String("Alice".to_string())]),
         }).unwrap();
 
         storage.alter_table(&AlterTableStatement {
@@ -2909,7 +2914,7 @@ mod tests {
         }).unwrap();
         storage.insert_row(&InsertStatement {
             table_name: "t".to_string(),
-            values: vec![Value::Int(1)],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(1)]),
         }).unwrap();
 
         let mut col = ColumnDefinition::new("required", DataType::Int);
@@ -2939,7 +2944,7 @@ mod tests {
         }).unwrap();
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Int(1), Value::String("Alice".to_string()), Value::Int(99)],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(1), Value::String("Alice".to_string()), Value::Int(99)]),
         }).unwrap();
 
         storage.alter_table(&AlterTableStatement {
@@ -3037,7 +3042,7 @@ mod tests {
         }).unwrap();
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            values: vec![Value::Int(1), Value::String("Alice".to_string())],
+            source: crate::parser::InsertSource::Values(vec![Value::Int(1), Value::String("Alice".to_string())]),
         }).unwrap();
 
         storage.alter_table(&AlterTableStatement {

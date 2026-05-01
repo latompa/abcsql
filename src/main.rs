@@ -155,9 +155,16 @@ fn execute_sql(sql: &str, storage: &Storage) {
             }
         }
         SqlStatement::Insert(insert_stmt) => {
-            match storage.insert_row(&insert_stmt) {
-                Ok(_) => println!("Inserted 1 row"),
-                Err(e) => eprintln!("Error: {}", e),
+            match &insert_stmt.source {
+                parser::InsertSource::Values(_) => {
+                    match storage.insert_row(&insert_stmt) {
+                        Ok(_) => println!("Inserted 1 row"),
+                        Err(e) => eprintln!("Error: {}", e),
+                    }
+                }
+                parser::InsertSource::Select(select_stmt) => {
+                    execute_insert_select(&insert_stmt.table_name, select_stmt, storage);
+                }
             }
         }
         SqlStatement::Select(select_stmt) => {
@@ -498,42 +505,81 @@ fn materialize_aggregate_cte(
     CteData { columns: result_cols, rows: result_rows }
 }
 
-fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) -> (Vec<String>, Vec<Vec<String>>) {
-    // Materialize CTEs
+fn execute_insert_select(table_name: &str, select: &parser::SelectStatement, storage: &Storage) {
     let mut cte_map: HashMap<String, CteData> = HashMap::new();
-    for cte in &stmt.ctes {
+    for cte in &select.ctes {
         let cte_data = materialize_cte(&cte.query, storage, &cte_map);
         cte_map.insert(cte.name.clone(), cte_data);
     }
 
-    // Load the FROM table (check CTEs first, handle subqueries)
-    // Use index hint if WHERE is a simple column = literal equality
-    let effective_from = from_name(&stmt.from, &stmt.from_alias);
-    let hint = extract_index_hint(&stmt.where_clause);
-    let hint_ref = hint.as_ref().map(|(c, v)| (c.as_str(), v));
-    let (from_cols, from_rows) = match load_from_with_index(&stmt.from, &effective_from, &cte_map, storage, hint_ref) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            return (Vec::new(), Vec::new());
+    let (combined_cols, filtered_rows) = match prepare_rows(select, storage, &cte_map) {
+        Some(r) => r,
+        None => return,
+    };
+
+    // Project each row according to the SELECT columns
+    let empty_storage = Storage::new("/dev/null").unwrap();
+    let project = |row: &Vec<Value>| -> Vec<Value> {
+        match select.columns.as_slice() {
+            [parser::SelectColumn::All] => row.clone(),
+            cols => cols.iter().filter_map(|col| {
+                match col {
+                    parser::SelectColumn::Column(_) | parser::SelectColumn::QualifiedColumn(_, _) => {
+                        resolve_column_index(col, &combined_cols).map(|i| row[i].clone())
+                    }
+                    parser::SelectColumn::Alias(inner, _) => {
+                        resolve_column_index(inner, &combined_cols).map(|i| row[i].clone())
+                    }
+                    parser::SelectColumn::Expr(expr) => {
+                        Some(resolve_join_expression(expr, row, &combined_cols, &empty_storage)
+                            .unwrap_or(Value::Null))
+                    }
+                    parser::SelectColumn::Aggregate(_, _) | parser::SelectColumn::All => None,
+                }
+            }).collect(),
         }
     };
 
-    // Build the combined column list and row set, starting with the FROM table
+    let mut count = 0usize;
+    for row in &filtered_rows {
+        let values = project(row);
+        let stmt = parser::InsertStatement {
+            table_name: table_name.to_string(),
+            source: parser::InsertSource::Values(values),
+        };
+        match storage.insert_row(&stmt) {
+            Ok(_) => count += 1,
+            Err(e) => { eprintln!("Error: {}", e); return; }
+        }
+    }
+    println!("Inserted {} row(s)", count);
+}
+
+/// Load, join, and filter rows for a SELECT statement.
+/// Returns (combined_cols, filtered_rows) or None on error.
+fn prepare_rows(
+    stmt: &parser::SelectStatement,
+    storage: &Storage,
+    cte_map: &HashMap<String, CteData>,
+) -> Option<(Vec<ResultColumn>, Vec<Vec<Value>>)> {
+    let effective_from = from_name(&stmt.from, &stmt.from_alias);
+    let hint = extract_index_hint(&stmt.where_clause);
+    let hint_ref = hint.as_ref().map(|(c, v)| (c.as_str(), v));
+    let (from_cols, from_rows) = match load_from_with_index(&stmt.from, &effective_from, cte_map, storage, hint_ref) {
+        Ok(r) => r,
+        Err(e) => { eprintln!("Error: {}", e); return None; }
+    };
+
     let from_alias = &effective_from;
     let mut combined_cols: Vec<ResultColumn> = from_cols.into_iter()
         .map(|c| ResultColumn { table: from_alias.to_string(), name: c.name })
         .collect();
     let mut combined_rows: Vec<Vec<Value>> = from_rows;
 
-    // Process each JOIN (check CTEs first)
     for join in &stmt.joins {
-        let (join_cols, join_rows) = match load_table(&join.table, &cte_map, storage) {
+        let (join_cols, join_rows) = match load_table(&join.table, cte_map, storage) {
             Ok(r) => r,
-            Err(e) => {
-                eprintln!("Error: {}", e);
-                return (Vec::new(), Vec::new());
-            }
+            Err(e) => { eprintln!("Error: {}", e); return None; }
         };
 
         let join_alias = join.alias.as_deref().unwrap_or(&join.table);
@@ -547,7 +593,6 @@ fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) -> (Vec<Str
         for left_row in &combined_rows {
             let mut matched = false;
             for right_row in &join_rows {
-                // Build a candidate combined row to evaluate the ON condition
                 let mut candidate: Vec<Value> = left_row.clone();
                 candidate.extend(right_row.iter().cloned());
 
@@ -561,7 +606,6 @@ fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) -> (Vec<Str
                     matched = true;
                 }
             }
-            // LEFT JOIN: include unmatched left rows with NULLs for right side
             if !matched && join.join_type == parser::JoinType::Left {
                 let mut row = left_row.clone();
                 row.extend(std::iter::repeat(Value::Null).take(join_result_cols.len()));
@@ -569,7 +613,6 @@ fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) -> (Vec<Str
             }
         }
 
-        // RIGHT JOIN: include unmatched right rows with NULLs for left side
         if join.join_type == parser::JoinType::Right {
             for right_row in &join_rows {
                 let has_match = combined_rows.iter().any(|left_row| {
@@ -593,15 +636,28 @@ fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) -> (Vec<Str
         combined_rows = new_rows;
     }
 
-    // Filter by WHERE clause
     let filtered_rows: Vec<Vec<Value>> = combined_rows.into_iter()
-        .filter(|row| {
-            match &stmt.where_clause {
-                Some(wc) => evaluate_join_condition(&wc.condition, row, &combined_cols, storage),
-                None => true,
-            }
+        .filter(|row| match &stmt.where_clause {
+            Some(wc) => evaluate_join_condition(&wc.condition, row, &combined_cols, storage),
+            None => true,
         })
         .collect();
+
+    Some((combined_cols, filtered_rows))
+}
+
+fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) -> (Vec<String>, Vec<Vec<String>>) {
+    // Materialize CTEs
+    let mut cte_map: HashMap<String, CteData> = HashMap::new();
+    for cte in &stmt.ctes {
+        let cte_data = materialize_cte(&cte.query, storage, &cte_map);
+        cte_map.insert(cte.name.clone(), cte_data);
+    }
+
+    let (combined_cols, filtered_rows) = match prepare_rows(stmt, storage, &cte_map) {
+        Some(r) => r,
+        None => return (Vec::new(), Vec::new()),
+    };
 
     // Check if any column is an aggregate or GROUP BY is present
     let has_aggregates = stmt.columns.iter().any(|c| matches!(c, parser::SelectColumn::Aggregate(_, _)));

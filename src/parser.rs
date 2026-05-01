@@ -98,7 +98,22 @@ pub enum DataType {
 #[derive(Debug, PartialEq, Clone)]
 pub struct InsertStatement {
     pub table_name: String,
-    pub values: Vec<Value>,
+    pub source: InsertSource,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum InsertSource {
+    Values(Vec<Value>),
+    Select(Box<SelectStatement>),
+}
+
+impl InsertStatement {
+    pub fn values(&self) -> &[Value] {
+        match &self.source {
+            InsertSource::Values(v) => v,
+            InsertSource::Select(_) => &[],
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -464,23 +479,36 @@ pub fn parse_insert(input: &str) -> IResult<&str, SqlStatement> {
     let (input, _) = tag_no_case("INTO")(input)?;
     let (input, _) = multispace1(input)?;
     let (input, table_name) = parse_identifier(input)?;
-    let (input, _) = multispace0(input)?;
-    let (input, _) = tag_no_case("VALUES")(input)?;
-    let (input, _) = multispace0(input)?;
-    let (input, values) = delimited(
-        nom_char('('),
-        separated_list0(
-            delimited(multispace0, nom_char(','), multispace0),
-            parse_value
-        ),
-        nom_char(')'),
-    )(input)?;
+    let (input, _) = multispace1(input)?;
+
+    // Try INSERT INTO ... SELECT first, then VALUES
+    let (input, source) = if let Ok((input, select)) = parse_select_statement(input) {
+        let (input, _) = multispace0(input)?;
+        let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
+        return Ok((input, SqlStatement::Insert(InsertStatement {
+            table_name: table_name.to_string(),
+            source: InsertSource::Select(Box::new(select)),
+        })));
+    } else {
+        let (input, _) = tag_no_case("VALUES")(input)?;
+        let (input, _) = multispace0(input)?;
+        let (input, values) = delimited(
+            nom_char('('),
+            separated_list0(
+                delimited(multispace0, nom_char(','), multispace0),
+                parse_value
+            ),
+            nom_char(')'),
+        )(input)?;
+        (input, InsertSource::Values(values))
+    };
+
     let (input, _) = multispace0(input)?;
     let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
-    
+
     Ok((input, SqlStatement::Insert(InsertStatement {
         table_name: table_name.to_string(),
-        values,
+        source,
     })))
 }
 
@@ -1308,7 +1336,7 @@ mod tests {
         match stmt {
             SqlStatement::Insert(ins) => {
                 assert_eq!(ins.table_name, "users");
-                assert_eq!(ins.values.len(), 2);
+                assert_eq!(ins.values().len(), 2);
             }
             _ => panic!("Expected Insert"),
         }
@@ -1386,10 +1414,10 @@ mod tests {
         match stmt {
             SqlStatement::Insert(ins) => {
                 assert_eq!(ins.table_name, "users");
-                assert_eq!(ins.values.len(), 3);
-                assert_eq!(ins.values[0], Value::Int(1));
-                assert_eq!(ins.values[1], Value::Null);
-                assert_eq!(ins.values[2], Value::String("test@example.com".to_string()));
+                assert_eq!(ins.values().len(), 3);
+                assert_eq!(ins.values()[0], Value::Int(1));
+                assert_eq!(ins.values()[1], Value::Null);
+                assert_eq!(ins.values()[2], Value::String("test@example.com".to_string()));
             }
             _ => panic!("Expected Insert"),
         }
@@ -1403,9 +1431,9 @@ mod tests {
         match stmt {
             SqlStatement::Insert(ins) => {
                 assert_eq!(ins.table_name, "users");
-                assert_eq!(ins.values.len(), 2);
-                assert_eq!(ins.values[0], Value::Int(42));
-                assert_eq!(ins.values[1], Value::String("Bob".to_string()));
+                assert_eq!(ins.values().len(), 2);
+                assert_eq!(ins.values()[0], Value::Int(42));
+                assert_eq!(ins.values()[1], Value::String("Bob".to_string()));
             }
             _ => panic!("Expected Insert"),
         }
@@ -1418,7 +1446,26 @@ mod tests {
         
         match stmt {
             SqlStatement::Insert(ins) => {
-                assert_eq!(ins.values[0], Value::Int(-100));
+                assert_eq!(ins.values()[0], Value::Int(-100));
+            }
+            _ => panic!("Expected Insert"),
+        }
+    }
+
+    #[test]
+    fn test_parse_insert_select() {
+        let sql = "INSERT INTO archive SELECT id, name FROM users WHERE active = TRUE;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Insert(ins) => {
+                assert_eq!(ins.table_name, "archive");
+                match &ins.source {
+                    InsertSource::Select(sel) => {
+                        assert_eq!(sel.from, FromClause::Table("users".to_string()));
+                        assert_eq!(sel.columns.len(), 2);
+                    }
+                    _ => panic!("Expected InsertSource::Select"),
+                }
             }
             _ => panic!("Expected Insert"),
         }
@@ -2682,7 +2729,7 @@ mod tests {
 
         match stmt {
             SqlStatement::Insert(ins) => {
-                assert_eq!(ins.values[0], Value::Float(3.14));
+                assert_eq!(ins.values()[0], Value::Float(3.14));
             }
             _ => panic!("Expected Insert"),
         }
@@ -2763,7 +2810,7 @@ mod tests {
         let (_, stmt) = parse_sql(sql).unwrap();
         match stmt {
             SqlStatement::Insert(ins) => {
-                assert_eq!(ins.values[0], Value::Bool(true));
+                assert_eq!(ins.values()[0], Value::Bool(true));
             }
             _ => panic!("Expected Insert"),
         }

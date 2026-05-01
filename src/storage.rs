@@ -1208,6 +1208,14 @@ fn evaluate_condition(condition: &Condition, row: &[Value], schema: &[ColumnDefi
                 return if *operator == Operator::Between { in_range } else { !in_range };
             }
 
+            if *operator == Operator::In || *operator == Operator::NotIn {
+                if let Expression::List(values) = right {
+                    let left_val = resolve_expression(left, row, schema);
+                    let contains = left_val.map_or(false, |lv| values.contains(&lv));
+                    return if *operator == Operator::In { contains } else { !contains };
+                }
+            }
+
             let left_val = resolve_expression(left, row, schema);
             let right_val = resolve_expression(right, row, schema);
             match (&left_val, &right_val) {
@@ -1234,6 +1242,7 @@ fn resolve_expression(expr: &Expression, row: &[Value], schema: &[ColumnDefiniti
                 .map(|idx| row[idx].clone())
         }
         Expression::Subquery(_) => None,
+        Expression::List(_) => None,
         Expression::BinaryOp(_, _, _) => None,
         Expression::Aggregate(_, _) => None,
         Expression::Case(branches, else_expr) => {

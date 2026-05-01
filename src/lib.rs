@@ -217,6 +217,7 @@ fn resolve_expr(expr: &parser::Expression, row: &[Value], cols: &[(String, Strin
             cols.iter().position(|c| c.0 == *table && c.1 == *col).map(|i| row[i].clone())
         }
         parser::Expression::Subquery(_) => None,
+        parser::Expression::List(_) => None,
         parser::Expression::BinaryOp(_, _, _) => None,
         parser::Expression::Aggregate(_, _) => None,
         parser::Expression::Case(_, _) => None,

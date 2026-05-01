@@ -1107,6 +1107,7 @@ fn format_expr(expr: &parser::Expression) -> String {
             format!("{} {} {}", format_expr(l), op_str, format_expr(r))
         }
         parser::Expression::Subquery(_) => "(subquery)".to_string(),
+        parser::Expression::List(_) => "(list)".to_string(),
         parser::Expression::Case(_, _) => "case".to_string(),
         parser::Expression::Aggregate(func, inner) => {
             let func_name = match func {
@@ -1183,15 +1184,17 @@ fn evaluate_join_condition(
             }
 
             if *operator == parser::Operator::In || *operator == parser::Operator::NotIn {
-                if let parser::Expression::Subquery(subquery) = right {
-                    let left_val = resolve_join_expression(left, row, cols, storage);
-                    if let Some(lv) = left_val {
-                        let subquery_values = execute_subquery(subquery, storage);
-                        let contains = subquery_values.contains(&lv);
-                        return if *operator == parser::Operator::NotIn { !contains } else { contains };
+                let left_val = resolve_join_expression(left, row, cols, storage);
+                let contains = match right {
+                    parser::Expression::Subquery(subquery) => {
+                        left_val.map_or(false, |lv| execute_subquery(subquery, storage).contains(&lv))
                     }
-                    return false;
-                }
+                    parser::Expression::List(values) => {
+                        left_val.map_or(false, |lv| values.contains(&lv))
+                    }
+                    _ => false,
+                };
+                return if *operator == parser::Operator::NotIn { !contains } else { contains };
             }
 
             let left_val = resolve_join_expression(left, row, cols, storage);
@@ -1362,6 +1365,7 @@ fn resolve_join_expression(
             let right_val = resolve_join_expression(right, row, cols, storage)?;
             eval_arith(&left_val, op, &right_val)
         }
+        parser::Expression::List(_) => None,
         // Aggregates aren't valid in row-level (WHERE/JOIN ON) contexts; HAVING uses its own evaluator.
         parser::Expression::Aggregate(_, _) => None,
         parser::Expression::Case(branches, else_expr) => {

@@ -267,6 +267,8 @@ pub enum Expression {
     Aggregate(AggregateFunc, Box<SelectColumn>),
     // CASE WHEN cond THEN expr ... [ELSE expr] END
     Case(Vec<(Condition, Expression)>, Option<Box<Expression>>),
+    // Literal value list for IN (1, 2, 3)
+    List(Vec<Value>),
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -1140,35 +1142,27 @@ fn parse_primary_condition(input: &str) -> IResult<&str, Condition> {
         }));
     }
 
-    // Try parsing NOT IN (SELECT ...) or IN (SELECT ...)
+    // Try parsing NOT IN (...) or IN (...)
     if let Ok((input, _)) = nom::sequence::pair(
         tag::<&str, &str, nom::error::Error<&str>>("NOT"),
         nom::sequence::preceded(multispace1::<&str, nom::error::Error<&str>>, tag_no_case("IN")),
     )(input) {
         let (input, _) = multispace0(input)?;
-        let (input, _) = nom_char('(')(input)?;
-        let (input, _) = multispace0(input)?;
-        let (input, subquery) = parse_select_statement(input)?;
-        let (input, _) = multispace0(input)?;
-        let (input, _) = nom_char(')')(input)?;
+        let (input, right) = parse_in_list(input)?;
         return Ok((input, Condition::Comparison {
             left,
             operator: Operator::NotIn,
-            right: Expression::Subquery(Box::new(subquery)),
+            right,
             upper_bound: None,
         }));
     }
     if let Ok((input, _)) = tag::<&str, &str, nom::error::Error<&str>>("IN")(input) {
         let (input, _) = multispace0(input)?;
-        let (input, _) = nom_char('(')(input)?;
-        let (input, _) = multispace0(input)?;
-        let (input, subquery) = parse_select_statement(input)?;
-        let (input, _) = multispace0(input)?;
-        let (input, _) = nom_char(')')(input)?;
+        let (input, right) = parse_in_list(input)?;
         return Ok((input, Condition::Comparison {
             left,
             operator: Operator::In,
-            right: Expression::Subquery(Box::new(subquery)),
+            right,
             upper_bound: None,
         }));
     }
@@ -1371,6 +1365,29 @@ fn parse_expression_literal(input: &str) -> IResult<&str, Expression> {
 }
 
 /// Parse operator: =, !=, >, <, >=, <=, LIKE
+/// Parse IN (...): either a subquery or a comma-separated literal value list
+fn parse_in_list(input: &str) -> IResult<&str, Expression> {
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+
+    // If it starts with SELECT, parse as subquery
+    if input.trim_start().to_uppercase().starts_with("SELECT") {
+        let (input, subquery) = parse_select_statement(input)?;
+        let (input, _) = multispace0(input)?;
+        let (input, _) = nom_char(')')(input)?;
+        return Ok((input, Expression::Subquery(Box::new(subquery))));
+    }
+
+    // Otherwise parse a comma-separated list of literal values
+    let (input, values) = nom::multi::separated_list1(
+        nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+        parse_value,
+    )(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, Expression::List(values)))
+}
+
 fn parse_operator(input: &str) -> IResult<&str, Operator> {
     nom::branch::alt((
         nom::combinator::map(tag("!="), |_| Operator::NotEquals),
@@ -2503,6 +2520,39 @@ mod tests {
             SqlStatement::Select(sel) => {
                 let wc = sel.where_clause.unwrap();
                 assert_eq!(wc.condition.operator(), Operator::NotIn);
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_in_value_list() {
+        let sql = "SELECT * FROM users WHERE id IN (1, 2, 3);";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                let wc = sel.where_clause.unwrap();
+                assert_eq!(wc.condition.operator(), Operator::In);
+                assert_eq!(wc.condition.right(), Expression::List(vec![
+                    Value::Int(1), Value::Int(2), Value::Int(3),
+                ]));
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_not_in_value_list() {
+        let sql = "SELECT * FROM users WHERE status NOT IN ('active', 'pending');";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                let wc = sel.where_clause.unwrap();
+                assert_eq!(wc.condition.operator(), Operator::NotIn);
+                assert_eq!(wc.condition.right(), Expression::List(vec![
+                    Value::String("active".to_string()),
+                    Value::String("pending".to_string()),
+                ]));
             }
             _ => panic!("Expected Select"),
         }

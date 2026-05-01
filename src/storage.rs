@@ -1281,6 +1281,20 @@ fn resolve_expression(expr: &Expression, row: &[Value], schema: &[ColumnDefiniti
         Expression::ScalarFunc(func, inner) => {
             resolve_expression(inner, row, schema).and_then(|v| apply_scalar_func(func, v))
         }
+        Expression::Coalesce(exprs) => {
+            exprs.iter().find_map(|e| {
+                let v = resolve_expression(e, row, schema);
+                match v { Some(Value::Null) | None => None, other => other }
+            })
+        }
+        Expression::NullIf(a, b) => {
+            let va = resolve_expression(a, row, schema);
+            let vb = resolve_expression(b, row, schema);
+            match (&va, &vb) {
+                (Some(l), Some(r)) if l == r => Some(Value::Null),
+                _ => va,
+            }
+        }
         Expression::BinaryOp(_, _, _) => None,
         Expression::Aggregate(_, _) => None,
         Expression::Case(branches, else_expr) => {

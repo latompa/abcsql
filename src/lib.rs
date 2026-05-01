@@ -244,6 +244,20 @@ fn resolve_expr(expr: &parser::Expression, row: &[Value], cols: &[(String, Strin
         parser::Expression::ScalarFunc(func, inner) => {
             resolve_expr(inner, row, cols).and_then(|v| parser::apply_scalar_func(func, v))
         }
+        parser::Expression::Coalesce(exprs) => {
+            exprs.iter().find_map(|e| {
+                let v = resolve_expr(e, row, cols);
+                match v { Some(Value::Null) | None => None, other => other }
+            })
+        }
+        parser::Expression::NullIf(a, b) => {
+            let va = resolve_expr(a, row, cols);
+            let vb = resolve_expr(b, row, cols);
+            match (&va, &vb) {
+                (Some(l), Some(r)) if l == r => Some(Value::Null),
+                _ => va,
+            }
+        }
         parser::Expression::BinaryOp(_, _, _) => None,
         parser::Expression::Aggregate(_, _) => None,
         parser::Expression::Case(_, _) => None,

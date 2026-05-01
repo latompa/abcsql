@@ -1157,6 +1157,11 @@ fn format_expr(expr: &parser::Expression) -> String {
             };
             format!("{}({})", name, format_expr(inner))
         }
+        parser::Expression::Coalesce(exprs) => {
+            let args: Vec<String> = exprs.iter().map(format_expr).collect();
+            format!("coalesce({})", args.join(", "))
+        }
+        parser::Expression::NullIf(a, b) => format!("nullif({}, {})", format_expr(a), format_expr(b)),
         parser::Expression::Case(_, _) => "case".to_string(),
         parser::Expression::Aggregate(func, inner) => {
             let func_name = match func {
@@ -1417,6 +1422,20 @@ fn resolve_join_expression(
         parser::Expression::List(_) => None,
         parser::Expression::ScalarFunc(func, inner) => {
             resolve_join_expression(inner, row, cols, storage).and_then(|v| parser::apply_scalar_func(func, v))
+        }
+        parser::Expression::Coalesce(exprs) => {
+            exprs.iter().find_map(|e| {
+                let v = resolve_join_expression(e, row, cols, storage);
+                match v { Some(Value::Null) | None => None, other => other }
+            })
+        }
+        parser::Expression::NullIf(a, b) => {
+            let va = resolve_join_expression(a, row, cols, storage);
+            let vb = resolve_join_expression(b, row, cols, storage);
+            match (&va, &vb) {
+                (Some(l), Some(r)) if l == r => Some(Value::Null),
+                _ => va,
+            }
         }
         // Aggregates aren't valid in row-level (WHERE/JOIN ON) contexts; HAVING uses its own evaluator.
         parser::Expression::Aggregate(_, _) => None,

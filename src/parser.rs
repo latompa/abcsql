@@ -295,6 +295,10 @@ pub enum Expression {
     List(Vec<Value>),
     // Scalar string function: UPPER(expr), LOWER(expr), etc.
     ScalarFunc(ScalarFunc, Box<Expression>),
+    // COALESCE(expr, expr, ...) — first non-NULL value
+    Coalesce(Vec<Expression>),
+    // NULLIF(expr, expr) — NULL if both args are equal, else first arg
+    NullIf(Box<Expression>, Box<Expression>),
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -891,7 +895,8 @@ fn parse_select_column(input: &str) -> IResult<&str, SelectColumn> {
 fn parse_arith_select_column(input: &str) -> IResult<&str, SelectColumn> {
     let (new_input, expr) = parse_expression(input)?;
     match &expr {
-        Expression::BinaryOp(_, _, _) | Expression::Case(_, _) | Expression::ScalarFunc(_, _) => Ok((new_input, SelectColumn::Expr(expr))),
+        Expression::BinaryOp(_, _, _) | Expression::Case(_, _) | Expression::ScalarFunc(_, _)
+        | Expression::Coalesce(_) | Expression::NullIf(_, _) => Ok((new_input, SelectColumn::Expr(expr))),
         _ => Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag))),
     }
 }
@@ -1322,12 +1327,43 @@ fn parse_atom(input: &str) -> IResult<&str, Expression> {
     nom::branch::alt((
         parse_expression_case,
         parse_expression_subquery,
+        parse_expression_coalesce,
+        parse_expression_nullif,
         parse_expression_scalar_func,
         parse_expression_aggregate,
         parse_expression_qualified_column,
         parse_expression_literal,
         parse_expression_simple_column,
     ))(input)
+}
+
+fn parse_expression_coalesce(input: &str) -> IResult<&str, Expression> {
+    let (input, _) = tag_no_case("COALESCE")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, exprs) = nom::multi::separated_list1(
+        nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+        parse_expression,
+    )(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, Expression::Coalesce(exprs)))
+}
+
+fn parse_expression_nullif(input: &str) -> IResult<&str, Expression> {
+    let (input, _) = tag_no_case("NULLIF")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, first) = parse_expression(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(',')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, second) = parse_expression(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, Expression::NullIf(Box::new(first), Box::new(second))))
 }
 
 fn parse_expression_scalar_func(input: &str) -> IResult<&str, Expression> {
@@ -3620,6 +3656,56 @@ mod tests {
                 assert!(matches!(&sel.columns[0], SelectColumn::Expr(Expression::ScalarFunc(ScalarFunc::Trim, _))));
                 let wc = sel.where_clause.unwrap();
                 assert!(matches!(wc.condition.left(), Expression::ScalarFunc(ScalarFunc::Trim, _)));
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_coalesce() {
+        let sql = "SELECT COALESCE(nickname, name, 'unknown') FROM users;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                match &sel.columns[0] {
+                    SelectColumn::Expr(Expression::Coalesce(exprs)) => {
+                        assert_eq!(exprs.len(), 3);
+                        assert_eq!(exprs[0], Expression::Column("nickname".to_string()));
+                        assert_eq!(exprs[1], Expression::Column("name".to_string()));
+                        assert_eq!(exprs[2], Expression::Literal(Value::String("unknown".to_string())));
+                    }
+                    _ => panic!("Expected Coalesce"),
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_nullif() {
+        let sql = "SELECT NULLIF(score, 0) FROM results;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                match &sel.columns[0] {
+                    SelectColumn::Expr(Expression::NullIf(a, b)) => {
+                        assert_eq!(**a, Expression::Column("score".to_string()));
+                        assert_eq!(**b, Expression::Literal(Value::Int(0)));
+                    }
+                    _ => panic!("Expected NullIf"),
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_coalesce_in_where() {
+        let sql = "SELECT * FROM users WHERE COALESCE(nickname, name) = 'Alice';";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert!(matches!(sel.where_clause.unwrap().condition.left(), Expression::Coalesce(_)));
             }
             _ => panic!("Expected Select"),
         }

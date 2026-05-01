@@ -1148,6 +1148,15 @@ fn format_expr(expr: &parser::Expression) -> String {
         }
         parser::Expression::Subquery(_) => "(subquery)".to_string(),
         parser::Expression::List(_) => "(list)".to_string(),
+        parser::Expression::ScalarFunc(func, inner) => {
+            let name = match func {
+                parser::ScalarFunc::Upper => "upper",
+                parser::ScalarFunc::Lower => "lower",
+                parser::ScalarFunc::Length => "length",
+                parser::ScalarFunc::Trim => "trim",
+            };
+            format!("{}({})", name, format_expr(inner))
+        }
         parser::Expression::Case(_, _) => "case".to_string(),
         parser::Expression::Aggregate(func, inner) => {
             let func_name = match func {
@@ -1406,6 +1415,9 @@ fn resolve_join_expression(
             eval_arith(&left_val, op, &right_val)
         }
         parser::Expression::List(_) => None,
+        parser::Expression::ScalarFunc(func, inner) => {
+            resolve_join_expression(inner, row, cols, storage).and_then(|v| parser::apply_scalar_func(func, v))
+        }
         // Aggregates aren't valid in row-level (WHERE/JOIN ON) contexts; HAVING uses its own evaluator.
         parser::Expression::Aggregate(_, _) => None,
         parser::Expression::Case(branches, else_expr) => {

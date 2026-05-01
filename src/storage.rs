@@ -3,7 +3,7 @@ use std::io::{self, Write as IoWrite, BufWriter, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::fmt;
 use std::collections::HashMap;
-use crate::parser::{CreateTableStatement, CreateIndexStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, UpdateStatement, DeleteStatement, AlterTableStatement, AlterAction, Value, Condition, Expression, Operator};
+use crate::parser::{CreateTableStatement, CreateIndexStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, UpdateStatement, DeleteStatement, AlterTableStatement, AlterAction, Value, Condition, Expression, Operator, ScalarFunc, apply_scalar_func};
 
 /// Storage engine for persisting tables to disk
 pub struct Storage {
@@ -1278,6 +1278,9 @@ fn resolve_expression(expr: &Expression, row: &[Value], schema: &[ColumnDefiniti
         }
         Expression::Subquery(_) => None,
         Expression::List(_) => None,
+        Expression::ScalarFunc(func, inner) => {
+            resolve_expression(inner, row, schema).and_then(|v| apply_scalar_func(func, v))
+        }
         Expression::BinaryOp(_, _, _) => None,
         Expression::Aggregate(_, _) => None,
         Expression::Case(branches, else_expr) => {

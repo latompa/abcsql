@@ -241,6 +241,9 @@ fn resolve_expr(expr: &parser::Expression, row: &[Value], cols: &[(String, Strin
         }
         parser::Expression::Subquery(_) => None,
         parser::Expression::List(_) => None,
+        parser::Expression::ScalarFunc(func, inner) => {
+            resolve_expr(inner, row, cols).and_then(|v| parser::apply_scalar_func(func, v))
+        }
         parser::Expression::BinaryOp(_, _, _) => None,
         parser::Expression::Aggregate(_, _) => None,
         parser::Expression::Case(_, _) => None,

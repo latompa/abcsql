@@ -217,6 +217,14 @@ pub enum AggregateFunc {
 }
 
 #[derive(Debug, PartialEq, Clone)]
+pub enum ScalarFunc {
+    Upper,
+    Lower,
+    Length,
+    Trim,
+}
+
+#[derive(Debug, PartialEq, Clone)]
 pub struct OrderByClause {
     pub column: SelectColumn,
     pub descending: bool,
@@ -285,6 +293,8 @@ pub enum Expression {
     Case(Vec<(Condition, Expression)>, Option<Box<Expression>>),
     // Literal value list for IN (1, 2, 3)
     List(Vec<Value>),
+    // Scalar string function: UPPER(expr), LOWER(expr), etc.
+    ScalarFunc(ScalarFunc, Box<Expression>),
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -881,7 +891,7 @@ fn parse_select_column(input: &str) -> IResult<&str, SelectColumn> {
 fn parse_arith_select_column(input: &str) -> IResult<&str, SelectColumn> {
     let (new_input, expr) = parse_expression(input)?;
     match &expr {
-        Expression::BinaryOp(_, _, _) | Expression::Case(_, _) => Ok((new_input, SelectColumn::Expr(expr))),
+        Expression::BinaryOp(_, _, _) | Expression::Case(_, _) | Expression::ScalarFunc(_, _) => Ok((new_input, SelectColumn::Expr(expr))),
         _ => Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag))),
     }
 }
@@ -1312,11 +1322,35 @@ fn parse_atom(input: &str) -> IResult<&str, Expression> {
     nom::branch::alt((
         parse_expression_case,
         parse_expression_subquery,
+        parse_expression_scalar_func,
         parse_expression_aggregate,
         parse_expression_qualified_column,
         parse_expression_literal,
         parse_expression_simple_column,
     ))(input)
+}
+
+fn parse_expression_scalar_func(input: &str) -> IResult<&str, Expression> {
+    let (input, func_name) = nom::branch::alt((
+        tag_no_case("UPPER"),
+        tag_no_case("LOWER"),
+        tag_no_case("LENGTH"),
+        tag_no_case("TRIM"),
+    ))(input)?;
+    let func = match func_name.to_uppercase().as_str() {
+        "UPPER" => ScalarFunc::Upper,
+        "LOWER" => ScalarFunc::Lower,
+        "LENGTH" => ScalarFunc::Length,
+        "TRIM" => ScalarFunc::Trim,
+        _ => unreachable!(),
+    };
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, expr) = parse_expression(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, Expression::ScalarFunc(func, Box::new(expr))))
 }
 
 fn parse_expression_case(input: &str) -> IResult<&str, Expression> {
@@ -1397,6 +1431,17 @@ fn parse_expression_subquery(input: &str) -> IResult<&str, Expression> {
     let (input, _) = multispace0(input)?;
     let (input, _) = nom_char(')')(input)?;
     Ok((input, Expression::Subquery(Box::new(stmt))))
+}
+
+/// Apply a scalar string function to a resolved Value
+pub fn apply_scalar_func(func: &ScalarFunc, val: Value) -> Option<Value> {
+    match (func, val) {
+        (ScalarFunc::Upper, Value::String(s)) => Some(Value::String(s.to_uppercase())),
+        (ScalarFunc::Lower, Value::String(s)) => Some(Value::String(s.to_lowercase())),
+        (ScalarFunc::Length, Value::String(s)) => Some(Value::Int(s.len() as i64)),
+        (ScalarFunc::Trim,  Value::String(s)) => Some(Value::String(s.trim().to_string())),
+        _ => None,
+    }
 }
 
 fn parse_expression_qualified_column(input: &str) -> IResult<&str, Expression> {
@@ -3521,6 +3566,62 @@ mod tests {
                 assert!(v.if_exists);
             }
             _ => panic!("Expected DropView"),
+        }
+    }
+
+    #[test]
+    fn test_parse_scalar_func_upper() {
+        let sql = "SELECT UPPER(name) FROM users;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert_eq!(sel.columns.len(), 1);
+                match &sel.columns[0] {
+                    SelectColumn::Expr(Expression::ScalarFunc(ScalarFunc::Upper, inner)) => {
+                        assert_eq!(**inner, Expression::Column("name".to_string()));
+                    }
+                    _ => panic!("Expected UPPER scalar func"),
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_scalar_func_lower() {
+        let sql = "SELECT LOWER(email) FROM users;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert!(matches!(&sel.columns[0], SelectColumn::Expr(Expression::ScalarFunc(ScalarFunc::Lower, _))));
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_scalar_func_length() {
+        let sql = "SELECT LENGTH(name) FROM users;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert!(matches!(&sel.columns[0], SelectColumn::Expr(Expression::ScalarFunc(ScalarFunc::Length, _))));
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_scalar_func_trim() {
+        let sql = "SELECT TRIM(name) FROM users WHERE TRIM(name) = 'Alice';";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert!(matches!(&sel.columns[0], SelectColumn::Expr(Expression::ScalarFunc(ScalarFunc::Trim, _))));
+                let wc = sel.where_clause.unwrap();
+                assert!(matches!(wc.condition.left(), Expression::ScalarFunc(ScalarFunc::Trim, _)));
+            }
+            _ => panic!("Expected Select"),
         }
     }
 }

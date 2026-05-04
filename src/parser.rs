@@ -165,6 +165,7 @@ pub struct SelectStatement {
     pub having: Option<WhereClause>,
     pub order_by: Vec<OrderByClause>,
     pub limit: Option<u64>,
+    pub offset: Option<u64>,
     pub union: Option<(UnionType, Box<SelectStatement>)>,
 }
 
@@ -807,7 +808,7 @@ pub fn parse_select_statement(input: &str) -> IResult<&str, SelectStatement> {
     let (input, group_by) = parse_group_by_clause(input)?;
     let (input, having) = parse_having_clause(input)?;
     let (input, order_by) = parse_order_by_clause(input)?;
-    let (input, limit) = parse_limit_clause(input)?;
+    let (input, (limit, offset)) = parse_limit_offset_clause(input)?;
 
     // Try to parse UNION [ALL] SELECT ...
     let (input, union) = {
@@ -838,6 +839,7 @@ pub fn parse_select_statement(input: &str) -> IResult<&str, SelectStatement> {
         having,
         order_by,
         limit,
+        offset,
         union,
     }))
 }
@@ -1035,22 +1037,32 @@ fn parse_order_by_item(input: &str) -> IResult<&str, OrderByClause> {
 }
 
 /// Parse LIMIT clause (returns None if not present)
-fn parse_limit_clause(input: &str) -> IResult<&str, Option<u64>> {
+fn parse_limit_offset_clause(input: &str) -> IResult<&str, (Option<u64>, Option<u64>)> {
     let (input, _) = multispace0(input)?;
-    let result = tag::<&str, &str, nom::error::Error<&str>>("LIMIT")(input);
+    let result = tag_no_case::<&str, &str, nom::error::Error<&str>>("LIMIT")(input);
     match result {
         Ok((input, _)) => {
             let (input, _) = multispace1(input)?;
             let (input, n) = nom::character::complete::u64(input)?;
-            Ok((input, Some(n)))
+            // Parse optional OFFSET
+            let (input, _) = multispace0(input)?;
+            let offset_result = tag_no_case::<&str, &str, nom::error::Error<&str>>("OFFSET")(input);
+            match offset_result {
+                Ok((input, _)) => {
+                    let (input, _) = multispace1(input)?;
+                    let (input, off) = nom::character::complete::u64(input)?;
+                    Ok((input, (Some(n), Some(off))))
+                }
+                Err(_) => Ok((input, (Some(n), None))),
+            }
         }
-        Err(_) => Ok((input, None)),
+        Err(_) => Ok((input, (None, None))),
     }
 }
 
 /// Check if identifier is a reserved keyword that can't be used as an alias
 fn is_reserved_keyword(s: &str) -> bool {
-    matches!(s.to_uppercase().as_str(), "ON" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "OUTER" | "WHERE" | "ORDER" | "GROUP" | "LIMIT" | "HAVING" | "UNION" | "ALL" | "CASE" | "WHEN" | "THEN" | "ELSE" | "END" | "AND" | "OR" | "NOT" | "AS" | "VIEW")
+    matches!(s.to_uppercase().as_str(), "ON" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "OUTER" | "WHERE" | "ORDER" | "GROUP" | "LIMIT" | "OFFSET" | "HAVING" | "UNION" | "ALL" | "CASE" | "WHEN" | "THEN" | "ELSE" | "END" | "AND" | "OR" | "NOT" | "AS" | "VIEW")
 }
 
 /// Parse optional table alias, rejecting reserved keywords
@@ -2470,6 +2482,33 @@ mod tests {
                 assert_eq!(sel.order_by.len(), 1);
                 assert!(sel.order_by[0].descending);
                 assert_eq!(sel.limit, Some(3));
+                assert_eq!(sel.offset, None);
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_limit_offset() {
+        let sql = "SELECT * FROM users LIMIT 10 OFFSET 20;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert_eq!(sel.limit, Some(10));
+                assert_eq!(sel.offset, Some(20));
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_no_offset() {
+        let sql = "SELECT * FROM users LIMIT 5;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert_eq!(sel.limit, Some(5));
+                assert_eq!(sel.offset, None);
             }
             _ => panic!("Expected Select"),
         }

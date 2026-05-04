@@ -200,7 +200,12 @@ fn execute_select_to_string(
         })
         .collect();
 
-    // apply LIMIT
+    // apply OFFSET then LIMIT
+    let rows: Vec<_> = if let Some(off) = stmt.offset {
+        rows.into_iter().skip(off as usize).collect()
+    } else {
+        rows
+    };
     let rows = if let Some(n) = stmt.limit {
         rows.into_iter().take(n as usize).collect()
     } else {

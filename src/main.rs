@@ -704,9 +704,9 @@ fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) -> (Vec<Str
     let has_group_by = !stmt.group_by.is_empty();
 
     let (headers, mut rows) = if has_aggregates || has_group_by {
-        collect_aggregate_rows(&stmt.columns, &filtered_rows, &combined_cols, &stmt.group_by, stmt.having.as_ref(), &stmt.order_by, stmt.limit, stmt.distinct, storage)
+        collect_aggregate_rows(&stmt.columns, &filtered_rows, &combined_cols, &stmt.group_by, stmt.having.as_ref(), &stmt.order_by, stmt.limit, stmt.offset, stmt.distinct, storage)
     } else {
-        collect_normal_rows(&stmt.columns, filtered_rows, &combined_cols, &stmt.order_by, stmt.limit, stmt.distinct)
+        collect_normal_rows(&stmt.columns, filtered_rows, &combined_cols, &stmt.order_by, stmt.limit, stmt.offset, stmt.distinct)
     };
 
     // Handle UNION / UNION ALL
@@ -814,6 +814,7 @@ fn collect_aggregate_rows(
     having: Option<&parser::WhereClause>,
     order_by: &[parser::OrderByClause],
     limit: Option<u64>,
+    offset: Option<u64>,
     distinct: bool,
     storage: &Storage,
 ) -> (Vec<String>, Vec<Vec<String>>) {
@@ -901,7 +902,15 @@ fn collect_aggregate_rows(
         });
     }
 
-    // Apply LIMIT
+    // Apply OFFSET then LIMIT
+    if let Some(off) = offset {
+        let off = off as usize;
+        if off >= result_rows.len() {
+            result_rows.clear();
+        } else {
+            result_rows.drain(..off);
+        }
+    }
     if let Some(n) = limit {
         result_rows.truncate(n as usize);
     }
@@ -1000,6 +1009,7 @@ fn collect_normal_rows(
     combined_cols: &[ResultColumn],
     order_by: &[parser::OrderByClause],
     limit: Option<u64>,
+    offset: Option<u64>,
     distinct: bool,
 ) -> (Vec<String>, Vec<Vec<String>>) {
     // Apply ORDER BY
@@ -1084,7 +1094,15 @@ fn collect_normal_rows(
         });
     }
 
-    // Apply LIMIT
+    // Apply OFFSET then LIMIT
+    if let Some(off) = offset {
+        let off = off as usize;
+        if off >= rows.len() {
+            rows.clear();
+        } else {
+            rows.drain(..off);
+        }
+    }
     if let Some(n) = limit {
         rows.truncate(n as usize);
     }

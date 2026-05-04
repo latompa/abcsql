@@ -1175,6 +1175,8 @@ fn format_expr(expr: &parser::Expression) -> String {
                 parser::ScalarFunc::Abs => "abs",
                 parser::ScalarFunc::Ceil => "ceil",
                 parser::ScalarFunc::Floor => "floor",
+                parser::ScalarFunc::LTrim => "ltrim",
+                parser::ScalarFunc::RTrim => "rtrim",
             };
             format!("{}({})", name, format_expr(inner))
         }
@@ -1195,6 +1197,9 @@ fn format_expr(expr: &parser::Expression) -> String {
             Some(l) => format!("substr({}, {}, {})", format_expr(s), format_expr(start), format_expr(l)),
             None => format!("substr({}, {})", format_expr(s), format_expr(start)),
         },
+        parser::Expression::Replace(s, from, to) => format!("replace({}, {}, {})", format_expr(s), format_expr(from), format_expr(to)),
+        parser::Expression::LPad(s, len, pad) => format!("lpad({}, {}, {})", format_expr(s), format_expr(len), format_expr(pad)),
+        parser::Expression::RPad(s, len, pad) => format!("rpad({}, {}, {})", format_expr(s), format_expr(len), format_expr(pad)),
         parser::Expression::Case(_, _) => "case".to_string(),
         parser::Expression::Aggregate(func, inner) => {
             let func_name = match func {
@@ -1484,6 +1489,24 @@ fn resolve_join_expression(
             let startv = resolve_join_expression(start, row, cols, storage)?;
             let lenv = len.as_ref().and_then(|e| resolve_join_expression(e, row, cols, storage));
             parser::apply_substr(sv, startv, lenv)
+        }
+        parser::Expression::Replace(s, from, to) => {
+            let sv = resolve_join_expression(s, row, cols, storage)?;
+            let fv = resolve_join_expression(from, row, cols, storage)?;
+            let tv = resolve_join_expression(to, row, cols, storage)?;
+            parser::apply_replace(sv, fv, tv)
+        }
+        parser::Expression::LPad(s, len, pad) => {
+            let sv = resolve_join_expression(s, row, cols, storage)?;
+            let lv = resolve_join_expression(len, row, cols, storage)?;
+            let pv = resolve_join_expression(pad, row, cols, storage)?;
+            parser::apply_lpad(sv, lv, pv)
+        }
+        parser::Expression::RPad(s, len, pad) => {
+            let sv = resolve_join_expression(s, row, cols, storage)?;
+            let lv = resolve_join_expression(len, row, cols, storage)?;
+            let pv = resolve_join_expression(pad, row, cols, storage)?;
+            parser::apply_rpad(sv, lv, pv)
         }
         // Aggregates aren't valid in row-level (WHERE/JOIN ON) contexts; HAVING uses its own evaluator.
         parser::Expression::Aggregate(_, _) => None,

@@ -223,6 +223,8 @@ pub enum ScalarFunc {
     Lower,
     Length,
     Trim,
+    LTrim,
+    RTrim,
     Abs,
     Ceil,
     Floor,
@@ -309,6 +311,11 @@ pub enum Expression {
     Concat(Vec<Expression>),
     // SUBSTR(str, start [, len]) — 1-indexed
     Substr(Box<Expression>, Box<Expression>, Option<Box<Expression>>),
+    // REPLACE(str, from, to)
+    Replace(Box<Expression>, Box<Expression>, Box<Expression>),
+    // LPAD(str, len, pad) / RPAD(str, len, pad)
+    LPad(Box<Expression>, Box<Expression>, Box<Expression>),
+    RPad(Box<Expression>, Box<Expression>, Box<Expression>),
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -908,7 +915,8 @@ fn parse_arith_select_column(input: &str) -> IResult<&str, SelectColumn> {
     match &expr {
         Expression::BinaryOp(_, _, _) | Expression::Case(_, _) | Expression::ScalarFunc(_, _)
         | Expression::Coalesce(_) | Expression::NullIf(_, _)
-        | Expression::Round(_, _) | Expression::Concat(_) | Expression::Substr(_, _, _) => Ok((new_input, SelectColumn::Expr(expr))),
+        | Expression::Round(_, _) | Expression::Concat(_) | Expression::Substr(_, _, _)
+        | Expression::Replace(_, _, _) | Expression::LPad(_, _, _) | Expression::RPad(_, _, _) => Ok((new_input, SelectColumn::Expr(expr))),
         _ => Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag))),
     }
 }
@@ -1354,6 +1362,9 @@ fn parse_atom(input: &str) -> IResult<&str, Expression> {
         parse_expression_round,
         parse_expression_concat,
         parse_expression_substr,
+        parse_expression_replace,
+        parse_expression_lpad,
+        parse_expression_rpad,
         parse_expression_scalar_func,
         parse_expression_aggregate,
         parse_expression_qualified_column,
@@ -1396,6 +1407,8 @@ fn parse_expression_scalar_func(input: &str) -> IResult<&str, Expression> {
         tag_no_case("UPPER"),
         tag_no_case("LOWER"),
         tag_no_case("LENGTH"),
+        tag_no_case("LTRIM"),
+        tag_no_case("RTRIM"),
         tag_no_case("TRIM"),
         tag_no_case("ABS"),
         tag_no_case("CEILING"),
@@ -1406,6 +1419,8 @@ fn parse_expression_scalar_func(input: &str) -> IResult<&str, Expression> {
         "UPPER"   => ScalarFunc::Upper,
         "LOWER"   => ScalarFunc::Lower,
         "LENGTH"  => ScalarFunc::Length,
+        "LTRIM"   => ScalarFunc::LTrim,
+        "RTRIM"   => ScalarFunc::RTrim,
         "TRIM"    => ScalarFunc::Trim,
         "ABS"     => ScalarFunc::Abs,
         "CEILING" | "CEIL" => ScalarFunc::Ceil,
@@ -1469,6 +1484,51 @@ fn parse_expression_substr(input: &str) -> IResult<&str, Expression> {
     let (input, _) = multispace0(input)?;
     let (input, _) = nom_char(')')(input)?;
     Ok((input, Expression::Substr(Box::new(s), Box::new(start), len.map(Box::new))))
+}
+
+fn parse_expression_replace(input: &str) -> IResult<&str, Expression> {
+    let (input, _) = tag_no_case("REPLACE")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, s) = parse_expression(input)?;
+    let (input, _) = nom::sequence::delimited(multispace0, nom_char(','), multispace0)(input)?;
+    let (input, from) = parse_expression(input)?;
+    let (input, _) = nom::sequence::delimited(multispace0, nom_char(','), multispace0)(input)?;
+    let (input, to) = parse_expression(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, Expression::Replace(Box::new(s), Box::new(from), Box::new(to))))
+}
+
+fn parse_expression_lpad(input: &str) -> IResult<&str, Expression> {
+    let (input, _) = tag_no_case("LPAD")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, s) = parse_expression(input)?;
+    let (input, _) = nom::sequence::delimited(multispace0, nom_char(','), multispace0)(input)?;
+    let (input, len) = parse_expression(input)?;
+    let (input, _) = nom::sequence::delimited(multispace0, nom_char(','), multispace0)(input)?;
+    let (input, pad) = parse_expression(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, Expression::LPad(Box::new(s), Box::new(len), Box::new(pad))))
+}
+
+fn parse_expression_rpad(input: &str) -> IResult<&str, Expression> {
+    let (input, _) = tag_no_case("RPAD")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, s) = parse_expression(input)?;
+    let (input, _) = nom::sequence::delimited(multispace0, nom_char(','), multispace0)(input)?;
+    let (input, len) = parse_expression(input)?;
+    let (input, _) = nom::sequence::delimited(multispace0, nom_char(','), multispace0)(input)?;
+    let (input, pad) = parse_expression(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, Expression::RPad(Box::new(s), Box::new(len), Box::new(pad))))
 }
 
 fn parse_expression_case(input: &str) -> IResult<&str, Expression> {
@@ -1600,6 +1660,46 @@ pub fn apply_substr(s: Value, start: Value, len: Option<Value>) -> Option<Value>
     Some(Value::String(result))
 }
 
+/// Evaluate REPLACE(str, from, to)
+pub fn apply_replace(s: Value, from: Value, to: Value) -> Option<Value> {
+    match (s, from, to) {
+        (Value::String(s), Value::String(f), Value::String(t)) => Some(Value::String(s.replace(&*f, &*t))),
+        _ => None,
+    }
+}
+
+/// Evaluate LPAD(str, len, pad)
+pub fn apply_lpad(s: Value, len: Value, pad: Value) -> Option<Value> {
+    let s = match s { Value::String(s) => s, _ => return None };
+    let len = match len { Value::Int(n) => n.max(0) as usize, _ => return None };
+    let pad = match pad { Value::String(p) => p, _ => return None };
+    if pad.is_empty() { return Some(Value::String(s)); }
+    let current = s.chars().count();
+    if current >= len {
+        return Some(Value::String(s.chars().take(len).collect()));
+    }
+    let needed = len - current;
+    let pad_chars: Vec<char> = pad.chars().collect();
+    let prefix: String = pad_chars.iter().cycle().take(needed).collect();
+    Some(Value::String(format!("{}{}", prefix, s)))
+}
+
+/// Evaluate RPAD(str, len, pad)
+pub fn apply_rpad(s: Value, len: Value, pad: Value) -> Option<Value> {
+    let s = match s { Value::String(s) => s, _ => return None };
+    let len = match len { Value::Int(n) => n.max(0) as usize, _ => return None };
+    let pad = match pad { Value::String(p) => p, _ => return None };
+    if pad.is_empty() { return Some(Value::String(s)); }
+    let current = s.chars().count();
+    if current >= len {
+        return Some(Value::String(s.chars().take(len).collect()));
+    }
+    let needed = len - current;
+    let pad_chars: Vec<char> = pad.chars().collect();
+    let suffix: String = pad_chars.iter().cycle().take(needed).collect();
+    Some(Value::String(format!("{}{}", s, suffix)))
+}
+
 /// Apply a single-arg scalar function to a resolved Value
 pub fn apply_scalar_func(func: &ScalarFunc, val: Value) -> Option<Value> {
     match (func, val) {
@@ -1607,6 +1707,8 @@ pub fn apply_scalar_func(func: &ScalarFunc, val: Value) -> Option<Value> {
         (ScalarFunc::Lower,  Value::String(s)) => Some(Value::String(s.to_lowercase())),
         (ScalarFunc::Length, Value::String(s)) => Some(Value::Int(s.len() as i64)),
         (ScalarFunc::Trim,   Value::String(s)) => Some(Value::String(s.trim().to_string())),
+        (ScalarFunc::LTrim,  Value::String(s)) => Some(Value::String(s.trim_start().to_string())),
+        (ScalarFunc::RTrim,  Value::String(s)) => Some(Value::String(s.trim_end().to_string())),
         (ScalarFunc::Abs, Value::Int(n))    => Some(Value::Int(n.abs())),
         (ScalarFunc::Abs, Value::Float(f))  => Some(Value::Float(f.abs())),
         (ScalarFunc::Ceil,  Value::Float(f)) => Some(Value::Float(f.ceil())),
@@ -4000,6 +4102,76 @@ mod tests {
                         assert_eq!(**len, Expression::Literal(Value::Int(5)));
                     }
                     _ => panic!("Expected Substr with length"),
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ltrim_rtrim() {
+        let sql = "SELECT LTRIM(name), RTRIM(name) FROM users;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert!(matches!(&sel.columns[0], SelectColumn::Expr(Expression::ScalarFunc(ScalarFunc::LTrim, _))));
+                assert!(matches!(&sel.columns[1], SelectColumn::Expr(Expression::ScalarFunc(ScalarFunc::RTrim, _))));
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_replace() {
+        let sql = "SELECT REPLACE(name, 'a', 'e') FROM users;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                match &sel.columns[0] {
+                    SelectColumn::Expr(Expression::Replace(s, from, to)) => {
+                        assert_eq!(**s, Expression::Column("name".to_string()));
+                        assert_eq!(**from, Expression::Literal(Value::String("a".to_string())));
+                        assert_eq!(**to, Expression::Literal(Value::String("e".to_string())));
+                    }
+                    _ => panic!("Expected Replace"),
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_lpad() {
+        let sql = "SELECT LPAD(code, 5, '0') FROM items;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                match &sel.columns[0] {
+                    SelectColumn::Expr(Expression::LPad(s, len, pad)) => {
+                        assert_eq!(**s, Expression::Column("code".to_string()));
+                        assert_eq!(**len, Expression::Literal(Value::Int(5)));
+                        assert_eq!(**pad, Expression::Literal(Value::String("0".to_string())));
+                    }
+                    _ => panic!("Expected LPad"),
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rpad() {
+        let sql = "SELECT RPAD(name, 10, ' ') FROM users;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                match &sel.columns[0] {
+                    SelectColumn::Expr(Expression::RPad(s, len, pad)) => {
+                        assert_eq!(**s, Expression::Column("name".to_string()));
+                        assert_eq!(**len, Expression::Literal(Value::Int(10)));
+                        assert_eq!(**pad, Expression::Literal(Value::String(" ".to_string())));
+                    }
+                    _ => panic!("Expected RPad"),
                 }
             }
             _ => panic!("Expected Select"),

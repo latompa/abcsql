@@ -3,7 +3,7 @@ use std::io::{self, Write as IoWrite, BufWriter, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::fmt;
 use std::collections::HashMap;
-use crate::parser::{CreateTableStatement, CreateIndexStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, UpdateStatement, DeleteStatement, AlterTableStatement, AlterAction, Value, Condition, Expression, Operator, apply_scalar_func, apply_round, apply_concat, apply_substr};
+use crate::parser::{CreateTableStatement, CreateIndexStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, UpdateStatement, DeleteStatement, AlterTableStatement, AlterAction, Value, Condition, Expression, Operator, apply_scalar_func, apply_round, apply_concat, apply_substr, apply_replace, apply_lpad, apply_rpad};
 
 /// Storage engine for persisting tables to disk
 pub struct Storage {
@@ -1309,6 +1309,24 @@ fn resolve_expression(expr: &Expression, row: &[Value], schema: &[ColumnDefiniti
             let startv = resolve_expression(start, row, schema)?;
             let lenv = len.as_ref().and_then(|e| resolve_expression(e, row, schema));
             apply_substr(sv, startv, lenv)
+        }
+        Expression::Replace(s, from, to) => {
+            let sv = resolve_expression(s, row, schema)?;
+            let fv = resolve_expression(from, row, schema)?;
+            let tv = resolve_expression(to, row, schema)?;
+            apply_replace(sv, fv, tv)
+        }
+        Expression::LPad(s, len, pad) => {
+            let sv = resolve_expression(s, row, schema)?;
+            let lv = resolve_expression(len, row, schema)?;
+            let pv = resolve_expression(pad, row, schema)?;
+            apply_lpad(sv, lv, pv)
+        }
+        Expression::RPad(s, len, pad) => {
+            let sv = resolve_expression(s, row, schema)?;
+            let lv = resolve_expression(len, row, schema)?;
+            let pv = resolve_expression(pad, row, schema)?;
+            apply_rpad(sv, lv, pv)
         }
         Expression::BinaryOp(_, _, _) => None,
         Expression::Aggregate(_, _) => None,

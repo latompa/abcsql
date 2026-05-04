@@ -278,6 +278,24 @@ fn resolve_expr(expr: &parser::Expression, row: &[Value], cols: &[(String, Strin
             let lenv = len.as_ref().and_then(|e| resolve_expr(e, row, cols));
             parser::apply_substr(sv, startv, lenv)
         }
+        parser::Expression::Replace(s, from, to) => {
+            let sv = resolve_expr(s, row, cols)?;
+            let fv = resolve_expr(from, row, cols)?;
+            let tv = resolve_expr(to, row, cols)?;
+            parser::apply_replace(sv, fv, tv)
+        }
+        parser::Expression::LPad(s, len, pad) => {
+            let sv = resolve_expr(s, row, cols)?;
+            let lv = resolve_expr(len, row, cols)?;
+            let pv = resolve_expr(pad, row, cols)?;
+            parser::apply_lpad(sv, lv, pv)
+        }
+        parser::Expression::RPad(s, len, pad) => {
+            let sv = resolve_expr(s, row, cols)?;
+            let lv = resolve_expr(len, row, cols)?;
+            let pv = resolve_expr(pad, row, cols)?;
+            parser::apply_rpad(sv, lv, pv)
+        }
         parser::Expression::BinaryOp(_, _, _) => None,
         parser::Expression::Aggregate(_, _) => None,
         parser::Expression::Case(_, _) => None,

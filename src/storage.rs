@@ -3,7 +3,7 @@ use std::io::{self, Write as IoWrite, BufWriter, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::fmt;
 use std::collections::HashMap;
-use crate::parser::{CreateTableStatement, CreateIndexStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, UpdateStatement, DeleteStatement, AlterTableStatement, AlterAction, Value, Condition, Expression, Operator, apply_scalar_func, apply_round, apply_concat, apply_substr, apply_replace, apply_lpad, apply_rpad, apply_cast};
+use crate::parser::{CreateTableStatement, CreateIndexStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, UpdateStatement, DeleteStatement, AlterTableStatement, AlterAction, Value, Condition, Expression, Operator, SelectStatement, SelectColumn, FromClause, apply_scalar_func, apply_round, apply_concat, apply_substr, apply_replace, apply_lpad, apply_rpad, apply_cast};
 
 /// Storage engine for persisting tables to disk
 pub struct Storage {
@@ -251,7 +251,7 @@ impl Storage {
         // Update matching rows
         for row in &mut rows {
             let matches = match &stmt.where_clause {
-                Some(wc) => evaluate_condition(&wc.condition, row, &schema.columns),
+                Some(wc) => evaluate_condition(&wc.condition, row, &schema.columns, self),
                 None => true, // No WHERE clause means update all rows
             };
 
@@ -292,7 +292,7 @@ impl Storage {
             .into_iter()
             .partition(|row| {
                 match &stmt.where_clause {
-                    Some(wc) => !evaluate_condition(&wc.condition, row, &schema.columns),
+                    Some(wc) => !evaluate_condition(&wc.condition, row, &schema.columns, self),
                     None => false,
                 }
             });
@@ -1218,26 +1218,54 @@ fn validate_timestamp_format(s: &str, column_name: &str) -> Result<(), StorageEr
 }
 
 /// Evaluate a WHERE condition against a row
-fn evaluate_condition(condition: &Condition, row: &[Value], schema: &[ColumnDefinition]) -> bool {
+/// Execute a scalar subquery and return the first column of the first row
+fn execute_scalar_subquery(stmt: &SelectStatement, storage: &Storage) -> Option<Value> {
+    let table_name = match &stmt.from {
+        FromClause::Table(t) => t.clone(),
+        _ => return None, // nested subquery FROM not supported here
+    };
+    let schema = storage.load_schema(&table_name).ok()?;
+    let rows = storage.read_rows(&table_name).ok()?;
+
+    let filtered: Vec<Vec<Value>> = rows.into_iter()
+        .filter(|row| match &stmt.where_clause {
+            Some(wc) => evaluate_condition(&wc.condition, row, &schema.columns, storage),
+            None => true,
+        })
+        .collect();
+
+    // Return first column of first row
+    let first_row = filtered.into_iter().next()?;
+    match stmt.columns.first() {
+        Some(SelectColumn::Column(name)) => {
+            let idx = schema.columns.iter().position(|c| c.name == *name)?;
+            first_row.get(idx).cloned()
+        }
+        Some(SelectColumn::Expr(_)) | Some(SelectColumn::All) => first_row.into_iter().next(),
+        _ => first_row.into_iter().next(),
+    }
+}
+
+fn evaluate_condition(condition: &Condition, row: &[Value], schema: &[ColumnDefinition], storage: &Storage) -> bool {
     match condition {
         Condition::And(left, right) => {
-            evaluate_condition(left, row, schema) && evaluate_condition(right, row, schema)
+            evaluate_condition(left, row, schema, storage) && evaluate_condition(right, row, schema, storage)
         }
         Condition::Or(left, right) => {
-            evaluate_condition(left, row, schema) || evaluate_condition(right, row, schema)
+            evaluate_condition(left, row, schema, storage) || evaluate_condition(right, row, schema, storage)
         }
-        Condition::Not(inner) => !evaluate_condition(inner, row, schema),
+        Condition::Not(inner) => !evaluate_condition(inner, row, schema, storage),
         Condition::Comparison { left, operator, right, upper_bound } => {
             if *operator == Operator::IsNull || *operator == Operator::IsNotNull {
-                let left_val = resolve_expression(left, row, schema);
+                let left_val = resolve_expression(left, row, schema, storage);
                 let is_null = matches!(left_val, Some(Value::Null) | None);
                 return if *operator == Operator::IsNull { is_null } else { !is_null };
             }
 
             if *operator == Operator::Between || *operator == Operator::NotBetween {
-                let val = resolve_expression(left, row, schema);
-                let low = resolve_expression(right, row, schema);
-                let high = upper_bound.as_ref().and_then(|e| resolve_expression(e, row, schema));
+                let val = resolve_expression(left, row, schema, storage);
+                let low = resolve_expression(right, row, schema, storage);
+                let high = upper_bound.as_ref().and_then(|e| resolve_expression(e, row, schema, storage));
                 let in_range = matches!((&val, &low, &high), (Some(v), Some(l), Some(h))
                     if compare_values(v, &Operator::GreaterThanOrEqual, l) && compare_values(v, &Operator::LessThanOrEqual, h));
                 return if *operator == Operator::Between { in_range } else { !in_range };
@@ -1245,14 +1273,14 @@ fn evaluate_condition(condition: &Condition, row: &[Value], schema: &[ColumnDefi
 
             if *operator == Operator::In || *operator == Operator::NotIn {
                 if let Expression::List(values) = right {
-                    let left_val = resolve_expression(left, row, schema);
+                    let left_val = resolve_expression(left, row, schema, storage);
                     let contains = left_val.map_or(false, |lv| values.contains(&lv));
                     return if *operator == Operator::In { contains } else { !contains };
                 }
             }
 
-            let left_val = resolve_expression(left, row, schema);
-            let right_val = resolve_expression(right, row, schema);
+            let left_val = resolve_expression(left, row, schema, storage);
+            let right_val = resolve_expression(right, row, schema, storage);
             match (&left_val, &right_val) {
                 (Some(l), Some(r)) => compare_values(l, operator, r),
                 _ => false,
@@ -1262,7 +1290,7 @@ fn evaluate_condition(condition: &Condition, row: &[Value], schema: &[ColumnDefi
 }
 
 /// Resolve an expression to a Value
-fn resolve_expression(expr: &Expression, row: &[Value], schema: &[ColumnDefinition]) -> Option<Value> {
+fn resolve_expression(expr: &Expression, row: &[Value], schema: &[ColumnDefinition], storage: &Storage) -> Option<Value> {
     match expr {
         Expression::Literal(v) => Some(v.clone()),
         Expression::Column(name) => {
@@ -1276,71 +1304,71 @@ fn resolve_expression(expr: &Expression, row: &[Value], schema: &[ColumnDefiniti
                 .position(|c| c.name == *col)
                 .map(|idx| row[idx].clone())
         }
-        Expression::Subquery(_) => None,
+        Expression::Subquery(subquery) => execute_scalar_subquery(subquery, storage),
         Expression::List(_) => None,
         Expression::ScalarFunc(func, inner) => {
-            resolve_expression(inner, row, schema).and_then(|v| apply_scalar_func(func, v))
+            resolve_expression(inner, row, schema, storage).and_then(|v| apply_scalar_func(func, v))
         }
         Expression::Coalesce(exprs) => {
             exprs.iter().find_map(|e| {
-                let v = resolve_expression(e, row, schema);
+                let v = resolve_expression(e, row, schema, storage);
                 match v { Some(Value::Null) | None => None, other => other }
             })
         }
         Expression::NullIf(a, b) => {
-            let va = resolve_expression(a, row, schema);
-            let vb = resolve_expression(b, row, schema);
+            let va = resolve_expression(a, row, schema, storage);
+            let vb = resolve_expression(b, row, schema, storage);
             match (&va, &vb) {
                 (Some(l), Some(r)) if l == r => Some(Value::Null),
                 _ => va,
             }
         }
         Expression::Round(val, places) => {
-            let v = resolve_expression(val, row, schema)?;
-            let p = places.as_ref().and_then(|e| resolve_expression(e, row, schema));
+            let v = resolve_expression(val, row, schema, storage)?;
+            let p = places.as_ref().and_then(|e| resolve_expression(e, row, schema, storage));
             apply_round(v, p)
         }
         Expression::Concat(exprs) => {
-            let parts: Vec<Option<Value>> = exprs.iter().map(|e| resolve_expression(e, row, schema)).collect();
+            let parts: Vec<Option<Value>> = exprs.iter().map(|e| resolve_expression(e, row, schema, storage)).collect();
             apply_concat(parts)
         }
         Expression::Substr(s, start, len) => {
-            let sv = resolve_expression(s, row, schema)?;
-            let startv = resolve_expression(start, row, schema)?;
-            let lenv = len.as_ref().and_then(|e| resolve_expression(e, row, schema));
+            let sv = resolve_expression(s, row, schema, storage)?;
+            let startv = resolve_expression(start, row, schema, storage)?;
+            let lenv = len.as_ref().and_then(|e| resolve_expression(e, row, schema, storage));
             apply_substr(sv, startv, lenv)
         }
         Expression::Replace(s, from, to) => {
-            let sv = resolve_expression(s, row, schema)?;
-            let fv = resolve_expression(from, row, schema)?;
-            let tv = resolve_expression(to, row, schema)?;
+            let sv = resolve_expression(s, row, schema, storage)?;
+            let fv = resolve_expression(from, row, schema, storage)?;
+            let tv = resolve_expression(to, row, schema, storage)?;
             apply_replace(sv, fv, tv)
         }
         Expression::LPad(s, len, pad) => {
-            let sv = resolve_expression(s, row, schema)?;
-            let lv = resolve_expression(len, row, schema)?;
-            let pv = resolve_expression(pad, row, schema)?;
+            let sv = resolve_expression(s, row, schema, storage)?;
+            let lv = resolve_expression(len, row, schema, storage)?;
+            let pv = resolve_expression(pad, row, schema, storage)?;
             apply_lpad(sv, lv, pv)
         }
         Expression::RPad(s, len, pad) => {
-            let sv = resolve_expression(s, row, schema)?;
-            let lv = resolve_expression(len, row, schema)?;
-            let pv = resolve_expression(pad, row, schema)?;
+            let sv = resolve_expression(s, row, schema, storage)?;
+            let lv = resolve_expression(len, row, schema, storage)?;
+            let pv = resolve_expression(pad, row, schema, storage)?;
             apply_rpad(sv, lv, pv)
         }
         Expression::Cast(inner, type_name) => {
-            let v = resolve_expression(inner, row, schema)?;
+            let v = resolve_expression(inner, row, schema, storage)?;
             apply_cast(v, type_name)
         }
         Expression::BinaryOp(_, _, _) => None,
         Expression::Aggregate(_, _) => None,
         Expression::Case(branches, else_expr) => {
             for (condition, result) in branches {
-                if evaluate_condition(condition, row, schema) {
-                    return resolve_expression(result, row, schema);
+                if evaluate_condition(condition, row, schema, storage) {
+                    return resolve_expression(result, row, schema, storage);
                 }
             }
-            else_expr.as_ref().and_then(|e| resolve_expression(e, row, schema))
+            else_expr.as_ref().and_then(|e| resolve_expression(e, row, schema, storage))
         }
     }
 }
@@ -3236,6 +3264,48 @@ mod tests {
 
         assert!(storage.find_index("users", "email").unwrap().is_none());
         assert_eq!(storage.find_index("users", "addr").unwrap().as_deref(), Some("idx_email"));
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_scalar_subquery_in_where() {
+        use crate::parser::parse_sql;
+        // Use lib::execute to run a full SQL roundtrip including scalar subquery
+        let temp_dir = std::env::temp_dir().join("abcsql_test_scalar_subq");
+        let _ = fs::remove_dir_all(&temp_dir);
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        // Create two tables
+        let create_users = "CREATE TABLE users (id INT, name VARCHAR)";
+        let create_limits = "CREATE TABLE limits (max_id INT)";
+        if let Ok((_, stmt)) = parse_sql(create_users) {
+            if let crate::parser::SqlStatement::CreateTable(s) = stmt { storage.create_table(&s).unwrap(); }
+        }
+        if let Ok((_, stmt)) = parse_sql(create_limits) {
+            if let crate::parser::SqlStatement::CreateTable(s) = stmt { storage.create_table(&s).unwrap(); }
+        }
+
+        // Insert rows
+        for sql in ["INSERT INTO users VALUES (1, 'Alice')", "INSERT INTO users VALUES (2, 'Bob')", "INSERT INTO limits VALUES (1)"] {
+            if let Ok((_, stmt)) = parse_sql(sql) {
+                if let crate::parser::SqlStatement::Insert(s) = stmt { storage.insert_row(&s).unwrap(); }
+            }
+        }
+
+        // Execute scalar subquery via evaluate_condition path (UPDATE WHERE)
+        let update_sql = "UPDATE users SET name = 'Updated' WHERE id = (SELECT max_id FROM limits)";
+        if let Ok((_, stmt)) = parse_sql(update_sql) {
+            if let crate::parser::SqlStatement::Update(s) = stmt {
+                let n = storage.update_rows(&s).unwrap();
+                assert_eq!(n, 1);
+            }
+        }
+
+        let rows = storage.read_rows("users").unwrap();
+        // Row 0 (id=1) should now be 'Updated', row 1 (id=2) unchanged
+        assert_eq!(rows[0][1], Value::String("Updated".to_string()));
+        assert_eq!(rows[1][1], Value::String("Bob".to_string()));
 
         fs::remove_dir_all(&temp_dir).unwrap();
     }

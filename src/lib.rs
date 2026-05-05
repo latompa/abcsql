@@ -157,7 +157,7 @@ fn execute_select_to_string(
                     .cloned()
                     .collect();
                 let matches = match &join.on {
-                    Some(cond) => eval_condition(cond, &candidate, &all_cols),
+                    Some(cond) => eval_condition(cond, &candidate, &all_cols, storage),
                     None => true, // CROSS JOIN — no condition
                 };
                 if matches {
@@ -182,7 +182,7 @@ fn execute_select_to_string(
                         .cloned()
                         .collect();
                     match &join.on {
-                        Some(cond) => eval_condition(cond, &candidate, &all_cols),
+                        Some(cond) => eval_condition(cond, &candidate, &all_cols, storage),
                         None => true,
                     }
                 });
@@ -202,7 +202,7 @@ fn execute_select_to_string(
     let rows: Vec<Vec<Value>> = combined_rows.into_iter()
         .filter(|row| {
             match &stmt.where_clause {
-                Some(wc) => eval_condition(&wc.condition, row, &combined_cols),
+                Some(wc) => eval_condition(&wc.condition, row, &combined_cols, storage),
                 None => true,
             }
         })
@@ -223,18 +223,41 @@ fn execute_select_to_string(
     Ok(format!("({} rows)", rows.len()))
 }
 
-fn eval_condition(cond: &parser::Condition, row: &[Value], cols: &[(String, String)]) -> bool {
+fn lib_execute_scalar_subquery(stmt: &parser::SelectStatement, storage: &Storage) -> Option<Value> {
+    let table_name = stmt.from.table_name()?;
+    let schema = storage.load_schema(table_name).ok()?;
+    let rows = storage.read_rows(table_name).ok()?;
+    let cols: Vec<(String, String)> = schema.columns.iter()
+        .map(|c| (table_name.to_string(), c.name.clone()))
+        .collect();
+    let filtered: Vec<Vec<Value>> = rows.into_iter()
+        .filter(|row| match &stmt.where_clause {
+            Some(wc) => eval_condition(&wc.condition, row, &cols, storage),
+            None => true,
+        })
+        .collect();
+    let first_row = filtered.into_iter().next()?;
+    match stmt.columns.first() {
+        Some(parser::SelectColumn::Column(name)) => {
+            let idx = schema.columns.iter().position(|c| c.name == *name)?;
+            first_row.get(idx).cloned()
+        }
+        _ => first_row.into_iter().next(),
+    }
+}
+
+fn eval_condition(cond: &parser::Condition, row: &[Value], cols: &[(String, String)], storage: &Storage) -> bool {
     match cond {
         parser::Condition::And(left, right) => {
-            eval_condition(left, row, cols) && eval_condition(right, row, cols)
+            eval_condition(left, row, cols, storage) && eval_condition(right, row, cols, storage)
         }
         parser::Condition::Or(left, right) => {
-            eval_condition(left, row, cols) || eval_condition(right, row, cols)
+            eval_condition(left, row, cols, storage) || eval_condition(right, row, cols, storage)
         }
-        parser::Condition::Not(inner) => !eval_condition(inner, row, cols),
+        parser::Condition::Not(inner) => !eval_condition(inner, row, cols, storage),
         parser::Condition::Comparison { left, operator, right, .. } => {
-            let lv = resolve_expr(left, row, cols);
-            let rv = resolve_expr(right, row, cols);
+            let lv = resolve_expr(left, row, cols, storage);
+            let rv = resolve_expr(right, row, cols, storage);
             match (lv, rv) {
                 (Some(l), Some(r)) => compare(&l, operator, &r),
                 _ => false,
@@ -243,7 +266,7 @@ fn eval_condition(cond: &parser::Condition, row: &[Value], cols: &[(String, Stri
     }
 }
 
-fn resolve_expr(expr: &parser::Expression, row: &[Value], cols: &[(String, String)]) -> Option<Value> {
+fn resolve_expr(expr: &parser::Expression, row: &[Value], cols: &[(String, String)], storage: &Storage) -> Option<Value> {
     match expr {
         parser::Expression::Literal(v) => Some(v.clone()),
         parser::Expression::Column(name) => {
@@ -252,60 +275,60 @@ fn resolve_expr(expr: &parser::Expression, row: &[Value], cols: &[(String, Strin
         parser::Expression::QualifiedColumn(table, col) => {
             cols.iter().position(|c| c.0 == *table && c.1 == *col).map(|i| row[i].clone())
         }
-        parser::Expression::Subquery(_) => None,
+        parser::Expression::Subquery(subquery) => lib_execute_scalar_subquery(subquery, storage),
         parser::Expression::List(_) => None,
         parser::Expression::ScalarFunc(func, inner) => {
-            resolve_expr(inner, row, cols).and_then(|v| parser::apply_scalar_func(func, v))
+            resolve_expr(inner, row, cols, storage).and_then(|v| parser::apply_scalar_func(func, v))
         }
         parser::Expression::Coalesce(exprs) => {
             exprs.iter().find_map(|e| {
-                let v = resolve_expr(e, row, cols);
+                let v = resolve_expr(e, row, cols, storage);
                 match v { Some(Value::Null) | None => None, other => other }
             })
         }
         parser::Expression::NullIf(a, b) => {
-            let va = resolve_expr(a, row, cols);
-            let vb = resolve_expr(b, row, cols);
+            let va = resolve_expr(a, row, cols, storage);
+            let vb = resolve_expr(b, row, cols, storage);
             match (&va, &vb) {
                 (Some(l), Some(r)) if l == r => Some(Value::Null),
                 _ => va,
             }
         }
         parser::Expression::Round(val, places) => {
-            let v = resolve_expr(val, row, cols)?;
-            let p = places.as_ref().and_then(|e| resolve_expr(e, row, cols));
+            let v = resolve_expr(val, row, cols, storage)?;
+            let p = places.as_ref().and_then(|e| resolve_expr(e, row, cols, storage));
             parser::apply_round(v, p)
         }
         parser::Expression::Concat(exprs) => {
-            let parts: Vec<Option<Value>> = exprs.iter().map(|e| resolve_expr(e, row, cols)).collect();
+            let parts: Vec<Option<Value>> = exprs.iter().map(|e| resolve_expr(e, row, cols, storage)).collect();
             parser::apply_concat(parts)
         }
         parser::Expression::Substr(s, start, len) => {
-            let sv = resolve_expr(s, row, cols)?;
-            let startv = resolve_expr(start, row, cols)?;
-            let lenv = len.as_ref().and_then(|e| resolve_expr(e, row, cols));
+            let sv = resolve_expr(s, row, cols, storage)?;
+            let startv = resolve_expr(start, row, cols, storage)?;
+            let lenv = len.as_ref().and_then(|e| resolve_expr(e, row, cols, storage));
             parser::apply_substr(sv, startv, lenv)
         }
         parser::Expression::Replace(s, from, to) => {
-            let sv = resolve_expr(s, row, cols)?;
-            let fv = resolve_expr(from, row, cols)?;
-            let tv = resolve_expr(to, row, cols)?;
+            let sv = resolve_expr(s, row, cols, storage)?;
+            let fv = resolve_expr(from, row, cols, storage)?;
+            let tv = resolve_expr(to, row, cols, storage)?;
             parser::apply_replace(sv, fv, tv)
         }
         parser::Expression::LPad(s, len, pad) => {
-            let sv = resolve_expr(s, row, cols)?;
-            let lv = resolve_expr(len, row, cols)?;
-            let pv = resolve_expr(pad, row, cols)?;
+            let sv = resolve_expr(s, row, cols, storage)?;
+            let lv = resolve_expr(len, row, cols, storage)?;
+            let pv = resolve_expr(pad, row, cols, storage)?;
             parser::apply_lpad(sv, lv, pv)
         }
         parser::Expression::RPad(s, len, pad) => {
-            let sv = resolve_expr(s, row, cols)?;
-            let lv = resolve_expr(len, row, cols)?;
-            let pv = resolve_expr(pad, row, cols)?;
+            let sv = resolve_expr(s, row, cols, storage)?;
+            let lv = resolve_expr(len, row, cols, storage)?;
+            let pv = resolve_expr(pad, row, cols, storage)?;
             parser::apply_rpad(sv, lv, pv)
         }
         parser::Expression::Cast(inner, type_name) => {
-            let v = resolve_expr(inner, row, cols)?;
+            let v = resolve_expr(inner, row, cols, storage)?;
             parser::apply_cast(v, type_name)
         }
         parser::Expression::BinaryOp(_, _, _) => None,

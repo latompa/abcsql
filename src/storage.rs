@@ -3,7 +3,7 @@ use std::io::{self, Write as IoWrite, BufWriter, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::fmt;
 use std::collections::HashMap;
-use crate::parser::{CreateTableStatement, CreateIndexStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, UpdateStatement, DeleteStatement, AlterTableStatement, AlterAction, Value, Condition, Expression, Operator, SelectStatement, SelectColumn, FromClause, apply_scalar_func, apply_round, apply_concat, apply_substr, apply_replace, apply_lpad, apply_rpad, apply_cast};
+use crate::parser::{CreateTableStatement, CreateIndexStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, UpdateStatement, DeleteStatement, AlterTableStatement, AlterAction, Value, Condition, Expression, Operator, ArithOp, SelectStatement, SelectColumn, FromClause, apply_scalar_func, apply_round, apply_concat, apply_substr, apply_replace, apply_lpad, apply_rpad, apply_cast};
 
 /// Storage engine for persisting tables to disk
 pub struct Storage {
@@ -1246,6 +1246,107 @@ fn execute_scalar_subquery(stmt: &SelectStatement, storage: &Storage) -> Option<
     }
 }
 
+/// Execute a correlated subquery; unresolved columns in WHERE fall back to the outer row/schema.
+fn execute_correlated_scalar_subquery(
+    stmt: &SelectStatement,
+    storage: &Storage,
+    outer_row: &[Value],
+    outer_schema: &[ColumnDefinition],
+) -> Option<Value> {
+    let table_name = match &stmt.from {
+        FromClause::Table(t) => t.clone(),
+        _ => return None,
+    };
+    let schema = storage.load_schema(&table_name).ok()?;
+    let rows = storage.read_rows(&table_name).ok()?;
+
+    let filtered: Vec<Vec<Value>> = rows.into_iter()
+        .filter(|row| match &stmt.where_clause {
+            Some(wc) => evaluate_correlated_condition_storage(
+                &wc.condition, row, &schema.columns, storage, outer_row, outer_schema
+            ),
+            None => true,
+        })
+        .collect();
+
+    let first_row = filtered.into_iter().next()?;
+    match stmt.columns.first() {
+        Some(SelectColumn::Column(name)) => {
+            let idx = schema.columns.iter().position(|c| c.name == *name)?;
+            first_row.get(idx).cloned()
+        }
+        _ => first_row.into_iter().next(),
+    }
+}
+
+/// Evaluate condition with fallback to outer row context for correlated references
+fn evaluate_correlated_condition_storage(
+    condition: &Condition,
+    row: &[Value],
+    schema: &[ColumnDefinition],
+    storage: &Storage,
+    outer_row: &[Value],
+    outer_schema: &[ColumnDefinition],
+) -> bool {
+    match condition {
+        Condition::And(l, r) => {
+            evaluate_correlated_condition_storage(l, row, schema, storage, outer_row, outer_schema)
+                && evaluate_correlated_condition_storage(r, row, schema, storage, outer_row, outer_schema)
+        }
+        Condition::Or(l, r) => {
+            evaluate_correlated_condition_storage(l, row, schema, storage, outer_row, outer_schema)
+                || evaluate_correlated_condition_storage(r, row, schema, storage, outer_row, outer_schema)
+        }
+        Condition::Not(inner) => !evaluate_correlated_condition_storage(inner, row, schema, storage, outer_row, outer_schema),
+        Condition::Comparison { left, operator, right, upper_bound } => {
+            let lv = resolve_correlated_expr_storage(left, row, schema, storage, outer_row, outer_schema);
+            let rv = resolve_correlated_expr_storage(right, row, schema, storage, outer_row, outer_schema);
+            if *operator == Operator::IsNull || *operator == Operator::IsNotNull {
+                let is_null = matches!(lv, Some(Value::Null) | None);
+                return if *operator == Operator::IsNull { is_null } else { !is_null };
+            }
+            if *operator == Operator::Between || *operator == Operator::NotBetween {
+                let high = upper_bound.as_ref().and_then(|e| resolve_correlated_expr_storage(e, row, schema, storage, outer_row, outer_schema));
+                let in_range = matches!((&lv, &rv, &high), (Some(v), Some(l), Some(h))
+                    if compare_values(v, &Operator::GreaterThanOrEqual, l) && compare_values(v, &Operator::LessThanOrEqual, h));
+                return if *operator == Operator::Between { in_range } else { !in_range };
+            }
+            match (&lv, &rv) {
+                (Some(l), Some(r)) => compare_values(l, operator, r),
+                _ => false,
+            }
+        }
+    }
+}
+
+/// Resolve expression with fallback to outer schema for correlated column references
+fn resolve_correlated_expr_storage(
+    expr: &Expression,
+    row: &[Value],
+    schema: &[ColumnDefinition],
+    storage: &Storage,
+    outer_row: &[Value],
+    outer_schema: &[ColumnDefinition],
+) -> Option<Value> {
+    match expr {
+        Expression::Column(name) => {
+            // Try inner schema first
+            if let Some(idx) = schema.iter().position(|c| c.name == *name) {
+                return Some(row[idx].clone());
+            }
+            // Fall back to outer schema
+            outer_schema.iter().position(|c| c.name == *name).map(|idx| outer_row[idx].clone())
+        }
+        Expression::QualifiedColumn(_, col) => {
+            if let Some(idx) = schema.iter().position(|c| c.name == *col) {
+                return Some(row[idx].clone());
+            }
+            outer_schema.iter().position(|c| c.name == *col).map(|idx| outer_row[idx].clone())
+        }
+        _ => resolve_expression(expr, row, schema, storage),
+    }
+}
+
 fn evaluate_condition(condition: &Condition, row: &[Value], schema: &[ColumnDefinition], storage: &Storage) -> bool {
     match condition {
         Condition::And(left, right) => {
@@ -1271,12 +1372,29 @@ fn evaluate_condition(condition: &Condition, row: &[Value], schema: &[ColumnDefi
                 return if *operator == Operator::Between { in_range } else { !in_range };
             }
 
-            if *operator == Operator::In || *operator == Operator::NotIn {
-                if let Expression::List(values) = right {
-                    let left_val = resolve_expression(left, row, schema, storage);
-                    let contains = left_val.map_or(false, |lv| values.contains(&lv));
-                    return if *operator == Operator::In { contains } else { !contains };
+            if *operator == Operator::Exists || *operator == Operator::NotExists {
+                if let Expression::Subquery(subquery) = right {
+                    let exists = execute_correlated_scalar_subquery(subquery, storage, row, schema).is_some();
+                    return if *operator == Operator::NotExists { !exists } else { exists };
                 }
+                return false;
+            }
+
+            if *operator == Operator::In || *operator == Operator::NotIn {
+                let left_val = resolve_expression(left, row, schema, storage);
+                let contains = match right {
+                    Expression::List(exprs) => {
+                        left_val.map_or(false, |lv| {
+                            exprs.iter().any(|e| resolve_expression(e, row, schema, storage).map_or(false, |rv| rv == lv))
+                        })
+                    }
+                    Expression::Subquery(subquery) => {
+                        let first = execute_scalar_subquery(subquery, storage);
+                        left_val.map_or(false, |lv| first.map_or(false, |rv| rv == lv))
+                    }
+                    _ => false,
+                };
+                return if *operator == Operator::In { contains } else { !contains };
             }
 
             let left_val = resolve_expression(left, row, schema, storage);
@@ -1360,7 +1478,11 @@ fn resolve_expression(expr: &Expression, row: &[Value], schema: &[ColumnDefiniti
             let v = resolve_expression(inner, row, schema, storage)?;
             apply_cast(v, type_name)
         }
-        Expression::BinaryOp(_, _, _) => None,
+        Expression::BinaryOp(left, op, right) => {
+            let lv = resolve_expression(left, row, schema, storage)?;
+            let rv = resolve_expression(right, row, schema, storage)?;
+            storage_eval_arith(&lv, op, &rv)
+        }
         Expression::Aggregate(_, _) => None,
         Expression::Window(_, _) => None,
         Expression::Case(branches, else_expr) => {
@@ -1418,6 +1540,54 @@ fn compare_values(left: &Value, op: &Operator, right: &Value) -> bool {
         },
         _ => false,
     }
+}
+
+/// Evaluate a binary arithmetic / concatenation operation on two Values
+fn storage_eval_arith(left: &Value, op: &ArithOp, right: &Value) -> Option<Value> {
+    if let ArithOp::Concat = op {
+        let ls = match left {
+            Value::String(s) => s.clone(),
+            Value::Int(n) => n.to_string(),
+            Value::Float(f) => format!("{}", f),
+            Value::Null => return Some(Value::Null),
+            Value::Bool(b) => b.to_string(),
+        };
+        let rs = match right {
+            Value::String(s) => s.clone(),
+            Value::Int(n) => n.to_string(),
+            Value::Float(f) => format!("{}", f),
+            Value::Null => return Some(Value::Null),
+            Value::Bool(b) => b.to_string(),
+        };
+        return Some(Value::String(ls + &rs));
+    }
+    match (left, right) {
+        (Value::Int(l), Value::Int(r)) => {
+            let v = match op {
+                ArithOp::Add => l + r,
+                ArithOp::Sub => l - r,
+                ArithOp::Mul => l * r,
+                ArithOp::Div => { if *r == 0 { return Some(Value::Null); } l / r }
+                ArithOp::Concat => unreachable!(),
+            };
+            Some(Value::Int(v))
+        }
+        (Value::Float(l), Value::Float(r)) => storage_arith_f64(*l, op, *r),
+        (Value::Int(l), Value::Float(r)) => storage_arith_f64(*l as f64, op, *r),
+        (Value::Float(l), Value::Int(r)) => storage_arith_f64(*l, op, *r as f64),
+        _ => Some(Value::Null),
+    }
+}
+
+fn storage_arith_f64(l: f64, op: &ArithOp, r: f64) -> Option<Value> {
+    let v = match op {
+        ArithOp::Add => l + r,
+        ArithOp::Sub => l - r,
+        ArithOp::Mul => l * r,
+        ArithOp::Div => { if r == 0.0 { return Some(Value::Null); } l / r }
+        ArithOp::Concat => return Some(Value::String(format!("{}{}", l, r))),
+    };
+    Some(Value::Float(v))
 }
 
 /// SQL LIKE pattern matching: % matches any sequence, _ matches any single char

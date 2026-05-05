@@ -224,15 +224,25 @@ fn execute_select_to_string(
 }
 
 fn lib_execute_scalar_subquery(stmt: &parser::SelectStatement, storage: &Storage) -> Option<Value> {
+    lib_execute_correlated_subquery(stmt, storage, &[], &[])
+}
+
+/// Execute a subquery with optional outer row context for correlated references.
+fn lib_execute_correlated_subquery(
+    stmt: &parser::SelectStatement,
+    storage: &Storage,
+    outer_row: &[Value],
+    outer_cols: &[(String, String)],
+) -> Option<Value> {
     let table_name = stmt.from.table_name()?;
     let schema = storage.load_schema(table_name).ok()?;
     let rows = storage.read_rows(table_name).ok()?;
-    let cols: Vec<(String, String)> = schema.columns.iter()
+    let inner_cols: Vec<(String, String)> = schema.columns.iter()
         .map(|c| (table_name.to_string(), c.name.clone()))
         .collect();
     let filtered: Vec<Vec<Value>> = rows.into_iter()
         .filter(|row| match &stmt.where_clause {
-            Some(wc) => eval_condition(&wc.condition, row, &cols, storage),
+            Some(wc) => eval_correlated_condition(&wc.condition, row, &inner_cols, storage, outer_row, outer_cols),
             None => true,
         })
         .collect();
@@ -246,6 +256,100 @@ fn lib_execute_scalar_subquery(stmt: &parser::SelectStatement, storage: &Storage
     }
 }
 
+/// Evaluate a condition, falling back to outer_cols/outer_row for unresolved column references.
+fn eval_correlated_condition(
+    cond: &parser::Condition,
+    row: &[Value],
+    cols: &[(String, String)],
+    storage: &Storage,
+    outer_row: &[Value],
+    outer_cols: &[(String, String)],
+) -> bool {
+    match cond {
+        parser::Condition::And(l, r) => {
+            eval_correlated_condition(l, row, cols, storage, outer_row, outer_cols)
+                && eval_correlated_condition(r, row, cols, storage, outer_row, outer_cols)
+        }
+        parser::Condition::Or(l, r) => {
+            eval_correlated_condition(l, row, cols, storage, outer_row, outer_cols)
+                || eval_correlated_condition(r, row, cols, storage, outer_row, outer_cols)
+        }
+        parser::Condition::Not(inner) => {
+            !eval_correlated_condition(inner, row, cols, storage, outer_row, outer_cols)
+        }
+        parser::Condition::Comparison { left, operator, right, upper_bound } => {
+            if *operator == parser::Operator::IsNull || *operator == parser::Operator::IsNotNull {
+                let lv = resolve_correlated_expr(left, row, cols, storage, outer_row, outer_cols);
+                let is_null = matches!(lv, Some(Value::Null) | None);
+                return if *operator == parser::Operator::IsNull { is_null } else { !is_null };
+            }
+            if *operator == parser::Operator::Between || *operator == parser::Operator::NotBetween {
+                let val = resolve_correlated_expr(left, row, cols, storage, outer_row, outer_cols);
+                let low = resolve_correlated_expr(right, row, cols, storage, outer_row, outer_cols);
+                let high = upper_bound.as_ref().and_then(|e| resolve_correlated_expr(e, row, cols, storage, outer_row, outer_cols));
+                let in_range = matches!((&val, &low, &high), (Some(v), Some(l), Some(h))
+                    if compare(v, &parser::Operator::GreaterThanOrEqual, l) && compare(v, &parser::Operator::LessThanOrEqual, h));
+                return if *operator == parser::Operator::Between { in_range } else { !in_range };
+            }
+            if *operator == parser::Operator::In || *operator == parser::Operator::NotIn {
+                let lv = resolve_correlated_expr(left, row, cols, storage, outer_row, outer_cols);
+                let contains = match right {
+                    parser::Expression::List(exprs) => lv.map_or(false, |lv| {
+                        exprs.iter().any(|e| resolve_correlated_expr(e, row, cols, storage, outer_row, outer_cols).map_or(false, |rv| rv == lv))
+                    }),
+                    parser::Expression::Subquery(sub) => {
+                        let first = lib_execute_scalar_subquery(sub, storage);
+                        lv.map_or(false, |lv| first.map_or(false, |rv| rv == lv))
+                    }
+                    _ => false,
+                };
+                return if *operator == parser::Operator::NotIn { !contains } else { contains };
+            }
+            if *operator == parser::Operator::Exists || *operator == parser::Operator::NotExists {
+                if let parser::Expression::Subquery(sub) = right {
+                    let exists = lib_execute_correlated_subquery(sub, storage, row, cols).is_some();
+                    return if *operator == parser::Operator::NotExists { !exists } else { exists };
+                }
+                return false;
+            }
+            let lv = resolve_correlated_expr(left, row, cols, storage, outer_row, outer_cols);
+            let rv = resolve_correlated_expr(right, row, cols, storage, outer_row, outer_cols);
+            match (lv, rv) {
+                (Some(l), Some(r)) => compare(&l, operator, &r),
+                _ => false,
+            }
+        }
+    }
+}
+
+/// Resolve expression with fallback to outer_cols for correlated column references.
+fn resolve_correlated_expr(
+    expr: &parser::Expression,
+    row: &[Value],
+    cols: &[(String, String)],
+    storage: &Storage,
+    outer_row: &[Value],
+    outer_cols: &[(String, String)],
+) -> Option<Value> {
+    match expr {
+        parser::Expression::Column(name) => {
+            // Try inner cols first, then outer cols
+            if let Some(i) = cols.iter().position(|c| c.1 == *name) {
+                return Some(row[i].clone());
+            }
+            outer_cols.iter().position(|c| c.1 == *name).map(|i| outer_row[i].clone())
+        }
+        parser::Expression::QualifiedColumn(table, col) => {
+            if let Some(i) = cols.iter().position(|c| c.0 == *table && c.1 == *col) {
+                return Some(row[i].clone());
+            }
+            outer_cols.iter().position(|c| c.0 == *table && c.1 == *col).map(|i| outer_row[i].clone())
+        }
+        // For all other expression types, delegate to resolve_expr (uses inner row/cols only)
+        other => resolve_expr(other, row, cols, storage),
+    }
+}
+
 fn eval_condition(cond: &parser::Condition, row: &[Value], cols: &[(String, String)], storage: &Storage) -> bool {
     match cond {
         parser::Condition::And(left, right) => {
@@ -255,7 +359,43 @@ fn eval_condition(cond: &parser::Condition, row: &[Value], cols: &[(String, Stri
             eval_condition(left, row, cols, storage) || eval_condition(right, row, cols, storage)
         }
         parser::Condition::Not(inner) => !eval_condition(inner, row, cols, storage),
-        parser::Condition::Comparison { left, operator, right, .. } => {
+        parser::Condition::Comparison { left, operator, right, upper_bound } => {
+            if *operator == parser::Operator::IsNull || *operator == parser::Operator::IsNotNull {
+                let lv = resolve_expr(left, row, cols, storage);
+                let is_null = matches!(lv, Some(Value::Null) | None);
+                return if *operator == parser::Operator::IsNull { is_null } else { !is_null };
+            }
+            if *operator == parser::Operator::Between || *operator == parser::Operator::NotBetween {
+                let val = resolve_expr(left, row, cols, storage);
+                let low = resolve_expr(right, row, cols, storage);
+                let high = upper_bound.as_ref().and_then(|e| resolve_expr(e, row, cols, storage));
+                let in_range = matches!((&val, &low, &high), (Some(v), Some(l), Some(h))
+                    if compare(v, &parser::Operator::GreaterThanOrEqual, l) && compare(v, &parser::Operator::LessThanOrEqual, h));
+                return if *operator == parser::Operator::Between { in_range } else { !in_range };
+            }
+            if *operator == parser::Operator::In || *operator == parser::Operator::NotIn {
+                let lv = resolve_expr(left, row, cols, storage);
+                let contains = match right {
+                    parser::Expression::List(exprs) => {
+                        lv.map_or(false, |lv| {
+                            exprs.iter().any(|e| resolve_expr(e, row, cols, storage).map_or(false, |rv| rv == lv))
+                        })
+                    }
+                    parser::Expression::Subquery(sub) => {
+                        let first = lib_execute_scalar_subquery(sub, storage);
+                        lv.map_or(false, |lv| first.map_or(false, |rv| rv == lv))
+                    }
+                    _ => false,
+                };
+                return if *operator == parser::Operator::NotIn { !contains } else { contains };
+            }
+            if *operator == parser::Operator::Exists || *operator == parser::Operator::NotExists {
+                if let parser::Expression::Subquery(sub) = right {
+                    let exists = lib_execute_correlated_subquery(sub, storage, row, cols).is_some();
+                    return if *operator == parser::Operator::NotExists { !exists } else { exists };
+                }
+                return false;
+            }
             let lv = resolve_expr(left, row, cols, storage);
             let rv = resolve_expr(right, row, cols, storage);
             match (lv, rv) {
@@ -331,10 +471,87 @@ fn resolve_expr(expr: &parser::Expression, row: &[Value], cols: &[(String, Strin
             let v = resolve_expr(inner, row, cols, storage)?;
             parser::apply_cast(v, type_name)
         }
-        parser::Expression::BinaryOp(_, _, _) => None,
+        parser::Expression::BinaryOp(left, op, right) => {
+            let lv = resolve_expr(left, row, cols, storage)?;
+            let rv = resolve_expr(right, row, cols, storage)?;
+            lib_eval_arith(&lv, op, &rv)
+        }
         parser::Expression::Aggregate(_, _) => None,
         parser::Expression::Window(_, _) => None,
-        parser::Expression::Case(_, _) => None,
+        parser::Expression::Case(branches, else_expr) => {
+            for (cond, then_expr) in branches {
+                if eval_condition(cond, row, cols, storage) {
+                    return resolve_expr(then_expr, row, cols, storage);
+                }
+            }
+            else_expr.as_ref().and_then(|e| resolve_expr(e, row, cols, storage))
+        }
+    }
+}
+
+/// Evaluate a binary arithmetic / concatenation operation
+fn lib_eval_arith(left: &Value, op: &parser::ArithOp, right: &Value) -> Option<Value> {
+    if let parser::ArithOp::Concat = op {
+        let ls = match left {
+            Value::String(s) => s.clone(),
+            Value::Int(n) => n.to_string(),
+            Value::Float(f) => format!("{}", f),
+            Value::Null => return Some(Value::Null),
+            Value::Bool(b) => b.to_string(),
+        };
+        let rs = match right {
+            Value::String(s) => s.clone(),
+            Value::Int(n) => n.to_string(),
+            Value::Float(f) => format!("{}", f),
+            Value::Null => return Some(Value::Null),
+            Value::Bool(b) => b.to_string(),
+        };
+        return Some(Value::String(ls + &rs));
+    }
+    match (left, right) {
+        (Value::Int(l), Value::Int(r)) => {
+            let v = match op {
+                parser::ArithOp::Add => l + r,
+                parser::ArithOp::Sub => l - r,
+                parser::ArithOp::Mul => l * r,
+                parser::ArithOp::Div => { if *r == 0 { return Some(Value::Null); } l / r }
+                parser::ArithOp::Concat => unreachable!(),
+            };
+            Some(Value::Int(v))
+        }
+        (Value::Float(l), Value::Float(r)) => {
+            let v = match op {
+                parser::ArithOp::Add => l + r,
+                parser::ArithOp::Sub => l - r,
+                parser::ArithOp::Mul => l * r,
+                parser::ArithOp::Div => { if *r == 0.0 { return Some(Value::Null); } l / r }
+                parser::ArithOp::Concat => unreachable!(),
+            };
+            Some(Value::Float(v))
+        }
+        (Value::Int(l), Value::Float(r)) => {
+            let l = *l as f64;
+            let v = match op {
+                parser::ArithOp::Add => l + r,
+                parser::ArithOp::Sub => l - r,
+                parser::ArithOp::Mul => l * r,
+                parser::ArithOp::Div => { if *r == 0.0 { return Some(Value::Null); } l / r }
+                parser::ArithOp::Concat => unreachable!(),
+            };
+            Some(Value::Float(v))
+        }
+        (Value::Float(l), Value::Int(r)) => {
+            let r = *r as f64;
+            let v = match op {
+                parser::ArithOp::Add => l + r,
+                parser::ArithOp::Sub => l - r,
+                parser::ArithOp::Mul => l * r,
+                parser::ArithOp::Div => { if r == 0.0 { return Some(Value::Null); } l / r }
+                parser::ArithOp::Concat => unreachable!(),
+            };
+            Some(Value::Float(v))
+        }
+        _ => None,
     }
 }
 

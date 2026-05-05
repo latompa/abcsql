@@ -173,6 +173,10 @@ pub struct SelectStatement {
 pub enum UnionType {
     Union,
     UnionAll,
+    Intersect,
+    IntersectAll,
+    Except,
+    ExceptAll,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -201,6 +205,7 @@ pub struct CteDefinition {
 #[derive(Debug, PartialEq, Clone)]
 pub enum SelectColumn {
     All, // *
+    StarFromTable(String), // t.*
     Column(String),
     QualifiedColumn(String, String), // table.column
     Aggregate(AggregateFunc, Box<SelectColumn>), // COUNT(*), SUM(col), etc.
@@ -211,6 +216,7 @@ pub enum SelectColumn {
 #[derive(Debug, PartialEq, Clone)]
 pub enum AggregateFunc {
     Count,
+    CountDistinct,
     Sum,
     Avg,
     Min,
@@ -218,9 +224,29 @@ pub enum AggregateFunc {
 }
 
 #[derive(Debug, PartialEq, Clone)]
+pub enum FrameMode { Rows, Range, Groups }
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum FrameBound {
+    UnboundedPreceding,
+    Preceding(u64),
+    CurrentRow,
+    Following(u64),
+    UnboundedFollowing,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct FrameSpec {
+    pub mode: FrameMode,
+    pub start: FrameBound,
+    pub end: FrameBound,
+}
+
+#[derive(Debug, PartialEq, Clone)]
 pub struct WindowSpec {
     pub partition_by: Vec<Expression>,
     pub order_by: Vec<OrderByClause>,
+    pub frame: Option<FrameSpec>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -250,6 +276,7 @@ pub enum ScalarFunc {
 pub struct OrderByClause {
     pub column: SelectColumn,
     pub descending: bool,
+    pub nulls_first: Option<bool>, // None = default (NULLs last for ASC, first for DESC)
 }
 #[derive(Debug, PartialEq, Clone)]
 pub struct WhereClause {
@@ -314,8 +341,8 @@ pub enum Expression {
     Aggregate(AggregateFunc, Box<SelectColumn>),
     // CASE WHEN cond THEN expr ... [ELSE expr] END
     Case(Vec<(Condition, Expression)>, Option<Box<Expression>>),
-    // Literal value list for IN (1, 2, 3)
-    List(Vec<Value>),
+    // Expression list for IN (expr, expr, ...) — items can be any scalar expressions
+    List(Vec<Expression>),
     // Scalar string function: UPPER(expr), LOWER(expr), etc.
     ScalarFunc(ScalarFunc, Box<Expression>),
     // COALESCE(expr, expr, ...) — first non-NULL value
@@ -345,6 +372,7 @@ pub enum ArithOp {
     Sub,
     Mul,
     Div,
+    Concat, // || operator
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -889,18 +917,29 @@ pub fn parse_select_statement(input: &str) -> IResult<&str, SelectStatement> {
     let (input, order_by) = parse_order_by_clause(input)?;
     let (input, (limit, offset)) = parse_limit_offset_clause(input)?;
 
-    // Try to parse UNION [ALL] SELECT ...
+    // Try to parse UNION [ALL] / INTERSECT [ALL] / EXCEPT [ALL] SELECT ...
     let (input, union) = {
         let input_before_union = input;
-        if let Ok((input, _)) = nom::sequence::preceded(
-            multispace0::<&str, nom::error::Error<&str>>,
-            tag_no_case("UNION"),
-        )(input) {
-            let (input, _) = multispace1(input)?;
-            let (input, all) = nom::combinator::opt(nom::sequence::terminated(tag_no_case("ALL"), multispace1))(input)?;
-            let union_type = if all.is_some() { UnionType::UnionAll } else { UnionType::Union };
-            let (input, right) = parse_select_statement(input)?;
-            (input, Some((union_type, Box::new(right))))
+        let (input_trimmed, _) = multispace0::<&str, nom::error::Error<&str>>(input)?;
+        let set_op = nom::branch::alt((
+            nom::combinator::map(tag_no_case::<&str, &str, nom::error::Error<&str>>("UNION"), |_| "UNION"),
+            nom::combinator::map(tag_no_case("INTERSECT"), |_| "INTERSECT"),
+            nom::combinator::map(tag_no_case("EXCEPT"), |_| "EXCEPT"),
+        ))(input_trimmed);
+        if let Ok((after_kw, kw)) = set_op {
+            let (after_kw, _) = multispace1(after_kw)?;
+            let (after_kw, all) = nom::combinator::opt(nom::sequence::terminated(tag_no_case("ALL"), multispace1))(after_kw)?;
+            let union_type = match (kw, all.is_some()) {
+                ("UNION", false) => UnionType::Union,
+                ("UNION", true)  => UnionType::UnionAll,
+                ("INTERSECT", false) => UnionType::Intersect,
+                ("INTERSECT", true)  => UnionType::IntersectAll,
+                ("EXCEPT", false) => UnionType::Except,
+                ("EXCEPT", true)  => UnionType::ExceptAll,
+                _ => unreachable!(),
+            };
+            let (after_kw, right) = parse_select_statement(after_kw)?;
+            (after_kw, Some((union_type, Box::new(right))))
         } else {
             (input_before_union, None)
         }
@@ -965,6 +1004,7 @@ fn parse_select_column(input: &str) -> IResult<&str, SelectColumn> {
     let (input, _) = multispace0(input)?;
     let (input, col) = nom::branch::alt((
         parse_all_column,
+        parse_star_from_table, // t.* must come before parse_arith_select_column
         parse_arith_select_column, // must come before parse_aggregate_column to catch window agg functions
         parse_aggregate_column,
         parse_qualified_column,
@@ -981,7 +1021,7 @@ fn parse_select_column(input: &str) -> IResult<&str, SelectColumn> {
     Ok((input, col))
 }
 
-/// Parse arithmetic expression as a select column (only matches if there's an operator)
+/// Parse arithmetic expression as a select column (complex exprs, literals, subqueries)
 fn parse_arith_select_column(input: &str) -> IResult<&str, SelectColumn> {
     let (new_input, expr) = parse_expression(input)?;
     match &expr {
@@ -989,12 +1029,13 @@ fn parse_arith_select_column(input: &str) -> IResult<&str, SelectColumn> {
         | Expression::Coalesce(_) | Expression::NullIf(_, _)
         | Expression::Round(_, _) | Expression::Concat(_) | Expression::Substr(_, _, _)
         | Expression::Replace(_, _, _) | Expression::LPad(_, _, _) | Expression::RPad(_, _, _)
-        | Expression::Cast(_, _) | Expression::Window(_, _) => Ok((new_input, SelectColumn::Expr(expr))),
+        | Expression::Cast(_, _) | Expression::Window(_, _)
+        | Expression::Literal(_) | Expression::Subquery(_) => Ok((new_input, SelectColumn::Expr(expr))),
         _ => Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag))),
     }
 }
 
-/// Parse aggregate function: COUNT(*), SUM(col), AVG(col), MIN(col), MAX(col)
+/// Parse aggregate function: COUNT(*), COUNT(DISTINCT col), SUM(col), AVG(col), MIN(col), MAX(col)
 fn parse_aggregate_column(input: &str) -> IResult<&str, SelectColumn> {
     let (input, func_name) = nom::branch::alt((
         tag_no_case("COUNT"),
@@ -1003,22 +1044,46 @@ fn parse_aggregate_column(input: &str) -> IResult<&str, SelectColumn> {
         tag_no_case("MIN"),
         tag_no_case("MAX"),
     ))(input)?;
-    let func = match func_name.to_uppercase().as_str() {
-        "COUNT" => AggregateFunc::Count,
-        "SUM" => AggregateFunc::Sum,
-        "AVG" => AggregateFunc::Avg,
-        "MIN" => AggregateFunc::Min,
-        "MAX" => AggregateFunc::Max,
-        _ => unreachable!(),
-    };
     let (input, _) = multispace0(input)?;
     let (input, _) = nom_char('(')(input)?;
     let (input, _) = multispace0(input)?;
-    let (input, inner) = nom::branch::alt((
-        parse_all_column,
-        parse_qualified_column,
-        parse_simple_column,
-    ))(input)?;
+
+    // Check for COUNT(DISTINCT ...)
+    let is_count = func_name.eq_ignore_ascii_case("COUNT");
+    let (input, func, inner) = if is_count {
+        if let Ok((rest, _)) = nom::sequence::terminated(
+            tag_no_case::<&str, &str, nom::error::Error<&str>>("DISTINCT"),
+            multispace1,
+        )(input) {
+            let (rest, inner) = nom::branch::alt((
+                parse_qualified_column,
+                parse_simple_column,
+            ))(rest)?;
+            (rest, AggregateFunc::CountDistinct, inner)
+        } else {
+            let (rest, inner) = nom::branch::alt((
+                parse_all_column,
+                parse_qualified_column,
+                parse_simple_column,
+            ))(input)?;
+            (rest, AggregateFunc::Count, inner)
+        }
+    } else {
+        let func = match func_name.to_uppercase().as_str() {
+            "SUM" => AggregateFunc::Sum,
+            "AVG" => AggregateFunc::Avg,
+            "MIN" => AggregateFunc::Min,
+            "MAX" => AggregateFunc::Max,
+            _ => unreachable!(),
+        };
+        let (rest, inner) = nom::branch::alt((
+            parse_all_column,
+            parse_qualified_column,
+            parse_simple_column,
+        ))(input)?;
+        (rest, func, inner)
+    };
+
     let (input, _) = multispace0(input)?;
     let (input, _) = nom_char(')')(input)?;
     Ok((input, SelectColumn::Aggregate(func, Box::new(inner))))
@@ -1027,6 +1092,14 @@ fn parse_aggregate_column(input: &str) -> IResult<&str, SelectColumn> {
 fn parse_all_column(input: &str) -> IResult<&str, SelectColumn> {
     let (input, _) = nom_char('*')(input)?;
     Ok((input, SelectColumn::All))
+}
+
+/// Parse t.* — table-qualified wildcard
+fn parse_star_from_table(input: &str) -> IResult<&str, SelectColumn> {
+    let (input, table) = parse_identifier(input)?;
+    let (input, _) = nom_char('.')(input)?;
+    let (input, _) = nom_char('*')(input)?;
+    Ok((input, SelectColumn::StarFromTable(table.to_string())))
 }
 
 fn parse_qualified_column(input: &str) -> IResult<&str, SelectColumn> {
@@ -1101,7 +1174,7 @@ fn parse_order_by_clause(input: &str) -> IResult<&str, Vec<OrderByClause>> {
     }
 }
 
-/// Parse a single ORDER BY item: column [ASC|DESC]
+/// Parse a single ORDER BY item: column [ASC|DESC] [NULLS FIRST|LAST]
 fn parse_order_by_item(input: &str) -> IResult<&str, OrderByClause> {
     let (input, _) = multispace0(input)?;
     let (input, column) = nom::branch::alt((
@@ -1113,8 +1186,19 @@ fn parse_order_by_item(input: &str) -> IResult<&str, OrderByClause> {
         tag_no_case("ASC"),
         tag_no_case("DESC"),
     )))(input)?;
-    let descending = dir == Some("DESC");
-    Ok((input, OrderByClause { column, descending }))
+    let descending = dir.map(|d| d.eq_ignore_ascii_case("DESC")).unwrap_or(false);
+    // Parse optional NULLS FIRST / NULLS LAST
+    let (input, nulls_first) = nom::combinator::opt(nom::sequence::preceded(
+        nom::sequence::pair(multispace1, tag_no_case("NULLS")),
+        nom::sequence::preceded(
+            multispace1,
+            nom::branch::alt((
+                nom::combinator::map(tag_no_case("FIRST"), |_| true),
+                nom::combinator::map(tag_no_case("LAST"), |_| false),
+            )),
+        ),
+    ))(input)?;
+    Ok((input, OrderByClause { column, descending, nulls_first }))
 }
 
 /// Parse LIMIT clause (returns None if not present)
@@ -1143,7 +1227,7 @@ fn parse_limit_offset_clause(input: &str) -> IResult<&str, (Option<u64>, Option<
 
 /// Check if identifier is a reserved keyword that can't be used as an alias
 fn is_reserved_keyword(s: &str) -> bool {
-    matches!(s.to_uppercase().as_str(), "ON" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "OUTER" | "CROSS" | "WHERE" | "ORDER" | "GROUP" | "LIMIT" | "OFFSET" | "HAVING" | "UNION" | "ALL" | "CASE" | "WHEN" | "THEN" | "ELSE" | "END" | "AND" | "OR" | "NOT" | "AS" | "VIEW" | "OVER" | "PARTITION")
+    matches!(s.to_uppercase().as_str(), "ON" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "OUTER" | "CROSS" | "WHERE" | "ORDER" | "GROUP" | "LIMIT" | "OFFSET" | "HAVING" | "UNION" | "ALL" | "CASE" | "WHEN" | "THEN" | "ELSE" | "END" | "AND" | "OR" | "NOT" | "AS" | "VIEW" | "OVER" | "PARTITION" | "NULLS" | "FIRST" | "LAST" | "INTERSECT" | "EXCEPT" | "ROWS" | "RANGE" | "GROUPS" | "PRECEDING" | "FOLLOWING" | "UNBOUNDED" | "BETWEEN")
 }
 
 /// Parse optional table alias, rejecting reserved keywords
@@ -1432,8 +1516,24 @@ fn parse_arith_mul_div(input: &str) -> IResult<&str, ArithOp> {
     Ok((input, op))
 }
 
-/// Parse expression with arithmetic: handles +, -, *, / with precedence
+/// Parse expression with arithmetic: handles ||, +, -, *, / with precedence
 fn parse_expression(input: &str) -> IResult<&str, Expression> {
+    let (mut input, mut left) = parse_arith_expr(input)?;
+    // || has lower precedence than +/-
+    while let Ok((remaining, _)) = nom::sequence::delimited(
+        multispace0::<&str, nom::error::Error<&str>>,
+        tag("||"),
+        multispace0::<&str, nom::error::Error<&str>>,
+    )(input) {
+        let (remaining, right) = parse_arith_expr(remaining)?;
+        left = Expression::BinaryOp(Box::new(left), ArithOp::Concat, Box::new(right));
+        input = remaining;
+    }
+    Ok((input, left))
+}
+
+/// Parse additive arithmetic: handles +, -
+fn parse_arith_expr(input: &str) -> IResult<&str, Expression> {
     let (mut input, mut left) = parse_term(input)?;
     while let Ok((remaining, op)) = parse_arith_add_sub(input) {
         let (remaining, right) = parse_term(remaining)?;
@@ -1688,8 +1788,70 @@ fn parse_window_spec(input: &str) -> IResult<&str, WindowSpec> {
     };
 
     let (input, _) = multispace0(input)?;
+    // Optional frame clause: ROWS|RANGE|GROUPS BETWEEN <bound> AND <bound>
+    //   or ROWS|RANGE|GROUPS <bound>
+    let (input, frame) = parse_window_frame(input)?;
+    let (input, _) = multispace0(input)?;
     let (input, _) = nom_char(')')(input)?;
-    Ok((input, WindowSpec { partition_by, order_by }))
+    Ok((input, WindowSpec { partition_by, order_by, frame }))
+}
+
+fn parse_frame_bound(input: &str) -> IResult<&str, FrameBound> {
+    let (input, _) = multispace0(input)?;
+    // Try UNBOUNDED PRECEDING / FOLLOWING
+    if let Ok((rest, _)) = nom::sequence::pair(
+        tag_no_case::<&str, &str, nom::error::Error<&str>>("UNBOUNDED"),
+        nom::sequence::preceded(multispace1::<&str, nom::error::Error<&str>>, tag_no_case("PRECEDING")),
+    )(input) {
+        return Ok((rest, FrameBound::UnboundedPreceding));
+    }
+    if let Ok((rest, _)) = nom::sequence::pair(
+        tag_no_case::<&str, &str, nom::error::Error<&str>>("UNBOUNDED"),
+        nom::sequence::preceded(multispace1::<&str, nom::error::Error<&str>>, tag_no_case("FOLLOWING")),
+    )(input) {
+        return Ok((rest, FrameBound::UnboundedFollowing));
+    }
+    // Try CURRENT ROW
+    if let Ok((rest, _)) = nom::sequence::pair(
+        tag_no_case::<&str, &str, nom::error::Error<&str>>("CURRENT"),
+        nom::sequence::preceded(multispace1::<&str, nom::error::Error<&str>>, tag_no_case("ROW")),
+    )(input) {
+        return Ok((rest, FrameBound::CurrentRow));
+    }
+    // Try n PRECEDING / n FOLLOWING
+    let (rest, n) = nom::character::complete::u64(input)?;
+    let (rest, _) = multispace1(rest)?;
+    if let Ok((rest, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("PRECEDING")(rest) {
+        return Ok((rest, FrameBound::Preceding(n)));
+    }
+    let (rest, _) = tag_no_case("FOLLOWING")(rest)?;
+    Ok((rest, FrameBound::Following(n)))
+}
+
+fn parse_window_frame(input: &str) -> IResult<&str, Option<FrameSpec>> {
+    let mode_res = nom::branch::alt((
+        nom::combinator::map(tag_no_case::<&str, &str, nom::error::Error<&str>>("ROWS"), |_| FrameMode::Rows),
+        nom::combinator::map(tag_no_case("RANGE"), |_| FrameMode::Range),
+        nom::combinator::map(tag_no_case("GROUPS"), |_| FrameMode::Groups),
+    ))(input);
+    let (after_mode, mode) = match mode_res {
+        Ok(r) => r,
+        Err(_) => return Ok((input, None)),
+    };
+    let (after_mode, _) = multispace1(after_mode)?;
+    // Try BETWEEN <start> AND <end>
+    if let Ok((rest, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("BETWEEN")(after_mode) {
+        let (rest, _) = multispace1(rest)?;
+        let (rest, start) = parse_frame_bound(rest)?;
+        let (rest, _) = multispace1(rest)?;
+        let (rest, _) = tag_no_case("AND")(rest)?;
+        let (rest, _) = multispace1(rest)?;
+        let (rest, end) = parse_frame_bound(rest)?;
+        return Ok((rest, Some(FrameSpec { mode, start, end })));
+    }
+    // Single bound: start only, end defaults to CURRENT ROW
+    let (after_mode, start) = parse_frame_bound(after_mode)?;
+    Ok((after_mode, Some(FrameSpec { mode, start, end: FrameBound::CurrentRow })))
 }
 
 fn parse_window_func_row_number(input: &str) -> IResult<&str, WindowFunc> {
@@ -2062,14 +2224,14 @@ fn parse_in_list(input: &str) -> IResult<&str, Expression> {
         return Ok((input, Expression::Subquery(Box::new(subquery))));
     }
 
-    // Otherwise parse a comma-separated list of literal values
-    let (input, values) = nom::multi::separated_list1(
+    // Parse a comma-separated list of scalar expressions (columns, literals, functions, etc.)
+    let (input, exprs) = nom::multi::separated_list1(
         nom::sequence::delimited(multispace0, nom_char(','), multispace0),
-        parse_value,
+        parse_atom,
     )(input)?;
     let (input, _) = multispace0(input)?;
     let (input, _) = nom_char(')')(input)?;
-    Ok((input, Expression::List(values)))
+    Ok((input, Expression::List(exprs)))
 }
 
 fn parse_operator(input: &str) -> IResult<&str, Operator> {
@@ -3369,7 +3531,9 @@ mod tests {
                 let wc = sel.where_clause.unwrap();
                 assert_eq!(wc.condition.operator(), Operator::In);
                 assert_eq!(wc.condition.right(), Expression::List(vec![
-                    Value::Int(1), Value::Int(2), Value::Int(3),
+                    Expression::Literal(Value::Int(1)),
+                    Expression::Literal(Value::Int(2)),
+                    Expression::Literal(Value::Int(3)),
                 ]));
             }
             _ => panic!("Expected Select"),
@@ -3385,8 +3549,8 @@ mod tests {
                 let wc = sel.where_clause.unwrap();
                 assert_eq!(wc.condition.operator(), Operator::NotIn);
                 assert_eq!(wc.condition.right(), Expression::List(vec![
-                    Value::String("active".to_string()),
-                    Value::String("pending".to_string()),
+                    Expression::Literal(Value::String("active".to_string())),
+                    Expression::Literal(Value::String("pending".to_string())),
                 ]));
             }
             _ => panic!("Expected Select"),

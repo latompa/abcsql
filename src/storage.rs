@@ -1362,6 +1362,7 @@ fn resolve_expression(expr: &Expression, row: &[Value], schema: &[ColumnDefiniti
         }
         Expression::BinaryOp(_, _, _) => None,
         Expression::Aggregate(_, _) => None,
+        Expression::Window(_, _) => None,
         Expression::Case(branches, else_expr) => {
             for (condition, result) in branches {
                 if evaluate_condition(condition, row, schema, storage) {

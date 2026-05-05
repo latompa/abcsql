@@ -695,6 +695,207 @@ fn prepare_rows(
     Some((combined_cols, filtered_rows))
 }
 
+/// Compute all window function expressions in `columns`, appending results as virtual
+/// columns to each row. Returns updated (select_columns, rows, combined_cols).
+fn materialize_window_functions(
+    columns: &[parser::SelectColumn],
+    mut rows: Vec<Vec<Value>>,
+    mut combined_cols: Vec<ResultColumn>,
+    storage: &Storage,
+) -> (Vec<parser::SelectColumn>, Vec<Vec<Value>>, Vec<ResultColumn>) {
+    // Collect unique window expressions with their position
+    let mut win_exprs: Vec<parser::Expression> = Vec::new();
+    for col in columns {
+        let expr = match col {
+            parser::SelectColumn::Expr(e) => Some(e.clone()),
+            parser::SelectColumn::Alias(inner, _) => {
+                if let parser::SelectColumn::Expr(e) = inner.as_ref() { Some(e.clone()) } else { None }
+            }
+            _ => None,
+        };
+        if let Some(e @ parser::Expression::Window(_, _)) = expr {
+            if !win_exprs.contains(&e) {
+                win_exprs.push(e);
+            }
+        }
+    }
+
+    if win_exprs.is_empty() {
+        return (columns.to_vec(), rows, combined_cols);
+    }
+
+    // Compute values for each window expression and append as virtual columns
+    for (win_idx, win_expr) in win_exprs.iter().enumerate() {
+        if let parser::Expression::Window(func, spec) = win_expr {
+            let values = compute_window_values(func, spec, &rows, &combined_cols, storage);
+            combined_cols.push(ResultColumn {
+                table: String::new(),
+                name: format!("__win_{}", win_idx),
+            });
+            for (row, val) in rows.iter_mut().zip(values.into_iter()) {
+                row.push(val);
+            }
+        }
+    }
+
+    // Replace Window expressions in select columns with a column reference to the virtual column
+    let new_columns: Vec<parser::SelectColumn> = columns.iter().map(|col| {
+        match col {
+            parser::SelectColumn::Expr(e) => {
+                if let Some(idx) = win_exprs.iter().position(|w| w == e) {
+                    let header = format_expr(e);
+                    let virtual_col = parser::SelectColumn::Column(format!("__win_{}", idx));
+                    parser::SelectColumn::Alias(Box::new(virtual_col), header)
+                } else {
+                    col.clone()
+                }
+            }
+            parser::SelectColumn::Alias(inner, alias) => {
+                if let parser::SelectColumn::Expr(e) = inner.as_ref() {
+                    if let Some(idx) = win_exprs.iter().position(|w| w == e) {
+                        let virtual_col = parser::SelectColumn::Column(format!("__win_{}", idx));
+                        parser::SelectColumn::Alias(Box::new(virtual_col), alias.clone())
+                    } else {
+                        col.clone()
+                    }
+                } else {
+                    col.clone()
+                }
+            }
+            _ => col.clone(),
+        }
+    }).collect();
+
+    (new_columns, rows, combined_cols)
+}
+
+fn compute_window_values(
+    func: &parser::WindowFunc,
+    spec: &parser::WindowSpec,
+    rows: &[Vec<Value>],
+    cols: &[ResultColumn],
+    storage: &Storage,
+) -> Vec<Value> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+
+    // Build partition groups: map from partition key → list of original row indices
+    let mut partition_keys: Vec<Vec<Value>> = Vec::new();
+    let mut partitions: Vec<Vec<usize>> = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        let key: Vec<Value> = spec.partition_by.iter()
+            .map(|e| resolve_join_expression(e, row, cols, storage).unwrap_or(Value::Null))
+            .collect();
+        if let Some(pos) = partition_keys.iter().position(|k| k == &key) {
+            partitions[pos].push(i);
+        } else {
+            partition_keys.push(key);
+            partitions.push(vec![i]);
+        }
+    }
+
+    let mut result = vec![Value::Null; rows.len()];
+
+    for partition_indices in &partitions {
+        // Sort the indices within this partition by the ORDER BY spec
+        let mut sorted = partition_indices.clone();
+        sorted.sort_by(|&a, &b| {
+            for ob in &spec.order_by {
+                if let Some(idx) = resolve_column_index(&ob.column, cols) {
+                    let ord = cmp_values(&rows[a][idx], &rows[b][idx]);
+                    let ord = if ob.descending { ord.reverse() } else { ord };
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+
+        match func {
+            parser::WindowFunc::RowNumber => {
+                for (rank, &orig_idx) in sorted.iter().enumerate() {
+                    result[orig_idx] = Value::Int((rank + 1) as i64);
+                }
+            }
+            parser::WindowFunc::Rank => {
+                let mut cur_rank = 1usize;
+                let mut prev_order_vals: Option<Vec<Value>> = None;
+                for (pos, &orig_idx) in sorted.iter().enumerate() {
+                    let order_vals: Vec<Value> = spec.order_by.iter()
+                        .filter_map(|ob| resolve_column_index(&ob.column, cols).map(|i| rows[orig_idx][i].clone()))
+                        .collect();
+                    if prev_order_vals.as_ref().map_or(false, |p| p == &order_vals) {
+                        // tie — keep same rank
+                    } else {
+                        cur_rank = pos + 1;
+                    }
+                    result[orig_idx] = Value::Int(cur_rank as i64);
+                    prev_order_vals = Some(order_vals);
+                }
+            }
+            parser::WindowFunc::DenseRank => {
+                let mut cur_rank = 0i64;
+                let mut prev_order_vals: Option<Vec<Value>> = None;
+                for &orig_idx in &sorted {
+                    let order_vals: Vec<Value> = spec.order_by.iter()
+                        .filter_map(|ob| resolve_column_index(&ob.column, cols).map(|i| rows[orig_idx][i].clone()))
+                        .collect();
+                    if prev_order_vals.as_ref().map_or(true, |p| p != &order_vals) {
+                        cur_rank += 1;
+                    }
+                    result[orig_idx] = Value::Int(cur_rank);
+                    prev_order_vals = Some(order_vals);
+                }
+            }
+            parser::WindowFunc::Lag(expr, offset) => {
+                let n = (*offset).max(0) as usize;
+                for (pos, &orig_idx) in sorted.iter().enumerate() {
+                    let val = if pos >= n {
+                        let src_idx = sorted[pos - n];
+                        resolve_join_expression(expr, &rows[src_idx], cols, storage).unwrap_or(Value::Null)
+                    } else {
+                        Value::Null
+                    };
+                    result[orig_idx] = val;
+                }
+            }
+            parser::WindowFunc::Lead(expr, offset) => {
+                let n = (*offset).max(0) as usize;
+                for (pos, &orig_idx) in sorted.iter().enumerate() {
+                    let val = if pos + n < sorted.len() {
+                        let src_idx = sorted[pos + n];
+                        resolve_join_expression(expr, &rows[src_idx], cols, storage).unwrap_or(Value::Null)
+                    } else {
+                        Value::Null
+                    };
+                    result[orig_idx] = val;
+                }
+            }
+            parser::WindowFunc::Agg(agg_func, inner_col) => {
+                // Compute aggregate over the whole partition and broadcast to every row
+                let part_rows: Vec<Vec<Value>> = partition_indices.iter().map(|&i| rows[i].clone()).collect();
+                let agg_str = compute_aggregate(agg_func, inner_col, &part_rows, cols);
+                let agg_val = if agg_str == "NULL" {
+                    Value::Null
+                } else if let Ok(n) = agg_str.parse::<i64>() {
+                    Value::Int(n)
+                } else if let Ok(f) = agg_str.parse::<f64>() {
+                    Value::Float(f)
+                } else {
+                    Value::String(agg_str)
+                };
+                for &orig_idx in partition_indices {
+                    result[orig_idx] = agg_val.clone();
+                }
+            }
+        }
+    }
+
+    result
+}
+
 fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) -> (Vec<String>, Vec<Vec<String>>) {
     // Materialize CTEs
     let mut cte_map: HashMap<String, CteData> = HashMap::new();
@@ -708,14 +909,18 @@ fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) -> (Vec<Str
         None => return (Vec::new(), Vec::new()),
     };
 
+    // Materialize window functions before projection
+    let (stmt_columns, filtered_rows, combined_cols) =
+        materialize_window_functions(&stmt.columns, filtered_rows, combined_cols, storage);
+
     // Check if any column is an aggregate or GROUP BY is present
-    let has_aggregates = stmt.columns.iter().any(|c| matches!(c, parser::SelectColumn::Aggregate(_, _)));
+    let has_aggregates = stmt_columns.iter().any(|c| matches!(c, parser::SelectColumn::Aggregate(_, _)));
     let has_group_by = !stmt.group_by.is_empty();
 
     let (headers, mut rows) = if has_aggregates || has_group_by {
-        collect_aggregate_rows(&stmt.columns, &filtered_rows, &combined_cols, &stmt.group_by, stmt.having.as_ref(), &stmt.order_by, stmt.limit, stmt.offset, stmt.distinct, storage)
+        collect_aggregate_rows(&stmt_columns, &filtered_rows, &combined_cols, &stmt.group_by, stmt.having.as_ref(), &stmt.order_by, stmt.limit, stmt.offset, stmt.distinct, storage)
     } else {
-        collect_normal_rows(&stmt.columns, filtered_rows, &combined_cols, &stmt.order_by, stmt.limit, stmt.offset, stmt.distinct)
+        collect_normal_rows(&stmt_columns, filtered_rows, &combined_cols, &stmt.order_by, stmt.limit, stmt.offset, stmt.distinct)
     };
 
     // Handle UNION / UNION ALL
@@ -1210,6 +1415,46 @@ fn format_expr(expr: &parser::Expression) -> String {
         parser::Expression::LPad(s, len, pad) => format!("lpad({}, {}, {})", format_expr(s), format_expr(len), format_expr(pad)),
         parser::Expression::RPad(s, len, pad) => format!("rpad({}, {}, {})", format_expr(s), format_expr(len), format_expr(pad)),
         parser::Expression::Cast(inner, type_name) => format!("cast({} as {})", format_expr(inner), type_name.to_lowercase()),
+        parser::Expression::Window(func, spec) => {
+            let func_str = match func {
+                parser::WindowFunc::RowNumber => "row_number()".to_string(),
+                parser::WindowFunc::Rank => "rank()".to_string(),
+                parser::WindowFunc::DenseRank => "dense_rank()".to_string(),
+                parser::WindowFunc::Lag(expr, n) => format!("lag({}, {})", format_expr(expr), n),
+                parser::WindowFunc::Lead(expr, n) => format!("lead({}, {})", format_expr(expr), n),
+                parser::WindowFunc::Agg(agg, col) => {
+                    let agg_name = match agg {
+                        parser::AggregateFunc::Count => "count",
+                        parser::AggregateFunc::Sum => "sum",
+                        parser::AggregateFunc::Avg => "avg",
+                        parser::AggregateFunc::Min => "min",
+                        parser::AggregateFunc::Max => "max",
+                    };
+                    format!("{}({})", agg_name, column_header(col))
+                }
+            };
+            let part_str = if spec.partition_by.is_empty() {
+                String::new()
+            } else {
+                let parts: Vec<String> = spec.partition_by.iter().map(format_expr).collect();
+                format!("partition by {}", parts.join(", "))
+            };
+            let ord_str = if spec.order_by.is_empty() {
+                String::new()
+            } else {
+                let ords: Vec<String> = spec.order_by.iter()
+                    .map(|o| format!("{}{}", column_header(&o.column), if o.descending { " desc" } else { "" }))
+                    .collect();
+                format!("order by {}", ords.join(", "))
+            };
+            let spec_str = match (part_str.is_empty(), ord_str.is_empty()) {
+                (true, true) => String::new(),
+                (true, false) => ord_str,
+                (false, true) => part_str,
+                (false, false) => format!("{} {}", part_str, ord_str),
+            };
+            format!("{} over ({})", func_str, spec_str)
+        }
         parser::Expression::Case(_, _) => "case".to_string(),
         parser::Expression::Aggregate(func, inner) => {
             let func_name = match func {
@@ -1518,6 +1763,8 @@ fn resolve_join_expression(
             let pv = resolve_join_expression(pad, row, cols, storage)?;
             parser::apply_rpad(sv, lv, pv)
         }
+        // Window values are precomputed before row-level resolution is called.
+        parser::Expression::Window(_, _) => None,
         // Aggregates aren't valid in row-level (WHERE/JOIN ON) contexts; HAVING uses its own evaluator.
         parser::Expression::Cast(inner, type_name) => {
             let v = resolve_join_expression(inner, row, cols, storage)?;

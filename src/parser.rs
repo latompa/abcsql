@@ -218,6 +218,22 @@ pub enum AggregateFunc {
 }
 
 #[derive(Debug, PartialEq, Clone)]
+pub struct WindowSpec {
+    pub partition_by: Vec<Expression>,
+    pub order_by: Vec<OrderByClause>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum WindowFunc {
+    RowNumber,
+    Rank,
+    DenseRank,
+    Lag(Box<Expression>, i64),  // expression, offset (default 1)
+    Lead(Box<Expression>, i64), // expression, offset (default 1)
+    Agg(AggregateFunc, Box<SelectColumn>), // e.g. SUM(col) OVER (...)
+}
+
+#[derive(Debug, PartialEq, Clone)]
 pub enum ScalarFunc {
     Upper,
     Lower,
@@ -319,6 +335,8 @@ pub enum Expression {
     // LPAD(str, len, pad) / RPAD(str, len, pad)
     LPad(Box<Expression>, Box<Expression>, Box<Expression>),
     RPad(Box<Expression>, Box<Expression>, Box<Expression>),
+    // Window function: func() OVER (PARTITION BY ... ORDER BY ...)
+    Window(WindowFunc, WindowSpec),
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -946,9 +964,9 @@ pub fn parse_select(input: &str) -> IResult<&str, SqlStatement> {
 fn parse_select_column(input: &str) -> IResult<&str, SelectColumn> {
     let (input, _) = multispace0(input)?;
     let (input, col) = nom::branch::alt((
-        parse_aggregate_column,
         parse_all_column,
-        parse_arith_select_column,
+        parse_arith_select_column, // must come before parse_aggregate_column to catch window agg functions
+        parse_aggregate_column,
         parse_qualified_column,
         parse_simple_column,
     ))(input)?;
@@ -971,7 +989,7 @@ fn parse_arith_select_column(input: &str) -> IResult<&str, SelectColumn> {
         | Expression::Coalesce(_) | Expression::NullIf(_, _)
         | Expression::Round(_, _) | Expression::Concat(_) | Expression::Substr(_, _, _)
         | Expression::Replace(_, _, _) | Expression::LPad(_, _, _) | Expression::RPad(_, _, _)
-        | Expression::Cast(_, _) => Ok((new_input, SelectColumn::Expr(expr))),
+        | Expression::Cast(_, _) | Expression::Window(_, _) => Ok((new_input, SelectColumn::Expr(expr))),
         _ => Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag))),
     }
 }
@@ -1125,7 +1143,7 @@ fn parse_limit_offset_clause(input: &str) -> IResult<&str, (Option<u64>, Option<
 
 /// Check if identifier is a reserved keyword that can't be used as an alias
 fn is_reserved_keyword(s: &str) -> bool {
-    matches!(s.to_uppercase().as_str(), "ON" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "OUTER" | "CROSS" | "WHERE" | "ORDER" | "GROUP" | "LIMIT" | "OFFSET" | "HAVING" | "UNION" | "ALL" | "CASE" | "WHEN" | "THEN" | "ELSE" | "END" | "AND" | "OR" | "NOT" | "AS" | "VIEW")
+    matches!(s.to_uppercase().as_str(), "ON" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "OUTER" | "CROSS" | "WHERE" | "ORDER" | "GROUP" | "LIMIT" | "OFFSET" | "HAVING" | "UNION" | "ALL" | "CASE" | "WHEN" | "THEN" | "ELSE" | "END" | "AND" | "OR" | "NOT" | "AS" | "VIEW" | "OVER" | "PARTITION")
 }
 
 /// Parse optional table alias, rejecting reserved keywords
@@ -1450,6 +1468,7 @@ fn parse_atom(input: &str) -> IResult<&str, Expression> {
         parse_expression_replace,
         parse_expression_lpad,
         parse_expression_rpad,
+        parse_expression_window,
         parse_expression_scalar_func,
         parse_expression_aggregate,
         parse_expression_qualified_column,
@@ -1630,6 +1649,156 @@ fn parse_expression_rpad(input: &str) -> IResult<&str, Expression> {
     let (input, _) = multispace0(input)?;
     let (input, _) = nom_char(')')(input)?;
     Ok((input, Expression::RPad(Box::new(s), Box::new(len), Box::new(pad))))
+}
+
+fn parse_window_spec(input: &str) -> IResult<&str, WindowSpec> {
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+
+    // Optional PARTITION BY
+    let (input, partition_by) = if let Ok((input2, _)) = nom::sequence::pair(
+        tag_no_case::<&str, &str, nom::error::Error<&str>>("PARTITION"),
+        nom::sequence::preceded(multispace1::<&str, nom::error::Error<&str>>, tag_no_case("BY")),
+    )(input) {
+        let (input2, _) = multispace1(input2)?;
+        let (input2, exprs) = nom::multi::separated_list1(
+            nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+            parse_expression,
+        )(input2)?;
+        (input2, exprs)
+    } else {
+        (input, Vec::new())
+    };
+
+    let (input, _) = multispace0(input)?;
+
+    // Optional ORDER BY (reuse parse_order_by_item)
+    let (input, order_by) = if let Ok((input2, _)) = nom::sequence::pair(
+        tag_no_case::<&str, &str, nom::error::Error<&str>>("ORDER"),
+        nom::sequence::preceded(multispace1::<&str, nom::error::Error<&str>>, tag_no_case("BY")),
+    )(input) {
+        let (input2, _) = multispace1(input2)?;
+        let (input2, clauses) = nom::multi::separated_list1(
+            nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+            parse_order_by_item,
+        )(input2)?;
+        (input2, clauses)
+    } else {
+        (input, Vec::new())
+    };
+
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, WindowSpec { partition_by, order_by }))
+}
+
+fn parse_window_func_row_number(input: &str) -> IResult<&str, WindowFunc> {
+    let (input, _) = tag_no_case("ROW_NUMBER")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, WindowFunc::RowNumber))
+}
+
+fn parse_window_func_dense_rank(input: &str) -> IResult<&str, WindowFunc> {
+    let (input, _) = tag_no_case("DENSE_RANK")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, WindowFunc::DenseRank))
+}
+
+fn parse_window_func_rank(input: &str) -> IResult<&str, WindowFunc> {
+    let (input, _) = tag_no_case("RANK")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, WindowFunc::Rank))
+}
+
+fn parse_window_func_lag(input: &str) -> IResult<&str, WindowFunc> {
+    let (input, _) = tag_no_case("LAG")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, expr) = parse_expression(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, offset) = nom::combinator::opt(nom::sequence::preceded(
+        nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+        nom::character::complete::i64,
+    ))(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, WindowFunc::Lag(Box::new(expr), offset.unwrap_or(1))))
+}
+
+fn parse_window_func_lead(input: &str) -> IResult<&str, WindowFunc> {
+    let (input, _) = tag_no_case("LEAD")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, expr) = parse_expression(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, offset) = nom::combinator::opt(nom::sequence::preceded(
+        nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+        nom::character::complete::i64,
+    ))(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, WindowFunc::Lead(Box::new(expr), offset.unwrap_or(1))))
+}
+
+fn parse_window_func_agg(input: &str) -> IResult<&str, WindowFunc> {
+    let (input, func_name) = nom::branch::alt((
+        tag_no_case("COUNT"),
+        tag_no_case("SUM"),
+        tag_no_case("AVG"),
+        tag_no_case("MIN"),
+        tag_no_case("MAX"),
+    ))(input)?;
+    let agg_func = match func_name.to_uppercase().as_str() {
+        "COUNT" => AggregateFunc::Count,
+        "SUM"   => AggregateFunc::Sum,
+        "AVG"   => AggregateFunc::Avg,
+        "MIN"   => AggregateFunc::Min,
+        "MAX"   => AggregateFunc::Max,
+        _ => unreachable!(),
+    };
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, inner) = nom::branch::alt((
+        parse_all_column,
+        parse_qualified_column,
+        parse_simple_column,
+    ))(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, WindowFunc::Agg(agg_func, Box::new(inner))))
+}
+
+fn parse_expression_window(input: &str) -> IResult<&str, Expression> {
+    let (input, _) = multispace0(input)?;
+
+    // Parse the window function name+args; DENSE_RANK must come before RANK
+    let (input, func) = nom::branch::alt((
+        parse_window_func_row_number,
+        parse_window_func_dense_rank,
+        parse_window_func_rank,
+        parse_window_func_lag,
+        parse_window_func_lead,
+        parse_window_func_agg,
+    ))(input)?;
+
+    // OVER is mandatory — if missing this parser fails and alt tries next option
+    let (input, _) = multispace1(input)?;
+    let (input, _) = tag_no_case("OVER")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, spec) = parse_window_spec(input)?;
+    Ok((input, Expression::Window(func, spec)))
 }
 
 fn parse_expression_case(input: &str) -> IResult<&str, Expression> {
@@ -4434,6 +4603,86 @@ mod tests {
                         assert_eq!(**pad, Expression::Literal(Value::String(" ".to_string())));
                     }
                     _ => panic!("Expected RPad"),
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_row_number() {
+        let sql = "SELECT ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary) FROM employees;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                match &sel.columns[0] {
+                    SelectColumn::Expr(Expression::Window(WindowFunc::RowNumber, spec)) => {
+                        assert_eq!(spec.partition_by.len(), 1);
+                        assert_eq!(spec.order_by.len(), 1);
+                    }
+                    _ => panic!("Expected Window(RowNumber)"),
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rank_dense_rank() {
+        let sql = "SELECT RANK() OVER (ORDER BY score DESC), DENSE_RANK() OVER (ORDER BY score DESC) FROM results;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert!(matches!(&sel.columns[0], SelectColumn::Expr(Expression::Window(WindowFunc::Rank, _))));
+                assert!(matches!(&sel.columns[1], SelectColumn::Expr(Expression::Window(WindowFunc::DenseRank, _))));
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_lag_lead() {
+        let sql = "SELECT LAG(salary, 1) OVER (ORDER BY hire_date), LEAD(salary, 1) OVER (ORDER BY hire_date) FROM employees;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert!(matches!(&sel.columns[0], SelectColumn::Expr(Expression::Window(WindowFunc::Lag(_, 1), _))));
+                assert!(matches!(&sel.columns[1], SelectColumn::Expr(Expression::Window(WindowFunc::Lead(_, 1), _))));
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_window_aggregate() {
+        let sql = "SELECT SUM(salary) OVER (PARTITION BY dept) FROM employees;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                match &sel.columns[0] {
+                    SelectColumn::Expr(Expression::Window(WindowFunc::Agg(AggregateFunc::Sum, _), spec)) => {
+                        assert_eq!(spec.partition_by.len(), 1);
+                        assert!(spec.order_by.is_empty());
+                    }
+                    _ => panic!("Expected Window(Agg(Sum))"),
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_window_over_empty() {
+        let sql = "SELECT ROW_NUMBER() OVER () FROM t;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                match &sel.columns[0] {
+                    SelectColumn::Expr(Expression::Window(WindowFunc::RowNumber, spec)) => {
+                        assert!(spec.partition_by.is_empty());
+                        assert!(spec.order_by.is_empty());
+                    }
+                    _ => panic!("Expected Window(RowNumber) with empty spec"),
                 }
             }
             _ => panic!("Expected Select"),

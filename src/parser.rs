@@ -1,6 +1,6 @@
 use nom::{
     IResult,
-    bytes::complete::{tag, tag_no_case, take_while1},
+    bytes::complete::{tag, tag_no_case},
     character::complete::{multispace0, multispace1, char as nom_char},
     combinator::recognize,
     sequence::{delimited, tuple},
@@ -312,6 +312,8 @@ pub enum Expression {
     Concat(Vec<Expression>),
     // SUBSTR(str, start [, len]) — 1-indexed
     Substr(Box<Expression>, Box<Expression>, Option<Box<Expression>>),
+    // CAST(expr AS type)
+    Cast(Box<Expression>, String),
     // REPLACE(str, from, to)
     Replace(Box<Expression>, Box<Expression>, Box<Expression>),
     // LPAD(str, len, pad) / RPAD(str, len, pad)
@@ -336,6 +338,9 @@ pub enum Operator {
     GreaterThanOrEqual,
     LessThanOrEqual,
     Like,
+    NotLike,
+    ILike,
+    NotILike,
     In,
     NotIn,
     Exists,
@@ -356,6 +361,54 @@ pub enum Value {
 }
 
 /// Parser functions
+
+/// Strip SQL comments from input, preserving string literals.
+pub fn strip_sql_comments(input: &str) -> String { strip_comments(input) }
+
+/// Strip SQL comments from input, preserving string literals.
+/// Handles -- line comments and /* block comments */.
+fn strip_comments(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let chars: Vec<char> = input.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+    while i < n {
+        // Inside single-quoted string — pass through verbatim including ''
+        if chars[i] == '\'' {
+            out.push('\'');
+            i += 1;
+            loop {
+                if i >= n { break; }
+                if chars[i] == '\'' {
+                    out.push('\'');
+                    i += 1;
+                    // '' is an escaped quote inside the string
+                    if i < n && chars[i] == '\'' {
+                        out.push('\'');
+                        i += 1;
+                    } else {
+                        break; // end of string literal
+                    }
+                } else {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+            }
+        // -- line comment: skip to end of line
+        } else if i + 1 < n && chars[i] == '-' && chars[i + 1] == '-' {
+            while i < n && chars[i] != '\n' { i += 1; }
+        // /* block comment */: skip to */
+        } else if i + 1 < n && chars[i] == '/' && chars[i + 1] == '*' {
+            i += 2;
+            while i + 1 < n && !(chars[i] == '*' && chars[i + 1] == '/') { i += 1; }
+            i += 2; // consume */
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
 
 /// Parse a SQL statement
 pub fn parse_sql(input: &str) -> IResult<&str, SqlStatement> {
@@ -917,7 +970,8 @@ fn parse_arith_select_column(input: &str) -> IResult<&str, SelectColumn> {
         Expression::BinaryOp(_, _, _) | Expression::Case(_, _) | Expression::ScalarFunc(_, _)
         | Expression::Coalesce(_) | Expression::NullIf(_, _)
         | Expression::Round(_, _) | Expression::Concat(_) | Expression::Substr(_, _, _)
-        | Expression::Replace(_, _, _) | Expression::LPad(_, _, _) | Expression::RPad(_, _, _) => Ok((new_input, SelectColumn::Expr(expr))),
+        | Expression::Replace(_, _, _) | Expression::LPad(_, _, _) | Expression::RPad(_, _, _)
+        | Expression::Cast(_, _) => Ok((new_input, SelectColumn::Expr(expr))),
         _ => Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag))),
     }
 }
@@ -1314,6 +1368,24 @@ fn parse_primary_condition(input: &str) -> IResult<&str, Condition> {
         }));
     }
 
+    // Try NOT LIKE / NOT ILIKE before general operator parse
+    if let Ok((input, _)) = nom::sequence::pair(
+        tag_no_case::<&str, &str, nom::error::Error<&str>>("NOT"),
+        nom::sequence::preceded(multispace1::<&str, nom::error::Error<&str>>, tag_no_case("ILIKE")),
+    )(input) {
+        let (input, _) = multispace0(input)?;
+        let (input, right) = parse_expression(input)?;
+        return Ok((input, Condition::Comparison { left, operator: Operator::NotILike, right, upper_bound: None }));
+    }
+    if let Ok((input, _)) = nom::sequence::pair(
+        tag_no_case::<&str, &str, nom::error::Error<&str>>("NOT"),
+        nom::sequence::preceded(multispace1::<&str, nom::error::Error<&str>>, tag_no_case("LIKE")),
+    )(input) {
+        let (input, _) = multispace0(input)?;
+        let (input, right) = parse_expression(input)?;
+        return Ok((input, Condition::Comparison { left, operator: Operator::NotLike, right, upper_bound: None }));
+    }
+
     let (input, operator) = parse_operator(input)?;
     let (input, _) = multispace0(input)?;
     let (input, right) = parse_expression(input)?;
@@ -1374,6 +1446,7 @@ fn parse_atom(input: &str) -> IResult<&str, Expression> {
         parse_expression_round,
         parse_expression_concat,
         parse_expression_substr,
+        parse_expression_cast,
         parse_expression_replace,
         parse_expression_lpad,
         parse_expression_rpad,
@@ -1496,6 +1569,22 @@ fn parse_expression_substr(input: &str) -> IResult<&str, Expression> {
     let (input, _) = multispace0(input)?;
     let (input, _) = nom_char(')')(input)?;
     Ok((input, Expression::Substr(Box::new(s), Box::new(start), len.map(Box::new))))
+}
+
+fn parse_expression_cast(input: &str) -> IResult<&str, Expression> {
+    let (input, _) = tag_no_case("CAST")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, expr) = parse_expression(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, _) = tag_no_case("AS")(input)?;
+    let (input, _) = multispace1(input)?;
+    // Type name: e.g. INT, FLOAT, VARCHAR, TEXT, BOOLEAN, etc.
+    let (input, type_name) = parse_identifier(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, Expression::Cast(Box::new(expr), type_name.to_uppercase())))
 }
 
 fn parse_expression_replace(input: &str) -> IResult<&str, Expression> {
@@ -1712,6 +1801,45 @@ pub fn apply_rpad(s: Value, len: Value, pad: Value) -> Option<Value> {
     Some(Value::String(format!("{}{}", s, suffix)))
 }
 
+/// Evaluate CAST(value AS type)
+pub fn apply_cast(val: Value, type_name: &str) -> Option<Value> {
+    match type_name {
+        "INT" | "INTEGER" | "BIGINT" => match val {
+            Value::Int(n)    => Some(Value::Int(n)),
+            Value::Float(f)  => Some(Value::Int(f as i64)),
+            Value::Bool(b)   => Some(Value::Int(b as i64)),
+            Value::String(s) => s.trim().parse::<i64>().ok().map(Value::Int),
+            Value::Null      => Some(Value::Null),
+        },
+        "FLOAT" | "DOUBLE" | "REAL" | "NUMERIC" | "DECIMAL" => match val {
+            Value::Float(f)  => Some(Value::Float(f)),
+            Value::Int(n)    => Some(Value::Float(n as f64)),
+            Value::String(s) => s.trim().parse::<f64>().ok().map(Value::Float),
+            Value::Null      => Some(Value::Null),
+            _ => None,
+        },
+        "TEXT" | "VARCHAR" | "STRING" | "CHAR" => match val {
+            Value::String(s) => Some(Value::String(s)),
+            Value::Int(n)    => Some(Value::String(n.to_string())),
+            Value::Float(f)  => Some(Value::String(f.to_string())),
+            Value::Bool(b)   => Some(Value::String(b.to_string())),
+            Value::Null      => Some(Value::Null),
+        },
+        "BOOLEAN" | "BOOL" => match val {
+            Value::Bool(b)   => Some(Value::Bool(b)),
+            Value::Int(n)    => Some(Value::Bool(n != 0)),
+            Value::String(s) => match s.to_lowercase().as_str() {
+                "true" | "1" | "yes" => Some(Value::Bool(true)),
+                "false" | "0" | "no" => Some(Value::Bool(false)),
+                _ => None,
+            },
+            Value::Null => Some(Value::Null),
+            _ => None,
+        },
+        _ => None, // unknown type
+    }
+}
+
 /// Apply a single-arg scalar function to a resolved Value
 pub fn apply_scalar_func(func: &ScalarFunc, val: Value) -> Option<Value> {
     match (func, val) {
@@ -1783,6 +1911,7 @@ fn parse_operator(input: &str) -> IResult<&str, Operator> {
         nom::combinator::map(tag("="), |_| Operator::Equals),
         nom::combinator::map(tag(">"), |_| Operator::GreaterThan),
         nom::combinator::map(tag("<"), |_| Operator::LessThan),
+        nom::combinator::map(tag_no_case("ILIKE"), |_| Operator::ILike),
         nom::combinator::map(tag_no_case("LIKE"), |_| Operator::Like),
     ))(input)
 }
@@ -1822,12 +1951,26 @@ fn parse_int_value(input: &str) -> IResult<&str, Value> {
 }
 
 fn parse_string_value(input: &str) -> IResult<&str, Value> {
-    let (input, s) = delimited(
-        nom_char('\''),
-        take_while1(|c| c != '\''),
-        nom_char('\''),
-    )(input)?;
-    Ok((input, Value::String(s.to_string())))
+    let (input, _) = nom_char('\'')(input)?;
+    // Accumulate content, treating '' as an escaped single quote
+    let mut result = String::new();
+    let mut remaining = input;
+    loop {
+        // Consume up to the next single quote
+        let (rest, chunk) = nom::bytes::complete::take_while(|c| c != '\'')(remaining)?;
+        result.push_str(chunk);
+        // Consume the closing quote
+        let (rest, _) = nom_char('\'')(rest)?;
+        // If the next char is also a quote, it's an escape sequence ''
+        if rest.starts_with('\'') {
+            result.push('\'');
+            remaining = &rest[1..];
+        } else {
+            remaining = rest;
+            break;
+        }
+    }
+    Ok((remaining, Value::String(result)))
 }
 
 fn parse_null_value(input: &str) -> IResult<&str, Value> {
@@ -2853,6 +2996,97 @@ mod tests {
             SqlStatement::Select(sel) => {
                 let wc = sel.where_clause.unwrap();
                 assert_eq!(wc.condition.operator(), Operator::Like);
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_not_like() {
+        let sql = "SELECT * FROM users WHERE name NOT LIKE 'A%';";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert_eq!(sel.where_clause.unwrap().condition.operator(), Operator::NotLike);
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ilike() {
+        let sql = "SELECT * FROM users WHERE name ILIKE 'alice';";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert_eq!(sel.where_clause.unwrap().condition.operator(), Operator::ILike);
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_not_ilike() {
+        let sql = "SELECT * FROM users WHERE name NOT ILIKE 'alice%';";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert_eq!(sel.where_clause.unwrap().condition.operator(), Operator::NotILike);
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_cast() {
+        let sql = "SELECT CAST(price AS INT) FROM products;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                match &sel.columns[0] {
+                    SelectColumn::Expr(Expression::Cast(inner, type_name)) => {
+                        assert_eq!(**inner, Expression::Column("price".to_string()));
+                        assert_eq!(type_name, "INT");
+                    }
+                    _ => panic!("Expected Cast"),
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_string_escaped_quote() {
+        let sql = "SELECT * FROM users WHERE name = 'it''s here';";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                let wc = sel.where_clause.unwrap();
+                assert_eq!(wc.condition.right(), Expression::Literal(Value::String("it's here".to_string())));
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_strip_line_comment() {
+        let sql = "SELECT * FROM users -- get all users\nWHERE id = 1;";
+        let (_, stmt) = parse_sql(&strip_sql_comments(sql)).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert!(sel.where_clause.is_some());
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_strip_block_comment() {
+        let sql = "SELECT /* all cols */ * FROM users;";
+        let (_, stmt) = parse_sql(&strip_sql_comments(sql)).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert!(matches!(sel.columns[0], SelectColumn::All));
             }
             _ => panic!("Expected Select"),
         }

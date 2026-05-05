@@ -133,6 +133,8 @@ fn handle_meta_command(cmd: &str, storage: &Storage) {
 }
 
 fn execute_sql(sql: &str, storage: &Storage) {
+    let stripped = parser::strip_sql_comments(sql);
+    let sql = stripped.trim();
     let stmt = match parse_sql(sql) {
         Ok((remaining, stmt)) => {
             if !remaining.trim().is_empty() {
@@ -1207,6 +1209,7 @@ fn format_expr(expr: &parser::Expression) -> String {
         parser::Expression::Replace(s, from, to) => format!("replace({}, {}, {})", format_expr(s), format_expr(from), format_expr(to)),
         parser::Expression::LPad(s, len, pad) => format!("lpad({}, {}, {})", format_expr(s), format_expr(len), format_expr(pad)),
         parser::Expression::RPad(s, len, pad) => format!("rpad({}, {}, {})", format_expr(s), format_expr(len), format_expr(pad)),
+        parser::Expression::Cast(inner, type_name) => format!("cast({} as {})", format_expr(inner), type_name.to_lowercase()),
         parser::Expression::Case(_, _) => "case".to_string(),
         parser::Expression::Aggregate(func, inner) => {
             let func_name = match func {
@@ -1516,6 +1519,10 @@ fn resolve_join_expression(
             parser::apply_rpad(sv, lv, pv)
         }
         // Aggregates aren't valid in row-level (WHERE/JOIN ON) contexts; HAVING uses its own evaluator.
+        parser::Expression::Cast(inner, type_name) => {
+            let v = resolve_join_expression(inner, row, cols, storage)?;
+            parser::apply_cast(v, type_name)
+        }
         parser::Expression::Aggregate(_, _) => None,
         parser::Expression::Case(branches, else_expr) => {
             for (condition, result) in branches {
@@ -1590,6 +1597,9 @@ fn compare_values(left: &Value, op: &parser::Operator, right: &Value) -> bool {
         },
         (Value::String(l), Value::String(r)) => match op {
             parser::Operator::Like => like_match(l, r),
+            parser::Operator::NotLike => !like_match(l, r),
+            parser::Operator::ILike => like_match(&l.to_lowercase(), &r.to_lowercase()),
+            parser::Operator::NotILike => !like_match(&l.to_lowercase(), &r.to_lowercase()),
             parser::Operator::Equals => l == r,
             parser::Operator::NotEquals => l != r,
             parser::Operator::GreaterThan => l > r,

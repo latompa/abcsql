@@ -7,7 +7,8 @@ pub use storage::Storage;
 /// Execute a SQL string against the storage engine. Returns Ok with a description
 /// of what happened, or Err with an error message. Never panics.
 pub fn execute(storage: &Storage, sql: &str) -> Result<String, String> {
-    let trimmed = sql.trim();
+    let stripped = parser::strip_sql_comments(sql.trim());
+    let trimmed = stripped.trim();
     if trimmed.is_empty() {
         return Err("empty input".to_string());
     }
@@ -303,6 +304,10 @@ fn resolve_expr(expr: &parser::Expression, row: &[Value], cols: &[(String, Strin
             let pv = resolve_expr(pad, row, cols)?;
             parser::apply_rpad(sv, lv, pv)
         }
+        parser::Expression::Cast(inner, type_name) => {
+            let v = resolve_expr(inner, row, cols)?;
+            parser::apply_cast(v, type_name)
+        }
         parser::Expression::BinaryOp(_, _, _) => None,
         parser::Expression::Aggregate(_, _) => None,
         parser::Expression::Case(_, _) => None,
@@ -334,6 +339,9 @@ fn compare(left: &Value, op: &parser::Operator, right: &Value) -> bool {
         },
         (Value::String(l), Value::String(r)) => match op {
             parser::Operator::Like => like_match(l, r),
+            parser::Operator::NotLike => !like_match(l, r),
+            parser::Operator::ILike => like_match(&l.to_lowercase(), &r.to_lowercase()),
+            parser::Operator::NotILike => !like_match(&l.to_lowercase(), &r.to_lowercase()),
             parser::Operator::Equals => l == r,
             parser::Operator::NotEquals => l != r,
             parser::Operator::GreaterThan => l > r,

@@ -3,7 +3,7 @@ use std::io::{self, Write as IoWrite, BufWriter, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::fmt;
 use std::collections::HashMap;
-use crate::parser::{CreateTableStatement, CreateIndexStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, UpdateStatement, DeleteStatement, AlterTableStatement, AlterAction, Value, Condition, Expression, Operator, apply_scalar_func, apply_round, apply_concat, apply_substr, apply_replace, apply_lpad, apply_rpad};
+use crate::parser::{CreateTableStatement, CreateIndexStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, UpdateStatement, DeleteStatement, AlterTableStatement, AlterAction, Value, Condition, Expression, Operator, apply_scalar_func, apply_round, apply_concat, apply_substr, apply_replace, apply_lpad, apply_rpad, apply_cast};
 
 /// Storage engine for persisting tables to disk
 pub struct Storage {
@@ -1328,6 +1328,10 @@ fn resolve_expression(expr: &Expression, row: &[Value], schema: &[ColumnDefiniti
             let pv = resolve_expression(pad, row, schema)?;
             apply_rpad(sv, lv, pv)
         }
+        Expression::Cast(inner, type_name) => {
+            let v = resolve_expression(inner, row, schema)?;
+            apply_cast(v, type_name)
+        }
         Expression::BinaryOp(_, _, _) => None,
         Expression::Aggregate(_, _) => None,
         Expression::Case(branches, else_expr) => {
@@ -1367,6 +1371,9 @@ fn compare_values(left: &Value, op: &Operator, right: &Value) -> bool {
         },
         (Value::String(l), Value::String(r)) => match op {
             Operator::Like => like_match(l, r),
+            Operator::NotLike => !like_match(l, r),
+            Operator::ILike => like_match(&l.to_lowercase(), &r.to_lowercase()),
+            Operator::NotILike => !like_match(&l.to_lowercase(), &r.to_lowercase()),
             Operator::Equals => l == r,
             Operator::NotEquals => l != r,
             Operator::GreaterThan => l > r,

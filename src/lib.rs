@@ -155,7 +155,11 @@ fn execute_select_to_string(
                     .chain(join_cols.iter())
                     .cloned()
                     .collect();
-                if eval_condition(&join.on, &candidate, &all_cols) {
+                let matches = match &join.on {
+                    Some(cond) => eval_condition(cond, &candidate, &all_cols),
+                    None => true, // CROSS JOIN — no condition
+                };
+                if matches {
                     new_rows.push(candidate);
                     matched = true;
                 }
@@ -176,7 +180,10 @@ fn execute_select_to_string(
                         .chain(join_cols.iter())
                         .cloned()
                         .collect();
-                    eval_condition(&join.on, &candidate, &all_cols)
+                    match &join.on {
+                        Some(cond) => eval_condition(cond, &candidate, &all_cols),
+                        None => true,
+                    }
                 });
                 if !has_match {
                     let mut row: Vec<Value> = std::iter::repeat(Value::Null).take(left_col_count).collect();

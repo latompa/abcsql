@@ -641,7 +641,11 @@ fn prepare_rows(
                     .map(|c| ResultColumn { table: c.table.clone(), name: c.name.clone() })
                     .collect();
 
-                if evaluate_join_condition(&join.on, &candidate, &all_cols, storage) {
+                let matches = match &join.on {
+                    Some(cond) => evaluate_join_condition(cond, &candidate, &all_cols, storage),
+                    None => true, // CROSS JOIN — no condition
+                };
+                if matches {
                     new_rows.push(candidate);
                     matched = true;
                 }
@@ -662,7 +666,10 @@ fn prepare_rows(
                         .chain(join_result_cols.iter())
                         .map(|c| ResultColumn { table: c.table.clone(), name: c.name.clone() })
                         .collect();
-                    evaluate_join_condition(&join.on, &candidate, &all_cols, storage)
+                    match &join.on {
+                        Some(cond) => evaluate_join_condition(cond, &candidate, &all_cols, storage),
+                        None => true,
+                    }
                 });
                 if !has_match {
                     let mut row: Vec<Value> = std::iter::repeat(Value::Null).take(left_col_count).collect();

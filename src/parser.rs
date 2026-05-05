@@ -245,7 +245,7 @@ pub struct JoinClause {
     pub join_type: JoinType,
     pub table: String,
     pub alias: Option<String>,
-    pub on: Condition,
+    pub on: Option<Condition>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -254,6 +254,7 @@ pub enum JoinType {
     Left,
     Right,
     Full,
+    Cross,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -1070,7 +1071,7 @@ fn parse_limit_offset_clause(input: &str) -> IResult<&str, (Option<u64>, Option<
 
 /// Check if identifier is a reserved keyword that can't be used as an alias
 fn is_reserved_keyword(s: &str) -> bool {
-    matches!(s.to_uppercase().as_str(), "ON" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "OUTER" | "WHERE" | "ORDER" | "GROUP" | "LIMIT" | "OFFSET" | "HAVING" | "UNION" | "ALL" | "CASE" | "WHEN" | "THEN" | "ELSE" | "END" | "AND" | "OR" | "NOT" | "AS" | "VIEW")
+    matches!(s.to_uppercase().as_str(), "ON" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "OUTER" | "CROSS" | "WHERE" | "ORDER" | "GROUP" | "LIMIT" | "OFFSET" | "HAVING" | "UNION" | "ALL" | "CASE" | "WHEN" | "THEN" | "ELSE" | "END" | "AND" | "OR" | "NOT" | "AS" | "VIEW")
 }
 
 /// Parse optional table alias, rejecting reserved keywords
@@ -1092,22 +1093,33 @@ pub fn parse_join(input: &str) -> IResult<&str, JoinClause> {
         nom::combinator::map(tag_no_case("RIGHT JOIN"), |_| JoinType::Right),
         nom::combinator::map(tag_no_case("FULL OUTER JOIN"), |_| JoinType::Full),
         nom::combinator::map(tag_no_case("FULL JOIN"), |_| JoinType::Full),
+        nom::combinator::map(tag_no_case("CROSS JOIN"), |_| JoinType::Cross),
         nom::combinator::map(tag_no_case("JOIN"), |_| JoinType::Inner),
     ))(input)?;
     let (input, _) = multispace1(input)?;
     let (input, table) = parse_identifier(input)?;
-    // Parse optional alias, but don't consume reserved keywords like ON
     let (input, alias) = nom::combinator::opt(parse_table_alias)(input)?;
+
+    // CROSS JOIN has no ON clause
+    if join_type == JoinType::Cross {
+        return Ok((input, JoinClause {
+            join_type,
+            table: table.to_string(),
+            alias,
+            on: None,
+        }));
+    }
+
     let (input, _) = multispace1(input)?;
     let (input, _) = tag_no_case("ON")(input)?;
     let (input, _) = multispace1(input)?;
     let (input, condition) = parse_condition(input)?;
-    
+
     Ok((input, JoinClause {
         join_type,
         table: table.to_string(),
         alias,
-        on: condition,
+        on: Some(condition),
     }))
 }
 
@@ -2095,7 +2107,7 @@ mod tests {
                 let join = &sel.joins[0];
                 assert_eq!(join.table, "orders");
                 assert_eq!(join.join_type, JoinType::Inner);
-                match &join.on.left() {
+                match &join.on.as_ref().unwrap().left() {
                     Expression::QualifiedColumn(table, col) => {
                         assert_eq!(table, "users");
                         assert_eq!(col, "id");
@@ -2128,6 +2140,22 @@ mod tests {
                 }
                 _ => panic!("Expected Select"),
             }
+        }
+    }
+
+    #[test]
+    fn test_parse_cross_join() {
+        let sql = "SELECT * FROM users CROSS JOIN orders;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert_eq!(sel.joins.len(), 1);
+                let join = &sel.joins[0];
+                assert_eq!(join.join_type, JoinType::Cross);
+                assert_eq!(join.table, "orders");
+                assert!(join.on.is_none());
+            }
+            _ => panic!("Expected Select"),
         }
     }
 

@@ -381,6 +381,7 @@ fn select_column_name(col: &parser::SelectColumn) -> String {
         parser::SelectColumn::Column(name) => name.clone(),
         parser::SelectColumn::QualifiedColumn(_, name) => name.clone(),
         parser::SelectColumn::Aggregate(_, _) => column_header(col),
+        parser::SelectColumn::AggregateFiltered(_, _, _) => column_header(col),
         parser::SelectColumn::Expr(expr) => format_expr(expr),
         parser::SelectColumn::All => "*".to_string(),
         parser::SelectColumn::StarFromTable(tbl) => format!("{}.*", tbl),
@@ -585,7 +586,7 @@ fn execute_insert_select(table_name: &str, select: &parser::SelectStatement, sto
                         Some(resolve_join_expression(expr, row, &combined_cols, &empty_storage)
                             .unwrap_or(Value::Null))
                     }
-                    parser::SelectColumn::Aggregate(_, _) | parser::SelectColumn::All | parser::SelectColumn::StarFromTable(_) => None,
+                    parser::SelectColumn::Aggregate(_, _) | parser::SelectColumn::AggregateFiltered(_, _, _) | parser::SelectColumn::All | parser::SelectColumn::StarFromTable(_) => None,
                 }
             }).collect(),
         }
@@ -641,6 +642,37 @@ fn prepare_rows(
         let mut new_rows: Vec<Vec<Value>> = Vec::new();
         let left_col_count = combined_cols.len();
 
+        // Determine shared column names for NATURAL JOIN or JOIN USING
+        let shared_cols: Vec<String> = if matches!(join.join_type, parser::JoinType::Natural) {
+            // Natural join: find columns present in both sides (case-insensitive)
+            combined_cols.iter()
+                .filter(|lc| join_result_cols.iter().any(|rc| rc.name.eq_ignore_ascii_case(&lc.name)))
+                .map(|lc| lc.name.clone())
+                .collect()
+        } else if let Some(using) = &join.using {
+            using.clone()
+        } else {
+            Vec::new()
+        };
+
+        // Build a row-level equality check for shared columns
+        let check_shared = |candidate: &Vec<Value>, all_cols: &Vec<ResultColumn>| -> bool {
+            for col_name in &shared_cols {
+                // Find left-side index (first occurrence)
+                let left_idx = all_cols[..left_col_count].iter().position(|c| c.name.eq_ignore_ascii_case(col_name));
+                // Find right-side index (in the joined portion)
+                let right_idx = all_cols[left_col_count..].iter().position(|c| c.name.eq_ignore_ascii_case(col_name))
+                    .map(|i| i + left_col_count);
+                match (left_idx, right_idx) {
+                    (Some(li), Some(ri)) => {
+                        if candidate[li] != candidate[ri] { return false; }
+                    }
+                    _ => return false,
+                }
+            }
+            true
+        };
+
         for left_row in &combined_rows {
             let mut matched = false;
             for right_row in &join_rows {
@@ -652,9 +684,14 @@ fn prepare_rows(
                     .map(|c| ResultColumn { table: c.table.clone(), name: c.name.clone() })
                     .collect();
 
-                let matches = match &join.on {
-                    Some(cond) => evaluate_join_condition(cond, &candidate, &all_cols, storage),
-                    None => true, // CROSS JOIN — no condition
+                let matches = if !shared_cols.is_empty() {
+                    // NATURAL or USING: match on shared column equality
+                    check_shared(&candidate, &all_cols)
+                } else {
+                    match &join.on {
+                        Some(cond) => evaluate_join_condition(cond, &candidate, &all_cols, storage),
+                        None => true, // CROSS JOIN — no condition
+                    }
                 };
                 if matches {
                     new_rows.push(candidate);
@@ -677,9 +714,13 @@ fn prepare_rows(
                         .chain(join_result_cols.iter())
                         .map(|c| ResultColumn { table: c.table.clone(), name: c.name.clone() })
                         .collect();
-                    match &join.on {
-                        Some(cond) => evaluate_join_condition(cond, &candidate, &all_cols, storage),
-                        None => true,
+                    if !shared_cols.is_empty() {
+                        check_shared(&candidate, &all_cols)
+                    } else {
+                        match &join.on {
+                            Some(cond) => evaluate_join_condition(cond, &candidate, &all_cols, storage),
+                            None => true,
+                        }
                     }
                 });
                 if !has_match {
@@ -690,8 +731,37 @@ fn prepare_rows(
             }
         }
 
-        combined_cols.extend(join_result_cols);
-        combined_rows = new_rows;
+        // For NATURAL JOIN / USING, deduplicate shared columns by removing right-side duplicates
+        let (final_cols, final_rows) = if !shared_cols.is_empty() {
+            // Indices in the combined layout to keep (drop right-side shared cols)
+            let all_cols_tmp: Vec<ResultColumn> = combined_cols.iter()
+                .chain(join_result_cols.iter())
+                .map(|c| ResultColumn { table: c.table.clone(), name: c.name.clone() })
+                .collect();
+            let drop_indices: std::collections::HashSet<usize> = (left_col_count..all_cols_tmp.len())
+                .filter(|&i| shared_cols.iter().any(|s| s.eq_ignore_ascii_case(&all_cols_tmp[i].name)))
+                .collect();
+            let kept_cols: Vec<ResultColumn> = all_cols_tmp.iter().enumerate()
+                .filter(|(i, _)| !drop_indices.contains(i))
+                .map(|(_, c)| ResultColumn { table: c.table.clone(), name: c.name.clone() })
+                .collect();
+            let kept_rows: Vec<Vec<Value>> = new_rows.into_iter()
+                .map(|row| row.into_iter().enumerate()
+                    .filter(|(i, _)| !drop_indices.contains(i))
+                    .map(|(_, v)| v)
+                    .collect())
+                .collect();
+            (kept_cols, kept_rows)
+        } else {
+            let all_cols_extended: Vec<ResultColumn> = combined_cols.iter()
+                .chain(join_result_cols.iter())
+                .map(|c| ResultColumn { table: c.table.clone(), name: c.name.clone() })
+                .collect();
+            (all_cols_extended, new_rows)
+        };
+
+        combined_cols = final_cols;
+        combined_rows = final_rows;
     }
 
     let filtered_rows: Vec<Vec<Value>> = combined_rows.into_iter()
@@ -1036,6 +1106,24 @@ fn column_header(col: &parser::SelectColumn) -> String {
         parser::SelectColumn::QualifiedColumn(_, name) => name.clone(),
         parser::SelectColumn::Alias(_, alias) => alias.clone(),
         parser::SelectColumn::Expr(expr) => format_expr(expr),
+        parser::SelectColumn::AggregateFiltered(func, inner, _) => {
+            // Reuse same naming as Aggregate but call into column_header for the inner part
+            let func_name = match func {
+                parser::AggregateFunc::Count => "COUNT",
+                parser::AggregateFunc::CountDistinct => "COUNT",
+                parser::AggregateFunc::Sum => "SUM",
+                parser::AggregateFunc::Avg => "AVG",
+                parser::AggregateFunc::Min => "MIN",
+                parser::AggregateFunc::Max => "MAX",
+            };
+            let inner_name = match inner.as_ref() {
+                parser::SelectColumn::All => "*".to_string(),
+                parser::SelectColumn::Column(n) => n.clone(),
+                parser::SelectColumn::QualifiedColumn(t, n) => format!("{}.{}", t, n),
+                _ => "?".to_string(),
+            };
+            format!("{}({}) FILTER", func_name, inner_name)
+        }
         parser::SelectColumn::All => "*".to_string(),
         parser::SelectColumn::StarFromTable(tbl) => format!("{}.*", tbl),
     }
@@ -1070,6 +1158,19 @@ fn compute_column_value(
             } else {
                 "NULL".to_string()
             }
+        }
+        parser::SelectColumn::AggregateFiltered(func, inner, filter_cond) => {
+            // Filter the group rows by the FILTER (WHERE ...) condition, then aggregate
+            let empty_storage = Storage::new("/dev/null").unwrap();
+            let filtered_group: Vec<Vec<Value>> = group.iter()
+                .filter(|row| {
+                    // Wrap single row as a one-element slice to satisfy evaluate_having_condition's signature
+                    evaluate_having_condition(filter_cond, std::slice::from_ref(*row), combined_cols, &empty_storage)
+                })
+                .cloned()
+                .collect();
+            let agg_col = parser::SelectColumn::Aggregate(func.clone(), inner.clone());
+            compute_column_value(&agg_col, &filtered_group, combined_cols)
         }
         parser::SelectColumn::All | parser::SelectColumn::StarFromTable(_) => "".to_string(),
     }
@@ -1306,20 +1407,60 @@ fn collect_normal_rows(
     offset: Option<u64>,
     distinct: bool,
 ) -> (Vec<String>, Vec<Vec<String>>) {
-    // Apply ORDER BY
+    // Build alias map: alias name -> index in the projected output (for ORDER BY alias)
+    let alias_map: std::collections::HashMap<String, usize> = columns.iter().enumerate()
+        .filter_map(|(i, col)| {
+            if let parser::SelectColumn::Alias(_, alias) = col {
+                Some((alias.to_lowercase(), i))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Apply ORDER BY — first try raw column index, then alias map on projected rows
     if !order_by.is_empty() {
-        rows.sort_by(|a, b| {
-            for ob in order_by {
-                if let Some(idx) = resolve_column_index(&ob.column, combined_cols) {
-                    let ord = cmp_values_nulls(&a[idx], &b[idx], ob.nulls_first, ob.descending);
-                    let ord = if ob.descending { ord.reverse() } else { ord };
-                    if ord != std::cmp::Ordering::Equal {
-                        return ord;
+        // Project rows once for alias-based ordering
+        let projected: Vec<Vec<Value>> = rows.iter().map(|row| {
+            columns.iter().map(|col| {
+                match col {
+                    parser::SelectColumn::Column(_) | parser::SelectColumn::QualifiedColumn(_, _) => {
+                        resolve_column_index(col, combined_cols).map(|i| row[i].clone()).unwrap_or(Value::Null)
                     }
+                    parser::SelectColumn::Alias(inner, _) => {
+                        resolve_column_index(inner, combined_cols).map(|i| row[i].clone()).unwrap_or(Value::Null)
+                    }
+                    _ => Value::Null,
+                }
+            }).collect()
+        }).collect();
+
+        let indices: Vec<usize> = (0..rows.len()).collect();
+        let mut sorted_indices = indices;
+        sorted_indices.sort_by(|&ai, &bi| {
+            for ob in order_by {
+                // Try raw column first, then alias on projected output
+                let (av, bv) = if let Some(idx) = resolve_column_index(&ob.column, combined_cols) {
+                    (rows[ai][idx].clone(), rows[bi][idx].clone())
+                } else if let parser::SelectColumn::Column(name) = &ob.column {
+                    let key = name.to_lowercase();
+                    if let Some(&pidx) = alias_map.get(&key) {
+                        (projected[ai][pidx].clone(), projected[bi][pidx].clone())
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                };
+                let ord = cmp_values_nulls(&av, &bv, ob.nulls_first, ob.descending);
+                let ord = if ob.descending { ord.reverse() } else { ord };
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
                 }
             }
             std::cmp::Ordering::Equal
         });
+        rows = sorted_indices.into_iter().map(|i| rows[i].clone()).collect();
     }
 
     // Build display column definitions: header name + how to get the value
@@ -1370,7 +1511,7 @@ fn collect_normal_rows(
                             }
                         }
                     }
-                    parser::SelectColumn::All | parser::SelectColumn::Aggregate(_, _) => {}
+                    parser::SelectColumn::All | parser::SelectColumn::Aggregate(_, _) | parser::SelectColumn::AggregateFiltered(_, _, _) => {}
                 }
             }
             result
@@ -1470,6 +1611,7 @@ fn format_expr(expr: &parser::Expression) -> String {
                 parser::ArithOp::Sub => "-",
                 parser::ArithOp::Mul => "*",
                 parser::ArithOp::Div => "/",
+                parser::ArithOp::Mod => "%",
                 parser::ArithOp::Concat => "||",
             };
             format!("{} {} {}", format_expr(l), op_str, format_expr(r))
@@ -1487,6 +1629,10 @@ fn format_expr(expr: &parser::Expression) -> String {
                 parser::ScalarFunc::Floor => "floor",
                 parser::ScalarFunc::LTrim => "ltrim",
                 parser::ScalarFunc::RTrim => "rtrim",
+                parser::ScalarFunc::Sqrt => "sqrt",
+                parser::ScalarFunc::Sign => "sign",
+                parser::ScalarFunc::Trunc => "trunc",
+                parser::ScalarFunc::Reverse => "reverse",
             };
             format!("{}({})", name, format_expr(inner))
         }
@@ -1552,6 +1698,17 @@ fn format_expr(expr: &parser::Expression) -> String {
             };
             format!("{} over ({})", func_str, spec_str)
         }
+        parser::Expression::Greatest(exprs) => {
+            let args: Vec<String> = exprs.iter().map(format_expr).collect();
+            format!("greatest({})", args.join(", "))
+        }
+        parser::Expression::Least(exprs) => {
+            let args: Vec<String> = exprs.iter().map(format_expr).collect();
+            format!("least({})", args.join(", "))
+        }
+        parser::Expression::Power(base, exp) => format!("power({}, {})", format_expr(base), format_expr(exp)),
+        parser::Expression::Position(needle, haystack) => format!("position({} in {})", format_expr(needle), format_expr(haystack)),
+        parser::Expression::Repeat(s, n) => format!("repeat({}, {})", format_expr(s), format_expr(n)),
         parser::Expression::Case(_, _) => "case".to_string(),
         parser::Expression::Aggregate(func, inner) => {
             let func_name = match func {
@@ -1651,6 +1808,17 @@ fn evaluate_join_condition(
                 _ => false,
             }
         }
+        parser::Condition::AnyComparison { left, op, subquery } => {
+            let lv = match resolve_join_expression(left, row, cols, storage) { Some(v) => v, None => return false };
+            let vals = execute_subquery(subquery, storage);
+            vals.iter().any(|rv| compare_values(&lv, op, rv))
+        }
+        parser::Condition::AllComparison { left, op, subquery } => {
+            let lv = match resolve_join_expression(left, row, cols, storage) { Some(v) => v, None => return false };
+            let vals = execute_subquery(subquery, storage);
+            if vals.is_empty() { return true; }
+            vals.iter().all(|rv| compare_values(&lv, op, rv))
+        }
     }
 }
 
@@ -1693,6 +1861,17 @@ fn evaluate_having_condition(
                 (Some(l), Some(r)) => compare_values(l, operator, r),
                 _ => false,
             }
+        }
+        parser::Condition::AnyComparison { left, op, subquery } => {
+            let lv = match resolve_having_expression(left, group, cols, storage) { Some(v) => v, None => return false };
+            let vals = execute_subquery(subquery, storage);
+            vals.iter().any(|rv| compare_values(&lv, op, rv))
+        }
+        parser::Condition::AllComparison { left, op, subquery } => {
+            let lv = match resolve_having_expression(left, group, cols, storage) { Some(v) => v, None => return false };
+            let vals = execute_subquery(subquery, storage);
+            if vals.is_empty() { return true; }
+            vals.iter().all(|rv| compare_values(&lv, op, rv))
         }
     }
 }
@@ -1876,6 +2055,17 @@ fn evaluate_correlated_condition(
                 _ => false,
             }
         }
+        parser::Condition::AnyComparison { left, op, subquery } => {
+            let lv = match resolve_correlated_expr(left, row, cols, storage, outer_row, outer_cols) { Some(v) => v, None => return false };
+            let vals = execute_subquery(subquery, storage);
+            vals.iter().any(|rv| compare_values(&lv, op, rv))
+        }
+        parser::Condition::AllComparison { left, op, subquery } => {
+            let lv = match resolve_correlated_expr(left, row, cols, storage, outer_row, outer_cols) { Some(v) => v, None => return false };
+            let vals = execute_subquery(subquery, storage);
+            if vals.is_empty() { return true; }
+            vals.iter().all(|rv| compare_values(&lv, op, rv))
+        }
     }
 }
 
@@ -2007,6 +2197,29 @@ fn resolve_join_expression(
             }
             else_expr.as_ref().and_then(|e| resolve_join_expression(e, row, cols, storage))
         }
+        parser::Expression::Greatest(exprs) => {
+            let args: Vec<Option<Value>> = exprs.iter().map(|e| resolve_join_expression(e, row, cols, storage)).collect();
+            parser::apply_greatest(args)
+        }
+        parser::Expression::Least(exprs) => {
+            let args: Vec<Option<Value>> = exprs.iter().map(|e| resolve_join_expression(e, row, cols, storage)).collect();
+            parser::apply_least(args)
+        }
+        parser::Expression::Power(base, exp) => {
+            let b = resolve_join_expression(base, row, cols, storage)?;
+            let e = resolve_join_expression(exp, row, cols, storage)?;
+            parser::apply_power(b, e)
+        }
+        parser::Expression::Position(needle, haystack) => {
+            let n = resolve_join_expression(needle, row, cols, storage)?;
+            let h = resolve_join_expression(haystack, row, cols, storage)?;
+            parser::apply_position(n, h)
+        }
+        parser::Expression::Repeat(s, n) => {
+            let sv = resolve_join_expression(s, row, cols, storage)?;
+            let nv = resolve_join_expression(n, row, cols, storage)?;
+            parser::apply_repeat(sv, nv)
+        }
     }
 }
 
@@ -2020,6 +2233,7 @@ fn arith_f64(l: f64, op: &parser::ArithOp, r: f64) -> Option<Value> {
             if r == 0.0 { return Some(Value::Null); }
             l / r
         }
+        parser::ArithOp::Mod => l % r,
         parser::ArithOp::Concat => return Some(Value::String(format!("{}{}", l, r))),
     };
     Some(Value::Float(result))
@@ -2047,17 +2261,14 @@ fn eval_arith(left: &Value, op: &parser::ArithOp, right: &Value) -> Option<Value
     }
     match (left, right) {
         (Value::Int(l), Value::Int(r)) => {
-            let result = match op {
-                parser::ArithOp::Add => l + r,
-                parser::ArithOp::Sub => l - r,
-                parser::ArithOp::Mul => l * r,
-                parser::ArithOp::Div => {
-                    if *r == 0 { return Some(Value::Null); }
-                    l / r
-                }
+            match op {
+                parser::ArithOp::Add => Some(Value::Int(l + r)),
+                parser::ArithOp::Sub => Some(Value::Int(l - r)),
+                parser::ArithOp::Mul => Some(Value::Int(l * r)),
+                parser::ArithOp::Div => { if *r == 0 { Some(Value::Null) } else { Some(Value::Int(l / r)) } }
+                parser::ArithOp::Mod => { if *r == 0 { Some(Value::Null) } else { Some(Value::Int(l % r)) } }
                 parser::ArithOp::Concat => unreachable!(),
-            };
-            Some(Value::Int(result))
+            }
         }
         (Value::Float(l), Value::Float(r)) => arith_f64(*l, op, *r),
         (Value::Int(l), Value::Float(r)) => arith_f64(*l as f64, op, *r),

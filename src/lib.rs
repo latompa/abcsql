@@ -147,6 +147,32 @@ fn execute_select_to_string(
         let mut new_rows = Vec::new();
         let left_col_count = combined_cols.len();
 
+        // Determine shared columns for NATURAL JOIN or JOIN USING
+        let shared_cols: Vec<String> = if matches!(join.join_type, parser::JoinType::Natural) {
+            combined_cols.iter()
+                .filter(|(_, lname)| join_cols.iter().any(|(_, rname)| rname.eq_ignore_ascii_case(lname)))
+                .map(|(_, name)| name.clone())
+                .collect()
+        } else if let Some(using) = &join.using {
+            using.clone()
+        } else {
+            Vec::new()
+        };
+
+        // Check equality of shared columns in a candidate row
+        let check_shared = |candidate: &Vec<Value>, all_cols: &Vec<(String, String)>| -> bool {
+            for col_name in &shared_cols {
+                let li = all_cols[..left_col_count].iter().position(|(_, n)| n.eq_ignore_ascii_case(col_name));
+                let ri = all_cols[left_col_count..].iter().position(|(_, n)| n.eq_ignore_ascii_case(col_name))
+                    .map(|i| i + left_col_count);
+                match (li, ri) {
+                    (Some(l), Some(r)) => { if candidate[l] != candidate[r] { return false; } }
+                    _ => return false,
+                }
+            }
+            true
+        };
+
         for left_row in &combined_rows {
             let mut matched = false;
             for right_row in &join_rows {
@@ -156,9 +182,13 @@ fn execute_select_to_string(
                     .chain(join_cols.iter())
                     .cloned()
                     .collect();
-                let matches = match &join.on {
-                    Some(cond) => eval_condition(cond, &candidate, &all_cols, storage),
-                    None => true, // CROSS JOIN — no condition
+                let matches = if !shared_cols.is_empty() {
+                    check_shared(&candidate, &all_cols)
+                } else {
+                    match &join.on {
+                        Some(cond) => eval_condition(cond, &candidate, &all_cols, storage),
+                        None => true, // CROSS JOIN — no condition
+                    }
                 };
                 if matches {
                     new_rows.push(candidate);
@@ -181,9 +211,13 @@ fn execute_select_to_string(
                         .chain(join_cols.iter())
                         .cloned()
                         .collect();
-                    match &join.on {
-                        Some(cond) => eval_condition(cond, &candidate, &all_cols, storage),
-                        None => true,
+                    if !shared_cols.is_empty() {
+                        check_shared(&candidate, &all_cols)
+                    } else {
+                        match &join.on {
+                            Some(cond) => eval_condition(cond, &candidate, &all_cols, storage),
+                            None => true,
+                        }
                     }
                 });
                 if !has_match {
@@ -225,6 +259,30 @@ fn execute_select_to_string(
 
 fn lib_execute_scalar_subquery(stmt: &parser::SelectStatement, storage: &Storage) -> Option<Value> {
     lib_execute_correlated_subquery(stmt, storage, &[], &[])
+}
+
+/// Execute a subquery and return all first-column values (for ANY/ALL evaluation).
+fn lib_execute_subquery_all_values(stmt: &parser::SelectStatement, storage: &Storage) -> Vec<Value> {
+    let table_name = match stmt.from.table_name() { Some(t) => t, None => return vec![] };
+    let schema = match storage.load_schema(table_name) { Ok(s) => s, Err(_) => return vec![] };
+    let rows = match storage.read_rows(table_name) { Ok(r) => r, Err(_) => return vec![] };
+    let inner_cols: Vec<(String, String)> = schema.columns.iter()
+        .map(|c| (table_name.to_string(), c.name.clone()))
+        .collect();
+    rows.into_iter()
+        .filter(|row| match &stmt.where_clause {
+            Some(wc) => eval_correlated_condition(&wc.condition, row, &inner_cols, storage, &[], &[]),
+            None => true,
+        })
+        .filter_map(|row| {
+            match stmt.columns.first() {
+                Some(parser::SelectColumn::Column(name)) => {
+                    schema.columns.iter().position(|c| c.name == *name).and_then(|i| row.get(i).cloned())
+                }
+                _ => row.into_iter().next(),
+            }
+        })
+        .collect()
 }
 
 /// Execute a subquery with optional outer row context for correlated references.
@@ -319,6 +377,17 @@ fn eval_correlated_condition(
                 _ => false,
             }
         }
+        parser::Condition::AnyComparison { left, op, subquery } => {
+            let lv = match resolve_correlated_expr(left, row, cols, storage, outer_row, outer_cols) { Some(v) => v, None => return false };
+            let values = lib_execute_subquery_all_values(subquery, storage);
+            values.iter().any(|rv| compare(&lv, op, rv))
+        }
+        parser::Condition::AllComparison { left, op, subquery } => {
+            let lv = match resolve_correlated_expr(left, row, cols, storage, outer_row, outer_cols) { Some(v) => v, None => return false };
+            let values = lib_execute_subquery_all_values(subquery, storage);
+            // Vacuously true if no rows
+            values.iter().all(|rv| compare(&lv, op, rv))
+        }
     }
 }
 
@@ -403,6 +472,16 @@ fn eval_condition(cond: &parser::Condition, row: &[Value], cols: &[(String, Stri
                 _ => false,
             }
         }
+        parser::Condition::AnyComparison { left, op, subquery } => {
+            let lv = match resolve_expr(left, row, cols, storage) { Some(v) => v, None => return false };
+            let values = lib_execute_subquery_all_values(subquery, storage);
+            values.iter().any(|rv| compare(&lv, op, rv))
+        }
+        parser::Condition::AllComparison { left, op, subquery } => {
+            let lv = match resolve_expr(left, row, cols, storage) { Some(v) => v, None => return false };
+            let values = lib_execute_subquery_all_values(subquery, storage);
+            values.iter().all(|rv| compare(&lv, op, rv))
+        }
     }
 }
 
@@ -476,6 +555,29 @@ fn resolve_expr(expr: &parser::Expression, row: &[Value], cols: &[(String, Strin
             let rv = resolve_expr(right, row, cols, storage)?;
             lib_eval_arith(&lv, op, &rv)
         }
+        parser::Expression::Greatest(exprs) => {
+            let args: Vec<Option<Value>> = exprs.iter().map(|e| resolve_expr(e, row, cols, storage)).collect();
+            parser::apply_greatest(args)
+        }
+        parser::Expression::Least(exprs) => {
+            let args: Vec<Option<Value>> = exprs.iter().map(|e| resolve_expr(e, row, cols, storage)).collect();
+            parser::apply_least(args)
+        }
+        parser::Expression::Power(base, exp) => {
+            let b = resolve_expr(base, row, cols, storage)?;
+            let e = resolve_expr(exp, row, cols, storage)?;
+            parser::apply_power(b, e)
+        }
+        parser::Expression::Position(needle, haystack) => {
+            let n = resolve_expr(needle, row, cols, storage)?;
+            let h = resolve_expr(haystack, row, cols, storage)?;
+            parser::apply_position(n, h)
+        }
+        parser::Expression::Repeat(s, n) => {
+            let sv = resolve_expr(s, row, cols, storage)?;
+            let nv = resolve_expr(n, row, cols, storage)?;
+            parser::apply_repeat(sv, nv)
+        }
         parser::Expression::Aggregate(_, _) => None,
         parser::Expression::Window(_, _) => None,
         parser::Expression::Case(branches, else_expr) => {
@@ -510,46 +612,46 @@ fn lib_eval_arith(left: &Value, op: &parser::ArithOp, right: &Value) -> Option<V
     }
     match (left, right) {
         (Value::Int(l), Value::Int(r)) => {
-            let v = match op {
-                parser::ArithOp::Add => l + r,
-                parser::ArithOp::Sub => l - r,
-                parser::ArithOp::Mul => l * r,
-                parser::ArithOp::Div => { if *r == 0 { return Some(Value::Null); } l / r }
+            match op {
+                parser::ArithOp::Add => Some(Value::Int(l + r)),
+                parser::ArithOp::Sub => Some(Value::Int(l - r)),
+                parser::ArithOp::Mul => Some(Value::Int(l * r)),
+                parser::ArithOp::Div => { if *r == 0 { Some(Value::Null) } else { Some(Value::Int(l / r)) } }
+                parser::ArithOp::Mod => { if *r == 0 { Some(Value::Null) } else { Some(Value::Int(l % r)) } }
                 parser::ArithOp::Concat => unreachable!(),
-            };
-            Some(Value::Int(v))
+            }
         }
         (Value::Float(l), Value::Float(r)) => {
-            let v = match op {
-                parser::ArithOp::Add => l + r,
-                parser::ArithOp::Sub => l - r,
-                parser::ArithOp::Mul => l * r,
-                parser::ArithOp::Div => { if *r == 0.0 { return Some(Value::Null); } l / r }
+            match op {
+                parser::ArithOp::Add => Some(Value::Float(l + r)),
+                parser::ArithOp::Sub => Some(Value::Float(l - r)),
+                parser::ArithOp::Mul => Some(Value::Float(l * r)),
+                parser::ArithOp::Div => { if *r == 0.0 { Some(Value::Null) } else { Some(Value::Float(l / r)) } }
+                parser::ArithOp::Mod => Some(Value::Float(l % r)),
                 parser::ArithOp::Concat => unreachable!(),
-            };
-            Some(Value::Float(v))
+            }
         }
         (Value::Int(l), Value::Float(r)) => {
             let l = *l as f64;
-            let v = match op {
-                parser::ArithOp::Add => l + r,
-                parser::ArithOp::Sub => l - r,
-                parser::ArithOp::Mul => l * r,
-                parser::ArithOp::Div => { if *r == 0.0 { return Some(Value::Null); } l / r }
+            match op {
+                parser::ArithOp::Add => Some(Value::Float(l + r)),
+                parser::ArithOp::Sub => Some(Value::Float(l - r)),
+                parser::ArithOp::Mul => Some(Value::Float(l * r)),
+                parser::ArithOp::Div => { if *r == 0.0 { Some(Value::Null) } else { Some(Value::Float(l / r)) } }
+                parser::ArithOp::Mod => Some(Value::Float(l % r)),
                 parser::ArithOp::Concat => unreachable!(),
-            };
-            Some(Value::Float(v))
+            }
         }
         (Value::Float(l), Value::Int(r)) => {
             let r = *r as f64;
-            let v = match op {
-                parser::ArithOp::Add => l + r,
-                parser::ArithOp::Sub => l - r,
-                parser::ArithOp::Mul => l * r,
-                parser::ArithOp::Div => { if r == 0.0 { return Some(Value::Null); } l / r }
+            match op {
+                parser::ArithOp::Add => Some(Value::Float(l + r)),
+                parser::ArithOp::Sub => Some(Value::Float(l - r)),
+                parser::ArithOp::Mul => Some(Value::Float(l * r)),
+                parser::ArithOp::Div => { if r == 0.0 { Some(Value::Null) } else { Some(Value::Float(l / r)) } }
+                parser::ArithOp::Mod => Some(Value::Float(l % r)),
                 parser::ArithOp::Concat => unreachable!(),
-            };
-            Some(Value::Float(v))
+            }
         }
         _ => None,
     }

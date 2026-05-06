@@ -209,6 +209,7 @@ pub enum SelectColumn {
     Column(String),
     QualifiedColumn(String, String), // table.column
     Aggregate(AggregateFunc, Box<SelectColumn>), // COUNT(*), SUM(col), etc.
+    AggregateFiltered(AggregateFunc, Box<SelectColumn>, Box<Condition>), // COUNT(*) FILTER (WHERE ...)
     Alias(Box<SelectColumn>, String), // expr AS name
     Expr(Expression), // arithmetic expression like price * 2
 }
@@ -270,6 +271,10 @@ pub enum ScalarFunc {
     Abs,
     Ceil,
     Floor,
+    Sqrt,
+    Sign,
+    Trunc,
+    Reverse,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -289,6 +294,7 @@ pub struct JoinClause {
     pub table: String,
     pub alias: Option<String>,
     pub on: Option<Condition>,
+    pub using: Option<Vec<String>>, // USING (col1, col2, ...)
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -298,6 +304,7 @@ pub enum JoinType {
     Right,
     Full,
     Cross,
+    Natural,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -312,6 +319,10 @@ pub enum Condition {
     And(Box<Condition>, Box<Condition>),
     Or(Box<Condition>, Box<Condition>),
     Not(Box<Condition>),
+    // expr op ANY (SELECT ...) — true if any row satisfies
+    AnyComparison { left: Expression, op: Operator, subquery: Box<SelectStatement> },
+    // expr op ALL (SELECT ...) — true if all rows satisfy
+    AllComparison { left: Expression, op: Operator, subquery: Box<SelectStatement> },
 }
 
 #[cfg(test)]
@@ -362,6 +373,15 @@ pub enum Expression {
     // LPAD(str, len, pad) / RPAD(str, len, pad)
     LPad(Box<Expression>, Box<Expression>, Box<Expression>),
     RPad(Box<Expression>, Box<Expression>, Box<Expression>),
+    // GREATEST(expr, ...) / LEAST(expr, ...) — return max/min ignoring NULLs
+    Greatest(Vec<Expression>),
+    Least(Vec<Expression>),
+    // POWER(base, exp) / POW(base, exp)
+    Power(Box<Expression>, Box<Expression>),
+    // POSITION(needle IN haystack) — 1-based index or 0 if not found
+    Position(Box<Expression>, Box<Expression>),
+    // REPEAT(str, n)
+    Repeat(Box<Expression>, Box<Expression>),
     // Window function: func() OVER (PARTITION BY ... ORDER BY ...)
     Window(WindowFunc, WindowSpec),
 }
@@ -372,6 +392,7 @@ pub enum ArithOp {
     Sub,
     Mul,
     Div,
+    Mod,    // % operator
     Concat, // || operator
 }
 
@@ -879,6 +900,13 @@ fn parse_alter_rename(input: &str) -> IResult<&str, AlterAction> {
     }
 }
 
+/// Parse an extra comma-separated FROM table (returns name and optional alias)
+fn parse_extra_from_table(input: &str) -> IResult<&str, (String, Option<String>)> {
+    let (input, tbl) = parse_identifier(input)?;
+    let (input, alias) = nom::combinator::opt(parse_table_alias)(input)?;
+    Ok((input, (tbl.to_string(), alias)))
+}
+
 /// Parse SELECT into a SelectStatement (used by both top-level and subqueries)
 pub fn parse_select_statement(input: &str) -> IResult<&str, SelectStatement> {
     let (input, _) = tag_no_case("SELECT")(input)?;
@@ -910,7 +938,22 @@ pub fn parse_select_statement(input: &str) -> IResult<&str, SelectStatement> {
         (input, FromClause::Table(table.to_string()), from_alias)
     };
 
-    let (input, joins) = nom::multi::many0(parse_join)(input)?;
+    // Parse optional comma-separated extra FROM tables (implicit CROSS JOIN)
+    let (input, extra_tables) = nom::multi::many0(
+        nom::sequence::preceded(
+            nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+            parse_extra_from_table,
+        )
+    )(input)?;
+
+    let mut joins = Vec::new();
+    for (tbl, alias) in extra_tables {
+        joins.push(JoinClause { join_type: JoinType::Cross, table: tbl, alias, on: None, using: None });
+    }
+
+    let (input, explicit_joins) = nom::multi::many0(parse_join)(input)?;
+    let mut joins = joins;
+    joins.extend(explicit_joins);
     let (input, where_clause) = nom::combinator::opt(parse_where)(input)?;
     let (input, group_by) = parse_group_by_clause(input)?;
     let (input, having) = parse_having_clause(input)?;
@@ -1030,9 +1073,26 @@ fn parse_arith_select_column(input: &str) -> IResult<&str, SelectColumn> {
         | Expression::Round(_, _) | Expression::Concat(_) | Expression::Substr(_, _, _)
         | Expression::Replace(_, _, _) | Expression::LPad(_, _, _) | Expression::RPad(_, _, _)
         | Expression::Cast(_, _) | Expression::Window(_, _)
+        | Expression::Greatest(_) | Expression::Least(_)
+        | Expression::Power(_, _) | Expression::Position(_, _) | Expression::Repeat(_, _)
         | Expression::Literal(_) | Expression::Subquery(_) => Ok((new_input, SelectColumn::Expr(expr))),
         _ => Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag))),
     }
+}
+
+/// Parse FILTER (WHERE condition) clause used after aggregates
+fn parse_filter_clause(input: &str) -> IResult<&str, Condition> {
+    let (input, _) = multispace1(input)?;
+    let (input, _) = tag_no_case("FILTER")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = tag_no_case("WHERE")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, cond) = parse_condition(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, cond))
 }
 
 /// Parse aggregate function: COUNT(*), COUNT(DISTINCT col), SUM(col), AVG(col), MIN(col), MAX(col)
@@ -1086,6 +1146,12 @@ fn parse_aggregate_column(input: &str) -> IResult<&str, SelectColumn> {
 
     let (input, _) = multispace0(input)?;
     let (input, _) = nom_char(')')(input)?;
+
+    // Try to parse optional FILTER (WHERE condition)
+    if let Ok((input, cond)) = parse_filter_clause(input) {
+        return Ok((input, SelectColumn::AggregateFiltered(func, Box::new(inner), Box::new(cond))));
+    }
+
     Ok((input, SelectColumn::Aggregate(func, Box::new(inner))))
 }
 
@@ -1227,7 +1293,7 @@ fn parse_limit_offset_clause(input: &str) -> IResult<&str, (Option<u64>, Option<
 
 /// Check if identifier is a reserved keyword that can't be used as an alias
 fn is_reserved_keyword(s: &str) -> bool {
-    matches!(s.to_uppercase().as_str(), "ON" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "OUTER" | "CROSS" | "WHERE" | "ORDER" | "GROUP" | "LIMIT" | "OFFSET" | "HAVING" | "UNION" | "ALL" | "CASE" | "WHEN" | "THEN" | "ELSE" | "END" | "AND" | "OR" | "NOT" | "AS" | "VIEW" | "OVER" | "PARTITION" | "NULLS" | "FIRST" | "LAST" | "INTERSECT" | "EXCEPT" | "ROWS" | "RANGE" | "GROUPS" | "PRECEDING" | "FOLLOWING" | "UNBOUNDED" | "BETWEEN")
+    matches!(s.to_uppercase().as_str(), "ON" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "OUTER" | "CROSS" | "WHERE" | "ORDER" | "GROUP" | "LIMIT" | "OFFSET" | "HAVING" | "UNION" | "ALL" | "CASE" | "WHEN" | "THEN" | "ELSE" | "END" | "AND" | "OR" | "NOT" | "AS" | "VIEW" | "OVER" | "PARTITION" | "NULLS" | "FIRST" | "LAST" | "INTERSECT" | "EXCEPT" | "ROWS" | "RANGE" | "GROUPS" | "PRECEDING" | "FOLLOWING" | "UNBOUNDED" | "BETWEEN" | "USING" | "NATURAL" | "ANY" | "SOME" | "FILTER")
 }
 
 /// Parse optional table alias, rejecting reserved keywords
@@ -1243,6 +1309,28 @@ fn parse_table_alias(input: &str) -> IResult<&str, String> {
 /// Parse JOIN clause
 pub fn parse_join(input: &str) -> IResult<&str, JoinClause> {
     let (input, _) = multispace1(input)?;
+
+    // Try NATURAL [LEFT|RIGHT|INNER] JOIN first
+    if let Ok((input, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("NATURAL")(input) {
+        let (input, _) = multispace1(input)?;
+        // Optionally consume LEFT/RIGHT/INNER before JOIN
+        let (input, _) = nom::combinator::opt(nom::sequence::terminated(
+            nom::branch::alt((tag_no_case("LEFT"), tag_no_case("RIGHT"), tag_no_case("INNER"))),
+            multispace1::<&str, nom::error::Error<&str>>,
+        ))(input)?;
+        let (input, _) = tag_no_case("JOIN")(input)?;
+        let (input, _) = multispace1(input)?;
+        let (input, table) = parse_identifier(input)?;
+        let (input, alias) = nom::combinator::opt(parse_table_alias)(input)?;
+        return Ok((input, JoinClause {
+            join_type: JoinType::Natural,
+            table: table.to_string(),
+            alias,
+            on: None,
+            using: None,
+        }));
+    }
+
     let (input, join_type) = nom::branch::alt((
         nom::combinator::map(tag_no_case("INNER JOIN"), |_| JoinType::Inner),
         nom::combinator::map(tag_no_case("LEFT JOIN"), |_| JoinType::Left),
@@ -1256,13 +1344,32 @@ pub fn parse_join(input: &str) -> IResult<&str, JoinClause> {
     let (input, table) = parse_identifier(input)?;
     let (input, alias) = nom::combinator::opt(parse_table_alias)(input)?;
 
-    // CROSS JOIN has no ON clause
+    // CROSS JOIN has no ON/USING clause
     if join_type == JoinType::Cross {
+        return Ok((input, JoinClause { join_type, table: table.to_string(), alias, on: None, using: None }));
+    }
+
+    // Try USING (col1, col2, ...)
+    let after_alias = input;
+    if let Ok((input, _)) = nom::sequence::preceded(
+        multispace1::<&str, nom::error::Error<&str>>,
+        tag_no_case::<&str, &str, nom::error::Error<&str>>("USING"),
+    )(after_alias) {
+        let (input, _) = multispace0(input)?;
+        let (input, _) = nom_char('(')(input)?;
+        let (input, _) = multispace0(input)?;
+        let (input, cols) = nom::multi::separated_list1(
+            nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+            parse_identifier,
+        )(input)?;
+        let (input, _) = multispace0(input)?;
+        let (input, _) = nom_char(')')(input)?;
         return Ok((input, JoinClause {
             join_type,
             table: table.to_string(),
             alias,
             on: None,
+            using: Some(cols.iter().map(|s| s.to_string()).collect()),
         }));
     }
 
@@ -1271,12 +1378,7 @@ pub fn parse_join(input: &str) -> IResult<&str, JoinClause> {
     let (input, _) = multispace1(input)?;
     let (input, condition) = parse_condition(input)?;
 
-    Ok((input, JoinClause {
-        join_type,
-        table: table.to_string(),
-        alias,
-        on: Some(condition),
-    }))
+    Ok((input, JoinClause { join_type, table: table.to_string(), alias, on: Some(condition), using: None }))
 }
 
 /// Parse condition with OR (lowest precedence), AND, then a primary comparison
@@ -1488,6 +1590,40 @@ fn parse_primary_condition(input: &str) -> IResult<&str, Condition> {
         return Ok((input, Condition::Comparison { left, operator: Operator::NotLike, right, upper_bound: None }));
     }
 
+    // Try ANY/ALL subquery operators: expr op ANY (SELECT ...) / expr op ALL (SELECT ...)
+    if let Ok((after_op, op)) = parse_operator(input) {
+        let after_op_trimmed = after_op.trim_start();
+        // Try ANY or SOME (synonym for ANY)
+        if let Ok((rest, _)) = nom::branch::alt((
+            tag_no_case::<&str, &str, nom::error::Error<&str>>("ANY"),
+            tag_no_case::<&str, &str, nom::error::Error<&str>>("SOME"),
+        ))(after_op_trimmed) {
+            let rest = rest.trim_start();
+            if let Ok((rest, _)) = nom_char::<&str, nom::error::Error<&str>>('(')(rest) {
+                let rest = rest.trim_start();
+                if let Ok((rest, subquery)) = parse_select_statement(rest) {
+                    let rest = rest.trim_start();
+                    if let Ok((rest, _)) = nom_char::<&str, nom::error::Error<&str>>(')')(rest) {
+                        return Ok((rest, Condition::AnyComparison { left, op, subquery: Box::new(subquery) }));
+                    }
+                }
+            }
+        }
+        // Try ALL
+        if let Ok((rest, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("ALL")(after_op_trimmed) {
+            let rest = rest.trim_start();
+            if let Ok((rest, _)) = nom_char::<&str, nom::error::Error<&str>>('(')(rest) {
+                let rest = rest.trim_start();
+                if let Ok((rest, subquery)) = parse_select_statement(rest) {
+                    let rest = rest.trim_start();
+                    if let Ok((rest, _)) = nom_char::<&str, nom::error::Error<&str>>(')')(rest) {
+                        return Ok((rest, Condition::AllComparison { left, op, subquery: Box::new(subquery) }));
+                    }
+                }
+            }
+        }
+    }
+
     let (input, operator) = parse_operator(input)?;
     let (input, _) = multispace0(input)?;
     let (input, right) = parse_expression(input)?;
@@ -1511,6 +1647,7 @@ fn parse_arith_mul_div(input: &str) -> IResult<&str, ArithOp> {
     let (input, op) = nom::branch::alt((
         nom::combinator::map(nom_char('*'), |_| ArithOp::Mul),
         nom::combinator::map(nom_char('/'), |_| ArithOp::Div),
+        nom::combinator::map(nom_char('%'), |_| ArithOp::Mod),
     ))(input)?;
     let (input, _) = multispace0(input)?;
     Ok((input, op))
@@ -1556,24 +1693,34 @@ fn parse_term(input: &str) -> IResult<&str, Expression> {
 
 /// Parse atomic expression: subquery, aggregate, CASE, column, table.column, or literal
 fn parse_atom(input: &str) -> IResult<&str, Expression> {
+    // Split into two alt groups because nom::alt supports max 21 alternatives
     nom::branch::alt((
-        parse_expression_case,
-        parse_expression_subquery,
-        parse_expression_coalesce,
-        parse_expression_nullif,
-        parse_expression_round,
-        parse_expression_concat,
-        parse_expression_substr,
-        parse_expression_cast,
-        parse_expression_replace,
-        parse_expression_lpad,
-        parse_expression_rpad,
-        parse_expression_window,
-        parse_expression_scalar_func,
-        parse_expression_aggregate,
-        parse_expression_qualified_column,
-        parse_expression_literal,
-        parse_expression_simple_column,
+        nom::branch::alt((
+            parse_expression_case,
+            parse_expression_subquery,
+            parse_expression_coalesce,
+            parse_expression_nullif,
+            parse_expression_greatest,
+            parse_expression_least,
+            parse_expression_power,
+            parse_expression_position,
+            parse_expression_repeat,
+            parse_expression_round,
+            parse_expression_concat,
+            parse_expression_substr,
+        )),
+        nom::branch::alt((
+            parse_expression_cast,
+            parse_expression_replace,
+            parse_expression_lpad,
+            parse_expression_rpad,
+            parse_expression_window,
+            parse_expression_scalar_func,
+            parse_expression_aggregate,
+            parse_expression_qualified_column,
+            parse_expression_literal,
+            parse_expression_simple_column,
+        )),
     ))(input)
 }
 
@@ -1618,6 +1765,10 @@ fn parse_expression_scalar_func(input: &str) -> IResult<&str, Expression> {
         tag_no_case("CEILING"),
         tag_no_case("CEIL"),
         tag_no_case("FLOOR"),
+        tag_no_case("SQRT"),
+        tag_no_case("SIGN"),
+        tag_no_case("TRUNC"),
+        tag_no_case("REVERSE"),
     ))(input)?;
     let func = match func_name.to_uppercase().as_str() {
         "UPPER"   => ScalarFunc::Upper,
@@ -1629,6 +1780,10 @@ fn parse_expression_scalar_func(input: &str) -> IResult<&str, Expression> {
         "ABS"     => ScalarFunc::Abs,
         "CEILING" | "CEIL" => ScalarFunc::Ceil,
         "FLOOR"   => ScalarFunc::Floor,
+        "SQRT"    => ScalarFunc::Sqrt,
+        "SIGN"    => ScalarFunc::Sign,
+        "TRUNC"   => ScalarFunc::Trunc,
+        "REVERSE" => ScalarFunc::Reverse,
         _ => unreachable!(),
     };
     let (input, _) = multispace0(input)?;
@@ -1749,6 +1904,75 @@ fn parse_expression_rpad(input: &str) -> IResult<&str, Expression> {
     let (input, _) = multispace0(input)?;
     let (input, _) = nom_char(')')(input)?;
     Ok((input, Expression::RPad(Box::new(s), Box::new(len), Box::new(pad))))
+}
+
+fn parse_expression_greatest(input: &str) -> IResult<&str, Expression> {
+    let (input, _) = tag_no_case("GREATEST")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, exprs) = nom::multi::separated_list1(
+        nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+        parse_expression,
+    )(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, Expression::Greatest(exprs)))
+}
+
+fn parse_expression_least(input: &str) -> IResult<&str, Expression> {
+    let (input, _) = tag_no_case("LEAST")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, exprs) = nom::multi::separated_list1(
+        nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+        parse_expression,
+    )(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, Expression::Least(exprs)))
+}
+
+fn parse_expression_power(input: &str) -> IResult<&str, Expression> {
+    let (input, _) = nom::branch::alt((tag_no_case("POWER"), tag_no_case("POW")))(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, base) = parse_expression(input)?;
+    let (input, _) = nom::sequence::delimited(multispace0, nom_char(','), multispace0)(input)?;
+    let (input, exp) = parse_expression(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, Expression::Power(Box::new(base), Box::new(exp))))
+}
+
+fn parse_expression_position(input: &str) -> IResult<&str, Expression> {
+    let (input, _) = tag_no_case("POSITION")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, needle) = parse_expression(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, _) = tag_no_case("IN")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, haystack) = parse_expression(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, Expression::Position(Box::new(needle), Box::new(haystack))))
+}
+
+fn parse_expression_repeat(input: &str) -> IResult<&str, Expression> {
+    let (input, _) = tag_no_case("REPEAT")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, s) = parse_expression(input)?;
+    let (input, _) = nom::sequence::delimited(multispace0, nom_char(','), multispace0)(input)?;
+    let (input, n) = parse_expression(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, Expression::Repeat(Box::new(s), Box::new(n))))
 }
 
 fn parse_window_spec(input: &str) -> IResult<&str, WindowSpec> {
@@ -2171,6 +2395,55 @@ pub fn apply_cast(val: Value, type_name: &str) -> Option<Value> {
     }
 }
 
+/// Evaluate GREATEST(args) — return max non-NULL arg, or NULL if all NULL
+pub fn apply_greatest(args: Vec<Option<Value>>) -> Option<Value> {
+    let non_null: Vec<Value> = args.into_iter().flatten()
+        .filter(|v| !matches!(v, Value::Null))
+        .collect();
+    non_null.into_iter().max_by(cmp_values_for_sort)
+}
+
+/// Evaluate LEAST(args) — return min non-NULL arg, or NULL if all NULL
+pub fn apply_least(args: Vec<Option<Value>>) -> Option<Value> {
+    let non_null: Vec<Value> = args.into_iter().flatten()
+        .filter(|v| !matches!(v, Value::Null))
+        .collect();
+    non_null.into_iter().min_by(cmp_values_for_sort)
+}
+
+fn cmp_values_for_sort(a: &Value, b: &Value) -> std::cmp::Ordering {
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
+        (Value::Int(x), Value::Float(y)) => (*x as f64).partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
+        (Value::Float(x), Value::Int(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(std::cmp::Ordering::Equal),
+        (Value::String(x), Value::String(y)) => x.cmp(y),
+        _ => std::cmp::Ordering::Equal,
+    }
+}
+
+/// Evaluate POWER(base, exp)
+pub fn apply_power(base: Value, exp: Value) -> Option<Value> {
+    let b = match base { Value::Int(n) => n as f64, Value::Float(f) => f, _ => return None };
+    let e = match exp  { Value::Int(n) => n as f64, Value::Float(f) => f, _ => return None };
+    Some(Value::Float(b.powf(e)))
+}
+
+/// Evaluate POSITION(needle IN haystack) — 1-based, 0 if not found
+pub fn apply_position(needle: Value, haystack: Value) -> Option<Value> {
+    let n = match needle   { Value::String(s) => s, _ => return None };
+    let h = match haystack { Value::String(s) => s, _ => return None };
+    let pos = h.find(n.as_str()).map(|i| i + 1).unwrap_or(0);
+    Some(Value::Int(pos as i64))
+}
+
+/// Evaluate REPEAT(str, n)
+pub fn apply_repeat(s: Value, n: Value) -> Option<Value> {
+    let s = match s { Value::String(s) => s, _ => return None };
+    let n = match n { Value::Int(n) if n >= 0 => n as usize, _ => return None };
+    Some(Value::String(s.repeat(n)))
+}
+
 /// Apply a single-arg scalar function to a resolved Value
 pub fn apply_scalar_func(func: &ScalarFunc, val: Value) -> Option<Value> {
     match (func, val) {
@@ -2186,6 +2459,13 @@ pub fn apply_scalar_func(func: &ScalarFunc, val: Value) -> Option<Value> {
         (ScalarFunc::Ceil,  Value::Int(n))   => Some(Value::Int(n)),
         (ScalarFunc::Floor, Value::Float(f)) => Some(Value::Float(f.floor())),
         (ScalarFunc::Floor, Value::Int(n))   => Some(Value::Int(n)),
+        (ScalarFunc::Sqrt,  Value::Float(f)) => Some(Value::Float(f.sqrt())),
+        (ScalarFunc::Sqrt,  Value::Int(n))   => Some(Value::Float((n as f64).sqrt())),
+        (ScalarFunc::Sign,  Value::Int(n))   => Some(Value::Int(n.signum())),
+        (ScalarFunc::Sign,  Value::Float(f)) => Some(Value::Float(f.signum())),
+        (ScalarFunc::Trunc, Value::Float(f)) => Some(Value::Float(f.trunc())),
+        (ScalarFunc::Trunc, Value::Int(n))   => Some(Value::Int(n)),
+        (ScalarFunc::Reverse, Value::String(s)) => Some(Value::String(s.chars().rev().collect())),
         _ => None,
     }
 }

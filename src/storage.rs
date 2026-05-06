@@ -3,7 +3,7 @@ use std::io::{self, Write as IoWrite, BufWriter, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::fmt;
 use std::collections::HashMap;
-use crate::parser::{CreateTableStatement, CreateIndexStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, UpdateStatement, DeleteStatement, AlterTableStatement, AlterAction, Value, Condition, Expression, Operator, ArithOp, SelectStatement, SelectColumn, FromClause, apply_scalar_func, apply_round, apply_concat, apply_substr, apply_replace, apply_lpad, apply_rpad, apply_cast};
+use crate::parser::{CreateTableStatement, CreateIndexStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, UpdateStatement, DeleteStatement, AlterTableStatement, AlterAction, Value, Condition, Expression, Operator, ArithOp, SelectStatement, SelectColumn, FromClause, apply_scalar_func, apply_round, apply_concat, apply_substr, apply_replace, apply_lpad, apply_rpad, apply_cast, apply_greatest, apply_least, apply_power, apply_position, apply_repeat};
 
 /// Storage engine for persisting tables to disk
 pub struct Storage {
@@ -1316,6 +1316,20 @@ fn evaluate_correlated_condition_storage(
                 _ => false,
             }
         }
+        Condition::AnyComparison { left, op, subquery } => {
+            let lv = match resolve_correlated_expr_storage(left, row, schema, storage, outer_row, outer_schema) { Some(v) => v, None => return false };
+            match execute_scalar_subquery(subquery, storage) {
+                Some(rv) => compare_values(&lv, op, &rv),
+                None => false,
+            }
+        }
+        Condition::AllComparison { left, op, subquery } => {
+            let lv = match resolve_correlated_expr_storage(left, row, schema, storage, outer_row, outer_schema) { Some(v) => v, None => return false };
+            match execute_scalar_subquery(subquery, storage) {
+                Some(rv) => compare_values(&lv, op, &rv),
+                None => true,
+            }
+        }
     }
 }
 
@@ -1402,6 +1416,20 @@ fn evaluate_condition(condition: &Condition, row: &[Value], schema: &[ColumnDefi
             match (&left_val, &right_val) {
                 (Some(l), Some(r)) => compare_values(l, operator, r),
                 _ => false,
+            }
+        }
+        Condition::AnyComparison { left, op, subquery } => {
+            let lv = match resolve_expression(left, row, schema, storage) { Some(v) => v, None => return false };
+            match execute_scalar_subquery(subquery, storage) {
+                Some(rv) => compare_values(&lv, op, &rv),
+                None => false,
+            }
+        }
+        Condition::AllComparison { left, op, subquery } => {
+            let lv = match resolve_expression(left, row, schema, storage) { Some(v) => v, None => return false };
+            match execute_scalar_subquery(subquery, storage) {
+                Some(rv) => compare_values(&lv, op, &rv),
+                None => true,
             }
         }
     }
@@ -1493,6 +1521,29 @@ fn resolve_expression(expr: &Expression, row: &[Value], schema: &[ColumnDefiniti
             }
             else_expr.as_ref().and_then(|e| resolve_expression(e, row, schema, storage))
         }
+        Expression::Greatest(exprs) => {
+            let args: Vec<Option<Value>> = exprs.iter().map(|e| resolve_expression(e, row, schema, storage)).collect();
+            apply_greatest(args)
+        }
+        Expression::Least(exprs) => {
+            let args: Vec<Option<Value>> = exprs.iter().map(|e| resolve_expression(e, row, schema, storage)).collect();
+            apply_least(args)
+        }
+        Expression::Power(base, exp) => {
+            let b = resolve_expression(base, row, schema, storage)?;
+            let e = resolve_expression(exp, row, schema, storage)?;
+            apply_power(b, e)
+        }
+        Expression::Position(needle, haystack) => {
+            let n = resolve_expression(needle, row, schema, storage)?;
+            let h = resolve_expression(haystack, row, schema, storage)?;
+            apply_position(n, h)
+        }
+        Expression::Repeat(s, n) => {
+            let sv = resolve_expression(s, row, schema, storage)?;
+            let nv = resolve_expression(n, row, schema, storage)?;
+            apply_repeat(sv, nv)
+        }
     }
 }
 
@@ -1563,14 +1614,14 @@ fn storage_eval_arith(left: &Value, op: &ArithOp, right: &Value) -> Option<Value
     }
     match (left, right) {
         (Value::Int(l), Value::Int(r)) => {
-            let v = match op {
-                ArithOp::Add => l + r,
-                ArithOp::Sub => l - r,
-                ArithOp::Mul => l * r,
-                ArithOp::Div => { if *r == 0 { return Some(Value::Null); } l / r }
+            match op {
+                ArithOp::Add => Some(Value::Int(l + r)),
+                ArithOp::Sub => Some(Value::Int(l - r)),
+                ArithOp::Mul => Some(Value::Int(l * r)),
+                ArithOp::Div => { if *r == 0 { Some(Value::Null) } else { Some(Value::Int(l / r)) } }
+                ArithOp::Mod => { if *r == 0 { Some(Value::Null) } else { Some(Value::Int(l % r)) } }
                 ArithOp::Concat => unreachable!(),
-            };
-            Some(Value::Int(v))
+            }
         }
         (Value::Float(l), Value::Float(r)) => storage_arith_f64(*l, op, *r),
         (Value::Int(l), Value::Float(r)) => storage_arith_f64(*l as f64, op, *r),
@@ -1585,6 +1636,7 @@ fn storage_arith_f64(l: f64, op: &ArithOp, r: f64) -> Option<Value> {
         ArithOp::Sub => l - r,
         ArithOp::Mul => l * r,
         ArithOp::Div => { if r == 0.0 { return Some(Value::Null); } l / r }
+        ArithOp::Mod => l % r,
         ArithOp::Concat => return Some(Value::String(format!("{}{}", l, r))),
     };
     Some(Value::Float(v))

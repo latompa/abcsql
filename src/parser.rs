@@ -162,6 +162,8 @@ pub struct SelectStatement {
     pub where_clause: Option<WhereClause>,
     pub joins: Vec<JoinClause>,
     pub group_by: Vec<SelectColumn>,
+    // None = regular GROUP BY, Some = ROLLUP/CUBE/GROUPING SETS expansion
+    pub grouping_sets: Option<Vec<Vec<SelectColumn>>>,
     pub having: Option<WhereClause>,
     pub window_defs: Vec<(String, WindowSpec)>,  // WINDOW clause named specs
     pub order_by: Vec<OrderByClause>,
@@ -184,15 +186,16 @@ pub enum UnionType {
 pub enum FromClause {
     Table(String),
     Subquery(Box<SelectStatement>),
+    Values(Vec<Vec<Expression>>, Vec<String>), // inline VALUES rows, optional column names
 }
 
 impl FromClause {
-    /// Get the table name, or None for subqueries
+    /// Get the table name, or None for subqueries/values
     #[allow(dead_code)]
     pub fn table_name(&self) -> Option<&str> {
         match self {
             FromClause::Table(name) => Some(name),
-            FromClause::Subquery(_) => None,
+            FromClause::Subquery(_) | FromClause::Values(_, _) => None,
         }
     }
 }
@@ -262,6 +265,12 @@ pub enum WindowFunc {
     Lag(Box<Expression>, i64),  // expression, offset (default 1)
     Lead(Box<Expression>, i64), // expression, offset (default 1)
     Agg(AggregateFunc, Box<SelectColumn>), // e.g. SUM(col) OVER (...)
+    Ntile(Box<Expression>),        // NTILE(n) — n is the bucket count
+    PercentRank,                   // PERCENT_RANK()
+    CumeDist,                      // CUME_DIST()
+    FirstValue(Box<Expression>),   // FIRST_VALUE(expr)
+    LastValue(Box<Expression>),    // LAST_VALUE(expr)
+    NthValue(Box<Expression>, Box<Expression>), // NTH_VALUE(expr, n)
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -308,6 +317,7 @@ pub struct JoinClause {
     pub alias: Option<String>,
     pub on: Option<Condition>,
     pub using: Option<Vec<String>>, // USING (col1, col2, ...)
+    pub lateral: Option<Box<SelectStatement>>, // Some if LATERAL (SELECT ...)
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -1025,6 +1035,51 @@ fn parse_alter_rename(input: &str) -> IResult<&str, AlterAction> {
     }
 }
 
+/// Parse VALUES (expr,...),(expr,...) used in FROM position
+fn parse_values_clause(input: &str) -> IResult<&str, Vec<Vec<Expression>>> {
+    let (input, _) = tag_no_case("VALUES")(input)?;
+    let (input, _) = multispace0(input)?;
+    nom::multi::separated_list1(
+        nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+        |input| {
+            let (input, _) = nom_char('(')(input)?;
+            let (input, _) = multispace0(input)?;
+            let (input, exprs) = nom::multi::separated_list1(
+                nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+                parse_expression,
+            )(input)?;
+            let (input, _) = multispace0(input)?;
+            let (input, _) = nom_char(')')(input)?;
+            Ok((input, exprs))
+        }
+    )(input)
+}
+
+/// Parse optional (col1, col2, ...) after a VALUES alias
+fn parse_values_col_list(input: &str) -> IResult<&str, Vec<String>> {
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, cols) = nom::multi::separated_list1(
+        nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+        parse_identifier,
+    )(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, cols.into_iter().map(|s| s.to_string()).collect()))
+}
+
+/// Parse [AS] alias [(col1, col2, ...)] for VALUES table alias
+fn parse_values_alias(input: &str) -> IResult<&str, (String, Vec<String>)> {
+    let (input, _) = multispace0(input)?;
+    // Consume optional AS
+    let (input, _) = nom::combinator::opt(nom::sequence::terminated(tag_no_case("AS"), multispace1))(input)?;
+    let (input, alias) = parse_identifier(input)?;
+    // Optional column name list
+    let (input, cols) = nom::combinator::opt(parse_values_col_list)(input)?;
+    Ok((input, (alias.to_string(), cols.unwrap_or_default())))
+}
+
 /// Parse an extra comma-separated FROM table (returns name and optional alias)
 fn parse_extra_from_table(input: &str) -> IResult<&str, (String, Option<String>)> {
     let (input, tbl) = parse_identifier(input)?;
@@ -1055,17 +1110,25 @@ pub fn parse_select_statement(input: &str) -> IResult<&str, SelectStatement> {
         let (input, _) = tag_no_case("FROM")(input)?;
         let (input, _) = multispace1(input)?;
 
-        // FROM can be a table name or (SELECT ...) AS alias
+        // FROM can be: (VALUES ...) AS alias, (SELECT ...) AS alias, or table [alias]
         if let Ok((input, _)) = nom_char::<&str, nom::error::Error<&str>>('(')(input) {
             let (input, _) = multispace0(input)?;
-            let (input, subquery) = parse_select_statement(input)?;
-            let (input, _) = multispace0(input)?;
-            let (input, _) = nom_char(')')(input)?;
-            let (input, _) = multispace1(input)?;
-            let (input, _) = tag_no_case("AS")(input)?;
-            let (input, _) = multispace1(input)?;
-            let (input, alias) = parse_identifier(input)?;
-            (input, FromClause::Subquery(Box::new(subquery)), Some(alias.to_string()))
+            // Try VALUES inside parens first
+            if let Ok((input, value_rows)) = parse_values_clause(input) {
+                let (input, _) = multispace0(input)?;
+                let (input, _) = nom_char(')')(input)?;
+                let (input, (alias, col_names)) = parse_values_alias(input)?;
+                (input, FromClause::Values(value_rows, col_names), Some(alias))
+            } else {
+                let (input, subquery) = parse_select_statement(input)?;
+                let (input, _) = multispace0(input)?;
+                let (input, _) = nom_char(')')(input)?;
+                let (input, _) = multispace1(input)?;
+                let (input, _) = tag_no_case("AS")(input)?;
+                let (input, _) = multispace1(input)?;
+                let (input, alias) = parse_identifier(input)?;
+                (input, FromClause::Subquery(Box::new(subquery)), Some(alias.to_string()))
+            }
         } else {
             let (input, table) = parse_identifier(input)?;
             let (input, from_alias) = nom::combinator::opt(parse_table_alias)(input)?;
@@ -1086,14 +1149,14 @@ pub fn parse_select_statement(input: &str) -> IResult<&str, SelectStatement> {
 
     let mut joins = Vec::new();
     for (tbl, alias) in extra_tables {
-        joins.push(JoinClause { join_type: JoinType::Cross, table: tbl, alias, on: None, using: None });
+        joins.push(JoinClause { join_type: JoinType::Cross, table: tbl, alias, on: None, using: None, lateral: None });
     }
 
     let (input, explicit_joins) = nom::multi::many0(parse_join)(input)?;
     let mut joins = joins;
     joins.extend(explicit_joins);
     let (input, where_clause) = nom::combinator::opt(parse_where)(input)?;
-    let (input, group_by) = parse_group_by_clause(input)?;
+    let (input, (group_by, grouping_sets)) = parse_group_by_clause(input)?;
     let (input, having) = parse_having_clause(input)?;
     let (input, window_defs) = parse_window_clause(input)?;
     let (input, order_by) = parse_order_by_clause(input)?;
@@ -1136,6 +1199,7 @@ pub fn parse_select_statement(input: &str) -> IResult<&str, SelectStatement> {
         where_clause,
         joins,
         group_by,
+        grouping_sets,
         having,
         window_defs,
         order_by,
@@ -1355,20 +1419,113 @@ fn parse_where(input: &str) -> IResult<&str, WhereClause> {
     Ok((input, WhereClause { condition }))
 }
 
-/// Parse GROUP BY clause (returns empty vec if not present)
-fn parse_group_by_clause(input: &str) -> IResult<&str, Vec<SelectColumn>> {
+/// Parse ROLLUP(col, ...) — returns the column list
+fn parse_rollup(input: &str) -> IResult<&str, Vec<SelectColumn>> {
+    let (input, _) = tag_no_case("ROLLUP")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, cols) = nom::multi::separated_list1(
+        nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+        nom::branch::alt((parse_qualified_column, parse_simple_column)),
+    )(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, cols))
+}
+
+/// Parse CUBE(col, ...)
+fn parse_cube(input: &str) -> IResult<&str, Vec<SelectColumn>> {
+    let (input, _) = tag_no_case("CUBE")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, cols) = nom::multi::separated_list1(
+        nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+        nom::branch::alt((parse_qualified_column, parse_simple_column)),
+    )(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, cols))
+}
+
+/// Parse a single grouping set: (col, col, ...) or ()
+fn parse_one_grouping_set(input: &str) -> IResult<&str, Vec<SelectColumn>> {
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, cols) = separated_list0(
+        delimited(multispace0, nom_char(','), multispace0),
+        nom::branch::alt((parse_qualified_column, parse_simple_column)),
+    )(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, cols))
+}
+
+/// Parse GROUPING SETS((...), (...), ...)
+fn parse_grouping_sets(input: &str) -> IResult<&str, Vec<Vec<SelectColumn>>> {
+    let (input, _) = tag_no_case("GROUPING")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, _) = tag_no_case("SETS")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, sets) = nom::multi::separated_list1(
+        nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+        parse_one_grouping_set,
+    )(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, sets))
+}
+
+/// ROLLUP(a,b,c) → [(a,b,c), (a,b), (a), ()]
+fn expand_rollup(cols: &[SelectColumn]) -> Vec<Vec<SelectColumn>> {
+    (0..=cols.len()).rev().map(|n| cols[..n].to_vec()).collect()
+}
+
+/// CUBE(a,b) → all 2^n subsets in descending order of size
+fn expand_cube(cols: &[SelectColumn]) -> Vec<Vec<SelectColumn>> {
+    let n = cols.len();
+    let mut sets: Vec<Vec<SelectColumn>> = (0..(1u32 << n))
+        .map(|mask| (0..n).filter(|&i| mask & (1 << i) != 0).map(|i| cols[i].clone()).collect())
+        .collect();
+    sets.sort_by_key(|s: &Vec<SelectColumn>| std::cmp::Reverse(s.len()));
+    sets
+}
+
+/// Parse GROUP BY clause (returns group_by cols and optional grouping sets for ROLLUP/CUBE)
+fn parse_group_by_clause(input: &str) -> IResult<&str, (Vec<SelectColumn>, Option<Vec<Vec<SelectColumn>>>)> {
     let (input, _) = multispace0(input)?;
     let result = nom::sequence::pair(tag_no_case("GROUP"), nom::sequence::preceded(multispace1::<&str, nom::error::Error<&str>>, tag_no_case("BY")))(input);
     match result {
         Ok((input, _)) => {
             let (input, _) = multispace1(input)?;
+            // Try ROLLUP
+            if let Ok((input, cols)) = parse_rollup(input) {
+                let sets = expand_rollup(&cols);
+                let primary = sets.first().cloned().unwrap_or_default();
+                return Ok((input, (primary, Some(sets))));
+            }
+            // Try CUBE
+            if let Ok((input, cols)) = parse_cube(input) {
+                let sets = expand_cube(&cols);
+                let primary = sets.first().cloned().unwrap_or_default();
+                return Ok((input, (primary, Some(sets))));
+            }
+            // Try GROUPING SETS
+            if let Ok((input, sets)) = parse_grouping_sets(input) {
+                let primary = sets.first().cloned().unwrap_or_default();
+                return Ok((input, (primary, Some(sets))));
+            }
+            // Regular GROUP BY
             let (input, cols) = separated_list0(
                 delimited(multispace0, nom_char(','), multispace0),
                 nom::branch::alt((parse_qualified_column, parse_simple_column)),
             )(input)?;
-            Ok((input, cols))
+            Ok((input, (cols, None)))
         }
-        Err(_) => Ok((input, Vec::new())),
+        Err(_) => Ok((input, (Vec::new(), None))),
     }
 }
 
@@ -1456,14 +1613,27 @@ fn parse_limit_offset_clause(input: &str) -> IResult<&str, (Option<u64>, Option<
 
 /// Check if identifier is a reserved keyword that can't be used as an alias
 fn is_reserved_keyword(s: &str) -> bool {
-    matches!(s.to_uppercase().as_str(), "ON" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "OUTER" | "CROSS" | "WHERE" | "ORDER" | "GROUP" | "LIMIT" | "OFFSET" | "HAVING" | "UNION" | "ALL" | "CASE" | "WHEN" | "THEN" | "ELSE" | "END" | "AND" | "OR" | "NOT" | "AS" | "VIEW" | "OVER" | "PARTITION" | "NULLS" | "FIRST" | "LAST" | "INTERSECT" | "EXCEPT" | "ROWS" | "RANGE" | "GROUPS" | "PRECEDING" | "FOLLOWING" | "UNBOUNDED" | "BETWEEN" | "USING" | "NATURAL" | "ANY" | "SOME" | "FILTER" | "RECURSIVE" | "CURRENT_DATE" | "CURRENT_TIMESTAMP" | "EXTRACT" | "INTERVAL" | "DATEDIFF" | "DATE_TRUNC" | "DATE_PART" | "DATEADD" | "WINDOW")
+    matches!(s.to_uppercase().as_str(), "ON" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "OUTER" | "CROSS" | "WHERE" | "ORDER" | "GROUP" | "LIMIT" | "OFFSET" | "HAVING" | "UNION" | "ALL" | "CASE" | "WHEN" | "THEN" | "ELSE" | "END" | "AND" | "OR" | "NOT" | "AS" | "VIEW" | "OVER" | "PARTITION" | "NULLS" | "FIRST" | "LAST" | "INTERSECT" | "EXCEPT" | "ROWS" | "RANGE" | "GROUPS" | "PRECEDING" | "FOLLOWING" | "UNBOUNDED" | "BETWEEN" | "USING" | "NATURAL" | "ANY" | "SOME" | "FILTER" | "RECURSIVE" | "CURRENT_DATE" | "CURRENT_TIMESTAMP" | "EXTRACT" | "INTERVAL" | "DATEDIFF" | "DATE_TRUNC" | "DATE_PART" | "DATEADD" | "WINDOW" | "NTILE" | "PERCENT_RANK" | "CUME_DIST" | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" | "ROLLUP" | "CUBE" | "GROUPING" | "SETS" | "LATERAL" | "VALUES")
 }
 
-/// Parse optional table alias, rejecting reserved keywords
+/// Parse optional table alias, handling both `table alias` and `table AS alias` forms
 fn parse_table_alias(input: &str) -> IResult<&str, String> {
     let (input, _) = multispace1(input)?;
+    // Optionally consume the AS keyword
+    let (input, has_as) = if let Ok((i, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("AS")(input) {
+        // Only consume AS if followed by whitespace (not e.g. "ASC")
+        if i.starts_with(|c: char| c.is_whitespace()) {
+            let (i, _) = multispace1(i)?;
+            (i, true)
+        } else {
+            (input, false)
+        }
+    } else {
+        (input, false)
+    };
     let (input, alias) = parse_identifier(input)?;
-    if is_reserved_keyword(alias) {
+    // Without explicit AS, reject reserved keywords as implicit aliases
+    if !has_as && is_reserved_keyword(alias) {
         return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)));
     }
     Ok((input, alias.to_string()))
@@ -1491,6 +1661,7 @@ pub fn parse_join(input: &str) -> IResult<&str, JoinClause> {
             alias,
             on: None,
             using: None,
+            lateral: None,
         }));
     }
 
@@ -1504,12 +1675,44 @@ pub fn parse_join(input: &str) -> IResult<&str, JoinClause> {
         nom::combinator::map(tag_no_case("JOIN"), |_| JoinType::Inner),
     ))(input)?;
     let (input, _) = multispace1(input)?;
+
+    // Check for LATERAL (SELECT ...) subquery
+    if let Ok((input, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("LATERAL")(input) {
+        let (input, _) = multispace1(input)?;
+        let (input, _) = nom_char('(')(input)?;
+        let (input, _) = multispace0(input)?;
+        let (input, lateral_query) = parse_select_statement(input)?;
+        let (input, _) = multispace0(input)?;
+        let (input, _) = nom_char(')')(input)?;
+        // Parse optional alias
+        let (input, alias) = nom::combinator::opt(parse_table_alias)(input)?;
+        // Parse optional ON condition
+        let (input, on) = if let Ok((input2, _)) = nom::sequence::preceded(
+            multispace1::<&str, nom::error::Error<&str>>,
+            tag_no_case::<&str, &str, nom::error::Error<&str>>("ON"),
+        )(input) {
+            let (input2, _) = multispace1(input2)?;
+            let (input2, cond) = parse_condition(input2)?;
+            (input2, Some(cond))
+        } else {
+            (input, None)
+        };
+        return Ok((input, JoinClause {
+            join_type,
+            table: String::new(),
+            alias,
+            on,
+            using: None,
+            lateral: Some(Box::new(lateral_query)),
+        }));
+    }
+
     let (input, table) = parse_identifier(input)?;
     let (input, alias) = nom::combinator::opt(parse_table_alias)(input)?;
 
     // CROSS JOIN has no ON/USING clause
     if join_type == JoinType::Cross {
-        return Ok((input, JoinClause { join_type, table: table.to_string(), alias, on: None, using: None }));
+        return Ok((input, JoinClause { join_type, table: table.to_string(), alias, on: None, using: None, lateral: None }));
     }
 
     // Try USING (col1, col2, ...)
@@ -1533,6 +1736,7 @@ pub fn parse_join(input: &str) -> IResult<&str, JoinClause> {
             alias,
             on: None,
             using: Some(cols.iter().map(|s| s.to_string()).collect()),
+            lateral: None,
         }));
     }
 
@@ -1541,7 +1745,7 @@ pub fn parse_join(input: &str) -> IResult<&str, JoinClause> {
     let (input, _) = multispace1(input)?;
     let (input, condition) = parse_condition(input)?;
 
-    Ok((input, JoinClause { join_type, table: table.to_string(), alias, on: Some(condition), using: None }))
+    Ok((input, JoinClause { join_type, table: table.to_string(), alias, on: Some(condition), using: None, lateral: None }))
 }
 
 /// Parse condition with OR (lowest precedence), AND, then a primary comparison
@@ -1603,6 +1807,25 @@ fn parse_not_condition(input: &str) -> IResult<&str, Condition> {
 /// Parse a single comparison or a parenthesized condition group
 fn parse_primary_condition(input: &str) -> IResult<&str, Condition> {
     let (input, _) = multispace0(input)?;
+
+    // Boolean literals TRUE / FALSE as standalone conditions
+    if let Ok((input, val)) = nom::branch::alt((
+        tag_no_case::<&str, &str, nom::error::Error<&str>>("TRUE"),
+        tag_no_case::<&str, &str, nom::error::Error<&str>>("FALSE"),
+    ))(input) {
+        // Only treat as standalone if not immediately followed by alphanumeric (e.g. "TRUNC")
+        if input.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+            // Fall through — this is part of an identifier/function
+        } else {
+            let b = val.to_uppercase() == "TRUE";
+            return Ok((input, Condition::Comparison {
+                left: Expression::Literal(Value::Bool(b)),
+                operator: Operator::Equals,
+                right: Expression::Literal(Value::Bool(true)),
+                upper_bound: None,
+            }));
+        }
+    }
 
     // Parenthesized sub-condition: (cond AND/OR cond ...)
     if let Ok((input, _)) = nom_char::<&str, nom::error::Error<&str>>('(')(input) {
@@ -2614,17 +2837,91 @@ fn parse_window_func_agg(input: &str) -> IResult<&str, WindowFunc> {
     Ok((input, WindowFunc::Agg(agg_func, Box::new(inner))))
 }
 
+fn parse_window_func_ntile(input: &str) -> IResult<&str, WindowFunc> {
+    let (input, _) = tag_no_case("NTILE")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, expr) = parse_expression(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, WindowFunc::Ntile(Box::new(expr))))
+}
+
+fn parse_window_func_percent_rank(input: &str) -> IResult<&str, WindowFunc> {
+    let (input, _) = tag_no_case("PERCENT_RANK")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, WindowFunc::PercentRank))
+}
+
+fn parse_window_func_cume_dist(input: &str) -> IResult<&str, WindowFunc> {
+    let (input, _) = tag_no_case("CUME_DIST")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, WindowFunc::CumeDist))
+}
+
+fn parse_window_func_first_value(input: &str) -> IResult<&str, WindowFunc> {
+    let (input, _) = tag_no_case("FIRST_VALUE")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, expr) = parse_expression(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, WindowFunc::FirstValue(Box::new(expr))))
+}
+
+fn parse_window_func_last_value(input: &str) -> IResult<&str, WindowFunc> {
+    let (input, _) = tag_no_case("LAST_VALUE")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, expr) = parse_expression(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, WindowFunc::LastValue(Box::new(expr))))
+}
+
+fn parse_window_func_nth_value(input: &str) -> IResult<&str, WindowFunc> {
+    let (input, _) = tag_no_case("NTH_VALUE")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, expr) = parse_expression(input)?;
+    let (input, _) = nom::sequence::delimited(multispace0, nom_char(','), multispace0)(input)?;
+    let (input, n_expr) = parse_expression(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, WindowFunc::NthValue(Box::new(expr), Box::new(n_expr))))
+}
+
 fn parse_expression_window(input: &str) -> IResult<&str, Expression> {
     let (input, _) = multispace0(input)?;
 
-    // Parse the window function name+args; DENSE_RANK must come before RANK
+    // Parse the window function name+args; DENSE_RANK before RANK, PERCENT_RANK before PERCENT
     let (input, func) = nom::branch::alt((
-        parse_window_func_row_number,
-        parse_window_func_dense_rank,
-        parse_window_func_rank,
-        parse_window_func_lag,
-        parse_window_func_lead,
-        parse_window_func_agg,
+        nom::branch::alt((
+            parse_window_func_row_number,
+            parse_window_func_dense_rank,
+            parse_window_func_rank,
+            parse_window_func_percent_rank, // must come before any shorter prefix
+            parse_window_func_cume_dist,
+        )),
+        nom::branch::alt((
+            parse_window_func_first_value,
+            parse_window_func_last_value,
+            parse_window_func_nth_value,
+            parse_window_func_ntile,
+            parse_window_func_lag,
+            parse_window_func_lead,
+            parse_window_func_agg,
+        )),
     ))(input)?;
 
     // OVER is mandatory — if missing this parser fails and alt tries next option
@@ -5687,6 +5984,22 @@ mod tests {
                 }
             }
             _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_lateral_join() {
+        let sql = "SELECT c.id FROM customers AS c LEFT JOIN LATERAL (SELECT amount FROM orders WHERE customer_id = c.id LIMIT 1) AS recent ON true";
+        let result = parse_sql(sql);
+        assert!(result.is_ok(), "parse failed: {:?}", result);
+        let (_, stmt) = result.unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                assert_eq!(sel.joins.len(), 1, "expected 1 join, got {}", sel.joins.len());
+                assert!(sel.joins[0].lateral.is_some(), "join.lateral should be Some");
+                assert_eq!(sel.joins[0].alias.as_deref(), Some("recent"));
+            }
+            _ => panic!("expected Select"),
         }
     }
 }

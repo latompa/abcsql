@@ -153,7 +153,50 @@ fn lib_materialize_select(
         }
     }
 
-    let table_name = stmt.from.table_name().ok_or("Subquery FROM not supported here")?;
+    // Handle VALUES inline table
+    if let parser::FromClause::Values(value_rows, col_names) = &stmt.from {
+        let from_alias = stmt.from_alias.as_deref().unwrap_or("_values");
+        let materialized: Vec<Vec<Value>> = value_rows.iter().map(|exprs| {
+            exprs.iter().map(|e| resolve_expr(e, &[], &[], storage).unwrap_or(Value::Null)).collect()
+        }).collect();
+        let ncols = materialized.first().map(|r| r.len()).unwrap_or(0);
+        let combined_cols: LibCols = (0..ncols).map(|i| {
+            let name = col_names.get(i).cloned().unwrap_or_else(|| format!("column{}", i + 1));
+            (from_alias.to_string(), name)
+        }).collect();
+        // Apply WHERE, LIMIT, OFFSET, projection
+        let rows: Vec<Vec<Value>> = materialized.into_iter()
+            .filter(|row| match &stmt.where_clause {
+                Some(wc) => eval_condition(&wc.condition, row, &combined_cols, storage),
+                None => true,
+            })
+            .collect();
+        let rows = if let Some(off) = stmt.offset { rows.into_iter().skip(off as usize).collect() } else { rows };
+        let rows = if let Some(n) = stmt.limit { rows.into_iter().take(n as usize).collect() } else { rows };
+        let (out_cols, out_rows) = lib_project_rows(stmt, &combined_cols, rows, storage);
+        return Ok((out_cols, out_rows));
+    }
+
+    // Handle subquery in FROM
+    if let parser::FromClause::Subquery(subquery) = &stmt.from {
+        let from_alias = stmt.from_alias.as_deref().unwrap_or("_subquery");
+        let (sub_cols, sub_rows) = lib_materialize_select(subquery, storage, cte_map)?;
+        let combined_cols: LibCols = sub_cols.into_iter()
+            .map(|(_, c)| (from_alias.to_string(), c))
+            .collect();
+        let rows: Vec<Vec<Value>> = sub_rows.into_iter()
+            .filter(|row| match &stmt.where_clause {
+                Some(wc) => eval_condition(&wc.condition, row, &combined_cols, storage),
+                None => true,
+            })
+            .collect();
+        let rows = if let Some(off) = stmt.offset { rows.into_iter().skip(off as usize).collect() } else { rows };
+        let rows = if let Some(n) = stmt.limit { rows.into_iter().take(n as usize).collect() } else { rows };
+        let (out_cols, out_rows) = lib_project_rows(stmt, &combined_cols, rows, storage);
+        return Ok((out_cols, out_rows));
+    }
+
+    let table_name = stmt.from.table_name().ok_or("FROM clause not supported here")?;
     let from_alias = stmt.from_alias.as_deref().unwrap_or(table_name);
 
     let (from_cols_raw, from_rows) = lib_load_table(table_name, cte_map, storage)?;
@@ -384,7 +427,14 @@ fn execute_select_to_string(
         return Ok(format!("({} rows)", rows.len()));
     }
 
-    let table_name = stmt.from.table_name().ok_or("Subquery FROM not supported here")?;
+    // Delegate non-table FROM clauses (subquery, values) to lib_materialize_select
+    if stmt.from.table_name().is_none() {
+        let empty_ctes: LibCteMap = std::collections::HashMap::new();
+        let (_, rows) = lib_materialize_select(stmt, storage, &empty_ctes)?;
+        return Ok(format!("({} rows)", rows.len()));
+    }
+
+    let table_name = stmt.from.table_name().ok_or("FROM clause not supported here")?;
 
     // If FROM names a view, expand it by re-running the view's SELECT
     if let Ok(Some(view_sql)) = storage.load_view(table_name) {
@@ -433,6 +483,80 @@ fn execute_select_to_string(
 
     // process joins
     for join in &stmt.joins {
+        // Handle LATERAL (SELECT ...) joins
+        if let Some(lateral_query) = &join.lateral {
+            let lateral_alias = join.alias.as_deref().unwrap_or("lateral");
+            // Determine lateral output column names from a dry run on the first outer row
+            let lat_col_names: Vec<String> = if let Some(outer_row) = combined_rows.first() {
+                let table_name = lateral_query.from.table_name().unwrap_or("__unknown__");
+                let schema = storage.load_schema(table_name).ok();
+                let inner_cols: Vec<(String, String)> = schema.as_ref()
+                    .map(|s| s.columns.iter().map(|c| (table_name.to_string(), c.name.clone())).collect())
+                    .unwrap_or_default();
+                // Collect col names from lateral_query SELECT list
+                lateral_query.columns.iter().filter_map(|c| match c {
+                    parser::SelectColumn::Column(n) => Some(n.clone()),
+                    parser::SelectColumn::Alias(_, a) => Some(a.clone()),
+                    parser::SelectColumn::QualifiedColumn(_, n) => Some(n.clone()),
+                    _ => inner_cols.first().map(|(_, n)| n.clone()),
+                }).collect()
+            } else {
+                vec!["col1".to_string()]
+            };
+            let lat_ncols = lat_col_names.len().max(1);
+            let new_lat_cols: Vec<(String, String)> = lat_col_names.into_iter()
+                .map(|n| (lateral_alias.to_string(), n))
+                .collect();
+
+            let mut new_rows: Vec<Vec<Value>> = Vec::new();
+            for outer_row in &combined_rows {
+                // Execute the lateral subquery for each outer row using correlated eval
+                let table_name = lateral_query.from.table_name().unwrap_or("__unknown__");
+                let schema = storage.load_schema(table_name).ok();
+                let inner_cols: Vec<(String, String)> = schema.as_ref()
+                    .map(|s| s.columns.iter().map(|c| (table_name.to_string(), c.name.clone())).collect())
+                    .unwrap_or_default();
+                let all_inner_rows = schema.as_ref()
+                    .and_then(|_| storage.read_rows(table_name).ok())
+                    .unwrap_or_default();
+                let lat_rows: Vec<Vec<Value>> = all_inner_rows.into_iter()
+                    .filter(|row| match &lateral_query.where_clause {
+                        Some(wc) => eval_correlated_condition(&wc.condition, row, &inner_cols, storage, outer_row, &combined_cols),
+                        None => true,
+                    })
+                    .collect();
+                let lat_rows: Vec<Vec<Value>> = if let Some(n) = lateral_query.limit {
+                    lat_rows.into_iter().take(n as usize).collect()
+                } else { lat_rows };
+
+                if lat_rows.is_empty() {
+                    if join.join_type == parser::JoinType::Left {
+                        let mut row = outer_row.clone();
+                        row.extend(std::iter::repeat(Value::Null).take(lat_ncols));
+                        new_rows.push(row);
+                    }
+                    // INNER/CROSS: omit outer row if no match
+                } else {
+                    for lat_row in &lat_rows {
+                        // Project lateral columns from inner row
+                        let lat_vals: Vec<Value> = lateral_query.columns.iter().filter_map(|c| match c {
+                            parser::SelectColumn::Column(n) | parser::SelectColumn::QualifiedColumn(_, n) => {
+                                inner_cols.iter().position(|(_, cn)| cn == n).and_then(|i| lat_row.get(i).cloned())
+                            }
+                            _ => lat_row.first().cloned(),
+                        }).collect();
+                        let lat_vals = if lat_vals.is_empty() { lat_row.clone() } else { lat_vals };
+                        let mut new_row = outer_row.clone();
+                        new_row.extend(lat_vals);
+                        new_rows.push(new_row);
+                    }
+                }
+            }
+            combined_cols.extend(new_lat_cols);
+            combined_rows = new_rows;
+            continue;
+        }
+
         let join_schema = storage.load_schema(&join.table).map_err(|e| e.to_string())?;
         let join_rows = storage.read_rows(&join.table).map_err(|e| e.to_string())?;
         let join_alias = join.alias.as_deref().unwrap_or(&join.table);

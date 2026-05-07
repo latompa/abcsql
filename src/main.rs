@@ -347,6 +347,23 @@ fn load_from_with_index(
                 .collect();
             Ok((cols, cte_data.rows))
         }
+        parser::FromClause::Values(value_rows, col_names) => {
+            // Evaluate each expression row against an empty context
+            let empty_cols: Vec<ResultColumn> = Vec::new();
+            let empty_row: Vec<Value> = Vec::new();
+            let materialized: Vec<Vec<Value>> = value_rows.iter().map(|exprs| {
+                exprs.iter()
+                    .map(|e| resolve_join_expression(e, &empty_row, &empty_cols, storage).unwrap_or(Value::Null))
+                    .collect()
+            }).collect();
+            let ncols = materialized.first().map(|r| r.len()).unwrap_or(0);
+            let result_cols: Vec<ResultColumn> = (0..ncols).map(|i| {
+                let name = col_names.get(i).cloned()
+                    .unwrap_or_else(|| format!("column{}", i + 1));
+                ResultColumn { table: alias.to_string(), name }
+            }).collect();
+            Ok((result_cols, materialized))
+        }
     }
 }
 
@@ -373,6 +390,7 @@ fn from_name(from: &parser::FromClause, alias: &Option<String>) -> String {
         (_, Some(a)) => a.clone(),
         (parser::FromClause::Table(name), None) => name.clone(),
         (parser::FromClause::Subquery(_), None) => "_subquery".to_string(),
+        (parser::FromClause::Values(_, _), None) => "_values".to_string(),
     }
 }
 
@@ -759,6 +777,55 @@ fn prepare_rows(
     let mut combined_rows: Vec<Vec<Value>> = from_rows;
 
     for join in &stmt.joins {
+        // Handle LATERAL (SELECT ...) joins
+        if let Some(lateral_query) = &join.lateral {
+            let lateral_alias = join.alias.as_deref().unwrap_or("lateral");
+            // Get column schema from first outer row, or empty if no rows
+            let schema_row = combined_rows.first().cloned().unwrap_or_default();
+            let (lat_schema_cols, _) = execute_lateral_subquery(lateral_query, &schema_row, &combined_cols, storage, cte_map);
+            let lateral_result_cols: Vec<ResultColumn> = lat_schema_cols.iter()
+                .map(|c| ResultColumn { table: lateral_alias.to_string(), name: c.name.clone() })
+                .collect();
+            let lat_col_count = lateral_result_cols.len();
+            let new_combined_cols: Vec<ResultColumn> = combined_cols.iter()
+                .chain(lateral_result_cols.iter())
+                .cloned()
+                .collect();
+            let mut new_rows: Vec<Vec<Value>> = Vec::new();
+            for outer_row in &combined_rows {
+                let (_, lat_rows) = execute_lateral_subquery(lateral_query, outer_row, &combined_cols, storage, cte_map);
+                match join.join_type {
+                    parser::JoinType::Left => {
+                        if lat_rows.is_empty() {
+                            let mut row = outer_row.clone();
+                            row.extend(std::iter::repeat(Value::Null).take(lat_col_count));
+                            new_rows.push(row);
+                        } else {
+                            for lat_row in lat_rows {
+                                let mut row = outer_row.clone();
+                                row.extend(lat_row);
+                                if join.on.as_ref().map_or(true, |c| evaluate_join_condition(c, &row, &new_combined_cols, storage)) {
+                                    new_rows.push(row);
+                                }
+                            }
+                        }
+                    }
+                    _ => { // INNER / CROSS
+                        for lat_row in lat_rows {
+                            let mut row = outer_row.clone();
+                            row.extend(lat_row);
+                            if join.on.as_ref().map_or(true, |c| evaluate_join_condition(c, &row, &new_combined_cols, storage)) {
+                                new_rows.push(row);
+                            }
+                        }
+                    }
+                }
+            }
+            combined_cols = new_combined_cols;
+            combined_rows = new_rows;
+            continue;
+        }
+
         let (join_cols, join_rows) = match load_table(&join.table, cte_map, storage) {
             Ok(r) => r,
             Err(e) => { eprintln!("Error: {}", e); return None; }
@@ -1013,6 +1080,30 @@ fn materialize_window_functions(
     (new_columns, rows, combined_cols)
 }
 
+/// Compute frame bounds [start, end] (inclusive) for a given position in a sorted partition.
+/// Default (no frame spec) = whole partition: (0, n-1).
+fn compute_frame_bounds(spec: &parser::WindowSpec, pos: usize, n: usize) -> (usize, usize) {
+    if let Some(ref frame) = spec.frame {
+        let fs = match &frame.start {
+            parser::FrameBound::UnboundedPreceding => 0,
+            parser::FrameBound::Preceding(k) => pos.saturating_sub(*k as usize),
+            parser::FrameBound::CurrentRow => pos,
+            parser::FrameBound::Following(k) => (pos + *k as usize).min(n.saturating_sub(1)),
+            parser::FrameBound::UnboundedFollowing => n.saturating_sub(1),
+        };
+        let fe = match &frame.end {
+            parser::FrameBound::UnboundedPreceding => 0,
+            parser::FrameBound::Preceding(k) => pos.saturating_sub(*k as usize),
+            parser::FrameBound::CurrentRow => pos,
+            parser::FrameBound::Following(k) => (pos + *k as usize).min(n.saturating_sub(1)),
+            parser::FrameBound::UnboundedFollowing => n.saturating_sub(1),
+        };
+        (fs, fe)
+    } else {
+        (0, n.saturating_sub(1)) // default: whole partition
+    }
+}
+
 fn compute_window_values(
     func: &parser::WindowFunc,
     spec: &parser::WindowSpec,
@@ -1120,26 +1211,7 @@ fn compute_window_values(
             parser::WindowFunc::Agg(agg_func, inner_col) => {
                 let n = sorted.len();
                 for (pos, &orig_idx) in sorted.iter().enumerate() {
-                    // Determine frame bounds (if no frame spec, use whole partition)
-                    let (frame_start, frame_end) = if let Some(ref frame) = spec.frame {
-                        let fs = match &frame.start {
-                            parser::FrameBound::UnboundedPreceding => 0,
-                            parser::FrameBound::Preceding(k) => pos.saturating_sub(*k as usize),
-                            parser::FrameBound::CurrentRow => pos,
-                            parser::FrameBound::Following(k) => (pos + *k as usize).min(n.saturating_sub(1)),
-                            parser::FrameBound::UnboundedFollowing => n.saturating_sub(1),
-                        };
-                        let fe = match &frame.end {
-                            parser::FrameBound::UnboundedPreceding => 0,
-                            parser::FrameBound::Preceding(k) => pos.saturating_sub(*k as usize),
-                            parser::FrameBound::CurrentRow => pos,
-                            parser::FrameBound::Following(k) => (pos + *k as usize).min(n.saturating_sub(1)),
-                            parser::FrameBound::UnboundedFollowing => n.saturating_sub(1),
-                        };
-                        (fs, fe)
-                    } else {
-                        (0, n.saturating_sub(1)) // default: whole partition
-                    };
+                    let (frame_start, frame_end) = compute_frame_bounds(spec, pos, n);
                     let frame_rows: Vec<Vec<Value>> = sorted[frame_start..=frame_end]
                         .iter().map(|&i| rows[i].clone()).collect();
                     let agg_str = compute_aggregate(agg_func, inner_col, &frame_rows, cols);
@@ -1153,6 +1225,87 @@ fn compute_window_values(
                         Value::String(agg_str)
                     };
                     result[orig_idx] = agg_val;
+                }
+            }
+            parser::WindowFunc::Ntile(n_expr) => {
+                let n = resolve_join_expression(n_expr, &rows[sorted[0]], cols, storage)
+                    .and_then(|v| if let Value::Int(n) = v { Some(n.max(1) as usize) } else { None })
+                    .unwrap_or(1);
+                let count = sorted.len();
+                for (pos, &orig_idx) in sorted.iter().enumerate() {
+                    // 1-based bucket, distributed as evenly as possible
+                    let bucket = (pos * n / count) + 1;
+                    result[orig_idx] = Value::Int(bucket as i64);
+                }
+            }
+            parser::WindowFunc::PercentRank => {
+                let count = sorted.len();
+                let mut cur_rank = 1usize;
+                let mut prev_order_vals: Option<Vec<Value>> = None;
+                for (pos, &orig_idx) in sorted.iter().enumerate() {
+                    let order_vals: Vec<Value> = spec.order_by.iter()
+                        .filter_map(|ob| resolve_column_index(&ob.column, cols).map(|i| rows[orig_idx][i].clone()))
+                        .collect();
+                    if prev_order_vals.as_ref().map_or(false, |p| p == &order_vals) {
+                        // tie — keep same rank
+                    } else {
+                        cur_rank = pos + 1;
+                    }
+                    let pct = if count <= 1 { 0.0 } else { (cur_rank - 1) as f64 / (count - 1) as f64 };
+                    result[orig_idx] = Value::Float(pct);
+                    prev_order_vals = Some(order_vals);
+                }
+            }
+            parser::WindowFunc::CumeDist => {
+                let count = sorted.len();
+                // For each row, cume_dist = (# rows with order_val <= this row's) / count
+                for (pos, &orig_idx) in sorted.iter().enumerate() {
+                    let order_vals: Vec<Value> = spec.order_by.iter()
+                        .filter_map(|ob| resolve_column_index(&ob.column, cols).map(|i| rows[orig_idx][i].clone()))
+                        .collect();
+                    // Find last position with the same order key (handles ties)
+                    let last_pos = sorted.iter().rposition(|&idx| {
+                        let ov: Vec<Value> = spec.order_by.iter()
+                            .filter_map(|ob| resolve_column_index(&ob.column, cols).map(|i| rows[idx][i].clone()))
+                            .collect();
+                        ov == order_vals
+                    }).unwrap_or(pos);
+                    result[orig_idx] = Value::Float((last_pos + 1) as f64 / count as f64);
+                }
+            }
+            parser::WindowFunc::FirstValue(expr) => {
+                let n = sorted.len();
+                for (pos, &orig_idx) in sorted.iter().enumerate() {
+                    let (frame_start, _) = compute_frame_bounds(spec, pos, n);
+                    let src_idx = sorted[frame_start];
+                    result[orig_idx] = resolve_join_expression(expr, &rows[src_idx], cols, storage)
+                        .unwrap_or(Value::Null);
+                }
+            }
+            parser::WindowFunc::LastValue(expr) => {
+                let n = sorted.len();
+                for (pos, &orig_idx) in sorted.iter().enumerate() {
+                    let (_, frame_end) = compute_frame_bounds(spec, pos, n);
+                    let src_idx = sorted[frame_end];
+                    result[orig_idx] = resolve_join_expression(expr, &rows[src_idx], cols, storage)
+                        .unwrap_or(Value::Null);
+                }
+            }
+            parser::WindowFunc::NthValue(expr, n_expr) => {
+                let n = resolve_join_expression(n_expr, &rows[sorted[0]], cols, storage)
+                    .and_then(|v| if let Value::Int(n) = v { Some((n - 1).max(0) as usize) } else { None })
+                    .unwrap_or(0);
+                let total = sorted.len();
+                for (pos, &orig_idx) in sorted.iter().enumerate() {
+                    let (frame_start, frame_end) = compute_frame_bounds(spec, pos, total);
+                    let frame_len = frame_end - frame_start + 1;
+                    let val = if n < frame_len {
+                        let src_idx = sorted[frame_start + n];
+                        resolve_join_expression(expr, &rows[src_idx], cols, storage).unwrap_or(Value::Null)
+                    } else {
+                        Value::Null
+                    };
+                    result[orig_idx] = val;
                 }
             }
         }
@@ -1183,7 +1336,12 @@ fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) -> (Vec<Str
     let has_group_by = !stmt.group_by.is_empty();
 
     let (headers, mut rows) = if has_aggregates || has_group_by {
-        collect_aggregate_rows(&stmt_columns, &filtered_rows, &combined_cols, &stmt.group_by, stmt.having.as_ref(), &stmt.order_by, stmt.limit, stmt.offset, stmt.distinct, storage)
+        if let Some(ref sets) = stmt.grouping_sets {
+            // ROLLUP/CUBE/GROUPING SETS: run aggregation for each set and union results
+            collect_grouping_sets_rows(&stmt_columns, &filtered_rows, &combined_cols, sets, stmt.having.as_ref(), &stmt.order_by, stmt.limit, stmt.offset, stmt.distinct, storage)
+        } else {
+            collect_aggregate_rows(&stmt_columns, &filtered_rows, &combined_cols, &stmt.group_by, stmt.having.as_ref(), &stmt.order_by, stmt.limit, stmt.offset, stmt.distinct, storage)
+        }
     } else {
         collect_normal_rows(&stmt_columns, filtered_rows, &combined_cols, &stmt.order_by, stmt.limit, stmt.offset, stmt.distinct)
     };
@@ -1339,6 +1497,127 @@ fn compute_column_value(
         }
         parser::SelectColumn::All | parser::SelectColumn::StarFromTable(_) => "".to_string(),
     }
+}
+
+/// Execute aggregation for ROLLUP/CUBE/GROUPING SETS: one pass per grouping set, union all results.
+/// Columns not in the current set are replaced with NULL in the output.
+fn collect_grouping_sets_rows(
+    columns: &[parser::SelectColumn],
+    rows: &[Vec<Value>],
+    combined_cols: &[ResultColumn],
+    sets: &[Vec<parser::SelectColumn>],
+    having: Option<&parser::WhereClause>,
+    order_by: &[parser::OrderByClause],
+    limit: Option<u64>,
+    offset: Option<u64>,
+    distinct: bool,
+    storage: &Storage,
+) -> (Vec<String>, Vec<Vec<String>>) {
+    let header_names: Vec<String> = columns.iter()
+        .filter(|c| !matches!(c, parser::SelectColumn::All))
+        .map(|c| column_header(c))
+        .collect();
+
+    let mut all_result_rows: Vec<Vec<String>> = Vec::new();
+
+    for set in sets {
+        // For this grouping set, build a patched column list: GROUP BY columns not in set → NULL
+        let set_col_names: Vec<String> = set.iter().map(|c| match c {
+            parser::SelectColumn::Column(n) => n.clone(),
+            parser::SelectColumn::QualifiedColumn(_, n) => n.clone(),
+            _ => String::new(),
+        }).collect();
+
+        // Run aggregation for this set
+        let (_, set_rows) = collect_aggregate_rows(
+            columns, rows, combined_cols, set, having, &[], None, None, false, storage,
+        );
+
+        // For each result row, null out group-by columns not in this set
+        let patched: Vec<Vec<String>> = set_rows.into_iter().map(|row| {
+            row.into_iter().enumerate().map(|(i, val)| {
+                // Find if this header corresponds to a group-by column not in this set
+                let header = header_names.get(i).map(|s| s.as_str()).unwrap_or("");
+                // Check if it's a simple column that's a group-by candidate
+                let is_group_col = columns.iter().filter(|c| !matches!(c, parser::SelectColumn::All))
+                    .nth(i)
+                    .map(|c| {
+                        let col_name = match c {
+                            parser::SelectColumn::Column(n) => Some(n.clone()),
+                            parser::SelectColumn::QualifiedColumn(_, n) => Some(n.clone()),
+                            parser::SelectColumn::Alias(inner, _) => match inner.as_ref() {
+                                parser::SelectColumn::Column(n) => Some(n.clone()),
+                                parser::SelectColumn::QualifiedColumn(_, n) => Some(n.clone()),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        // It's a group column if it matches any of the all-sets columns
+                        col_name.map(|n| {
+                            // Check if this column appears in any grouping set
+                            sets.iter().any(|s| s.iter().any(|sc| match sc {
+                                parser::SelectColumn::Column(sn) => sn.eq_ignore_ascii_case(&n),
+                                parser::SelectColumn::QualifiedColumn(_, sn) => sn.eq_ignore_ascii_case(&n),
+                                _ => false,
+                            }))
+                        }).unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+
+                if is_group_col {
+                    // Check if this column is in the current set
+                    let in_set = columns.iter().filter(|c| !matches!(c, parser::SelectColumn::All))
+                        .nth(i)
+                        .and_then(|c| match c {
+                            parser::SelectColumn::Column(n) => Some(n.clone()),
+                            parser::SelectColumn::QualifiedColumn(_, n) => Some(n.clone()),
+                            parser::SelectColumn::Alias(inner, _) => match inner.as_ref() {
+                                parser::SelectColumn::Column(n) => Some(n.clone()),
+                                parser::SelectColumn::QualifiedColumn(_, n) => Some(n.clone()),
+                                _ => None,
+                            },
+                            _ => None,
+                        })
+                        .map(|n| set_col_names.iter().any(|sn| sn.eq_ignore_ascii_case(&n)))
+                        .unwrap_or(true);
+                    if !in_set { "NULL".to_string() } else { val }
+                } else {
+                    let _ = header; // suppress unused warning
+                    val
+                }
+            }).collect()
+        }).collect();
+
+        all_result_rows.extend(patched);
+    }
+
+    // Apply ORDER BY, DISTINCT, OFFSET, LIMIT
+    if !order_by.is_empty() {
+        all_result_rows.sort_by(|a, b| {
+            for ob in order_by {
+                let col_name = column_header(&ob.column);
+                if let Some(idx) = header_names.iter().position(|h| *h == col_name) {
+                    let ord = a[idx].cmp(&b[idx]);
+                    let ord = if ob.descending { ord.reverse() } else { ord };
+                    if ord != std::cmp::Ordering::Equal { return ord; }
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+    }
+    if distinct {
+        let mut seen: Vec<Vec<String>> = Vec::new();
+        all_result_rows.retain(|row| {
+            if seen.contains(row) { false } else { seen.push(row.clone()); true }
+        });
+    }
+    if let Some(off) = offset {
+        let off = off as usize;
+        if off >= all_result_rows.len() { all_result_rows.clear(); } else { all_result_rows.drain(..off); }
+    }
+    if let Some(n) = limit { all_result_rows.truncate(n as usize); }
+
+    (header_names, all_result_rows)
 }
 
 /// Execute a SELECT with aggregate functions, with optional GROUP BY and HAVING
@@ -1860,6 +2139,12 @@ fn format_expr(expr: &parser::Expression) -> String {
                     };
                     format!("{}({})", agg_name, column_header(col))
                 }
+                parser::WindowFunc::Ntile(n) => format!("ntile({})", format_expr(n)),
+                parser::WindowFunc::PercentRank => "percent_rank()".to_string(),
+                parser::WindowFunc::CumeDist => "cume_dist()".to_string(),
+                parser::WindowFunc::FirstValue(e) => format!("first_value({})", format_expr(e)),
+                parser::WindowFunc::LastValue(e) => format!("last_value({})", format_expr(e)),
+                parser::WindowFunc::NthValue(e, n) => format!("nth_value({}, {})", format_expr(e), format_expr(n)),
             };
             // If it's a bare named window reference with no inline spec, format as "func OVER name"
             if let Some(ref base_name) = spec.base_window {
@@ -2160,6 +2445,92 @@ fn execute_subquery(stmt: &parser::SelectStatement, storage: &Storage) -> Vec<Va
         Some(idx) => filtered.iter().map(|row| row[idx].clone()).collect(),
         None => Vec::new(),
     }
+}
+
+/// Substitute outer column references in an expression with literal values
+fn substitute_outer_refs_expr(
+    expr: &parser::Expression,
+    outer_row: &[Value],
+    outer_cols: &[ResultColumn],
+) -> parser::Expression {
+    match expr {
+        parser::Expression::Column(name) => {
+            if let Some(idx) = outer_cols.iter().position(|c| c.name.eq_ignore_ascii_case(name)) {
+                return parser::Expression::Literal(outer_row[idx].clone());
+            }
+            expr.clone()
+        }
+        parser::Expression::QualifiedColumn(table, name) => {
+            if let Some(idx) = outer_cols.iter().position(|c| c.table.eq_ignore_ascii_case(table) && c.name.eq_ignore_ascii_case(name)) {
+                return parser::Expression::Literal(outer_row[idx].clone());
+            }
+            expr.clone()
+        }
+        parser::Expression::BinaryOp(l, op, r) => parser::Expression::BinaryOp(
+            Box::new(substitute_outer_refs_expr(l, outer_row, outer_cols)),
+            op.clone(),
+            Box::new(substitute_outer_refs_expr(r, outer_row, outer_cols)),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Substitute outer column references in a condition
+fn substitute_outer_refs_cond(
+    cond: &parser::Condition,
+    outer_row: &[Value],
+    outer_cols: &[ResultColumn],
+) -> parser::Condition {
+    match cond {
+        parser::Condition::And(l, r) => parser::Condition::And(
+            Box::new(substitute_outer_refs_cond(l, outer_row, outer_cols)),
+            Box::new(substitute_outer_refs_cond(r, outer_row, outer_cols)),
+        ),
+        parser::Condition::Or(l, r) => parser::Condition::Or(
+            Box::new(substitute_outer_refs_cond(l, outer_row, outer_cols)),
+            Box::new(substitute_outer_refs_cond(r, outer_row, outer_cols)),
+        ),
+        parser::Condition::Not(inner) => parser::Condition::Not(
+            Box::new(substitute_outer_refs_cond(inner, outer_row, outer_cols))
+        ),
+        parser::Condition::Comparison { left, operator, right, upper_bound } => {
+            parser::Condition::Comparison {
+                left: substitute_outer_refs_expr(left, outer_row, outer_cols),
+                operator: operator.clone(),
+                right: substitute_outer_refs_expr(right, outer_row, outer_cols),
+                upper_bound: upper_bound.as_ref().map(|e| substitute_outer_refs_expr(e, outer_row, outer_cols)),
+            }
+        }
+        other => other.clone(),
+    }
+}
+
+/// Patch a lateral subquery by substituting outer row references in its WHERE clause
+fn substitute_outer_refs_in_query(
+    query: &parser::SelectStatement,
+    outer_row: &[Value],
+    outer_cols: &[ResultColumn],
+) -> parser::SelectStatement {
+    let mut q = query.clone();
+    if let Some(ref wc) = q.where_clause {
+        q.where_clause = Some(parser::WhereClause {
+            condition: substitute_outer_refs_cond(&wc.condition, outer_row, outer_cols),
+        });
+    }
+    q
+}
+
+/// Execute a lateral subquery for a single outer row, returning (cols, rows)
+fn execute_lateral_subquery(
+    query: &parser::SelectStatement,
+    outer_row: &[Value],
+    outer_cols: &[ResultColumn],
+    storage: &Storage,
+    cte_map: &HashMap<String, CteData>,
+) -> (Vec<ResultColumn>, Vec<Vec<Value>>) {
+    let patched = substitute_outer_refs_in_query(query, outer_row, outer_cols);
+    let cte_data = materialize_cte_inner(&patched, storage, cte_map);
+    (cte_data.columns, cte_data.rows)
 }
 
 /// Execute a subquery with outer row context for correlated subqueries.

@@ -199,7 +199,9 @@ impl FromClause {
 #[derive(Debug, PartialEq, Clone)]
 pub struct CteDefinition {
     pub name: String,
+    pub columns: Vec<String>, // optional column name list: counter(n, m)
     pub query: Box<SelectStatement>,
+    pub recursive: bool, // true when declared inside WITH RECURSIVE
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -917,25 +919,38 @@ pub fn parse_select_statement(input: &str) -> IResult<&str, SelectStatement> {
         delimited(multispace0, nom_char(','), multispace0),
         parse_select_column
     )(input)?;
-    let (input, _) = multispace1(input)?;
-    let (input, _) = tag_no_case("FROM")(input)?;
-    let (input, _) = multispace1(input)?;
 
-    // FROM can be a table name or (SELECT ...) AS alias
-    let (input, from, from_alias) = if let Ok((input, _)) = nom_char::<&str, nom::error::Error<&str>>('(')(input) {
-        let (input, _) = multispace0(input)?;
-        let (input, subquery) = parse_select_statement(input)?;
-        let (input, _) = multispace0(input)?;
-        let (input, _) = nom_char(')')(input)?;
+    // FROM is optional — "SELECT 1" or "SELECT 1+1" are valid (used in recursive CTE anchors)
+    let from_present = {
+        let trimmed = input.trim_start();
+        trimmed.to_uppercase().starts_with("FROM") &&
+            trimmed[4..].starts_with(|c: char| c.is_whitespace() || c == '(')
+    };
+
+    let (input, from, from_alias) = if from_present {
         let (input, _) = multispace1(input)?;
-        let (input, _) = tag_no_case("AS")(input)?;
+        let (input, _) = tag_no_case("FROM")(input)?;
         let (input, _) = multispace1(input)?;
-        let (input, alias) = parse_identifier(input)?;
-        (input, FromClause::Subquery(Box::new(subquery)), Some(alias.to_string()))
+
+        // FROM can be a table name or (SELECT ...) AS alias
+        if let Ok((input, _)) = nom_char::<&str, nom::error::Error<&str>>('(')(input) {
+            let (input, _) = multispace0(input)?;
+            let (input, subquery) = parse_select_statement(input)?;
+            let (input, _) = multispace0(input)?;
+            let (input, _) = nom_char(')')(input)?;
+            let (input, _) = multispace1(input)?;
+            let (input, _) = tag_no_case("AS")(input)?;
+            let (input, _) = multispace1(input)?;
+            let (input, alias) = parse_identifier(input)?;
+            (input, FromClause::Subquery(Box::new(subquery)), Some(alias.to_string()))
+        } else {
+            let (input, table) = parse_identifier(input)?;
+            let (input, from_alias) = nom::combinator::opt(parse_table_alias)(input)?;
+            (input, FromClause::Table(table.to_string()), from_alias)
+        }
     } else {
-        let (input, table) = parse_identifier(input)?;
-        let (input, from_alias) = nom::combinator::opt(parse_table_alias)(input)?;
-        (input, FromClause::Table(table.to_string()), from_alias)
+        // No FROM clause — use a sentinel table name so the rest of the machinery works
+        (input, FromClause::Table("__no_from__".to_string()), None)
     };
 
     // Parse optional comma-separated extra FROM tables (implicit CROSS JOIN)
@@ -1005,10 +1020,25 @@ pub fn parse_select_statement(input: &str) -> IResult<&str, SelectStatement> {
     }))
 }
 
-/// Parse a single CTE definition: name AS (SELECT ...)
-fn parse_cte_definition(input: &str) -> IResult<&str, CteDefinition> {
+/// Parse a single CTE definition: name [(col, ...)] AS (SELECT ...)
+/// The `recursive` flag is set by the caller based on WITH RECURSIVE.
+fn parse_cte_definition_inner(input: &str, recursive: bool) -> IResult<&str, CteDefinition> {
     let (input, _) = multispace0(input)?;
     let (input, name) = parse_identifier(input)?;
+    // Optional column name list: counter(n, m)
+    let (input, columns) = nom::combinator::opt(|input| {
+        let (input, _) = multispace0(input)?;
+        let (input, _) = nom_char('(')(input)?;
+        let (input, _) = multispace0(input)?;
+        let (input, cols) = nom::multi::separated_list1(
+            nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+            parse_identifier,
+        )(input)?;
+        let (input, _) = multispace0(input)?;
+        let (input, _) = nom_char(')')(input)?;
+        Ok((input, cols.into_iter().map(|s| s.to_string()).collect::<Vec<_>>()))
+    })(input)?;
+    let columns = columns.unwrap_or_default();
     let (input, _) = multispace1(input)?;
     let (input, _) = tag_no_case("AS")(input)?;
     let (input, _) = multispace0(input)?;
@@ -1017,17 +1047,22 @@ fn parse_cte_definition(input: &str) -> IResult<&str, CteDefinition> {
     let (input, query) = parse_select_statement(input)?;
     let (input, _) = multispace0(input)?;
     let (input, _) = nom_char(')')(input)?;
-    Ok((input, CteDefinition { name: name.to_string(), query: Box::new(query) }))
+    Ok((input, CteDefinition { name: name.to_string(), columns, query: Box::new(query), recursive }))
 }
 
-/// Parse SELECT statement (top-level, with optional WITH clause and semicolon)
+/// Parse SELECT statement (top-level, with optional WITH [RECURSIVE] clause and semicolon)
 pub fn parse_select(input: &str) -> IResult<&str, SqlStatement> {
-    // Try parsing WITH ... AS (...) before the SELECT
-    let (input, ctes) = if let Ok((input, _)) = tag::<&str, &str, nom::error::Error<&str>>("WITH")(input) {
+    // Try parsing WITH [RECURSIVE] ... AS (...) before the SELECT
+    let (input, ctes) = if let Ok((input, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("WITH")(input) {
         let (input, _) = multispace1(input)?;
+        // Optional RECURSIVE keyword
+        let (input, recursive_kw) = nom::combinator::opt(
+            nom::sequence::terminated(tag_no_case::<&str, &str, nom::error::Error<&str>>("RECURSIVE"), multispace1)
+        )(input)?;
+        let is_recursive = recursive_kw.is_some();
         let (input, ctes) = separated_list0(
             delimited(multispace0, nom_char(','), multispace0),
-            parse_cte_definition,
+            |i| parse_cte_definition_inner(i, is_recursive),
         )(input)?;
         let (input, _) = multispace0(input)?;
         (input, ctes)
@@ -1293,7 +1328,7 @@ fn parse_limit_offset_clause(input: &str) -> IResult<&str, (Option<u64>, Option<
 
 /// Check if identifier is a reserved keyword that can't be used as an alias
 fn is_reserved_keyword(s: &str) -> bool {
-    matches!(s.to_uppercase().as_str(), "ON" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "OUTER" | "CROSS" | "WHERE" | "ORDER" | "GROUP" | "LIMIT" | "OFFSET" | "HAVING" | "UNION" | "ALL" | "CASE" | "WHEN" | "THEN" | "ELSE" | "END" | "AND" | "OR" | "NOT" | "AS" | "VIEW" | "OVER" | "PARTITION" | "NULLS" | "FIRST" | "LAST" | "INTERSECT" | "EXCEPT" | "ROWS" | "RANGE" | "GROUPS" | "PRECEDING" | "FOLLOWING" | "UNBOUNDED" | "BETWEEN" | "USING" | "NATURAL" | "ANY" | "SOME" | "FILTER")
+    matches!(s.to_uppercase().as_str(), "ON" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "OUTER" | "CROSS" | "WHERE" | "ORDER" | "GROUP" | "LIMIT" | "OFFSET" | "HAVING" | "UNION" | "ALL" | "CASE" | "WHEN" | "THEN" | "ELSE" | "END" | "AND" | "OR" | "NOT" | "AS" | "VIEW" | "OVER" | "PARTITION" | "NULLS" | "FIRST" | "LAST" | "INTERSECT" | "EXCEPT" | "ROWS" | "RANGE" | "GROUPS" | "PRECEDING" | "FOLLOWING" | "UNBOUNDED" | "BETWEEN" | "USING" | "NATURAL" | "ANY" | "SOME" | "FILTER" | "RECURSIVE")
 }
 
 /// Parse optional table alias, rejecting reserved keywords

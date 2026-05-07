@@ -238,12 +238,14 @@ fn execute_sql(sql: &str, storage: &Storage) {
 }
 
 /// A column in the combined result set, tracked by table name and column name
+#[derive(Clone)]
 struct ResultColumn {
     table: String,
     name: String,
 }
 
 /// Materialized CTE: column definitions + row data
+#[derive(Clone)]
 struct CteData {
     columns: Vec<ResultColumn>,
     rows: Vec<Vec<Value>>,
@@ -339,7 +341,7 @@ fn load_from_with_index(
     match from {
         parser::FromClause::Table(name) => load_table_with_index(name, ctes, storage, index_hint),
         parser::FromClause::Subquery(subquery) => {
-            let cte_data = materialize_cte(subquery, storage, ctes);
+            let cte_data = materialize_cte_inner(subquery, storage, ctes);
             let cols = cte_data.columns.iter()
                 .map(|c| ResultColumn { table: alias.to_string(), name: c.name.clone() })
                 .collect();
@@ -388,12 +390,140 @@ fn select_column_name(col: &parser::SelectColumn) -> String {
     }
 }
 
-/// Execute a CTE or derived table query and capture its result as columns + rows
+/// Execute a CTE definition, dispatching to the recursive path if needed
 fn materialize_cte(
+    cte: &parser::CteDefinition,
+    storage: &Storage,
+    existing_ctes: &HashMap<String, CteData>,
+) -> CteData {
+    if cte.recursive {
+        return materialize_recursive_cte(cte, storage, existing_ctes);
+    }
+    let mut data = materialize_cte_inner(&cte.query, storage, existing_ctes);
+    // Apply optional column rename from the CTE column list
+    if !cte.columns.is_empty() {
+        for (i, col) in data.columns.iter_mut().enumerate() {
+            if let Some(name) = cte.columns.get(i) {
+                col.name = name.clone();
+            }
+        }
+    }
+    data
+}
+
+/// Fixpoint evaluation for recursive CTEs
+fn materialize_recursive_cte(
+    cte: &parser::CteDefinition,
+    storage: &Storage,
+    existing_ctes: &HashMap<String, CteData>,
+) -> CteData {
+    let query = &cte.query;
+
+    // Split UNION into anchor (left) and recursive term (right)
+    let (union_type, recursive_query) = match &query.union {
+        Some((ut, rq)) => (ut.clone(), rq.as_ref()),
+        None => {
+            // No UNION — execute normally as a non-recursive CTE
+            return materialize_cte_inner(query, storage, existing_ctes);
+        }
+    };
+
+    // Anchor: the left side of the UNION (strip the union field)
+    let mut anchor_stmt = query.clone();
+    anchor_stmt.union = None;
+
+    let anchor_data = materialize_cte_inner(&anchor_stmt, storage, existing_ctes);
+
+    // Determine output column names: use CTE column list if provided, else anchor's headers
+    let output_columns: Vec<ResultColumn> = if !cte.columns.is_empty() {
+        cte.columns.iter().map(|name| ResultColumn { table: String::new(), name: name.clone() }).collect()
+    } else {
+        anchor_data.columns.clone()
+    };
+
+    let mut accumulated: Vec<Vec<Value>> = anchor_data.rows.clone();
+    let mut current_rows = anchor_data.rows;
+    // Track seen rows for UNION (dedup) mode
+    let mut seen: Vec<Vec<Value>> = accumulated.clone();
+
+    let max_iterations = 10_000usize;
+    for _ in 0..max_iterations {
+        if current_rows.is_empty() {
+            break;
+        }
+
+        // Expose current rows under the CTE name so the recursive term can reference them
+        let mut iter_ctes = existing_ctes.clone();
+        iter_ctes.insert(cte.name.clone(), CteData {
+            columns: output_columns.clone(),
+            rows: current_rows.clone(),
+        });
+
+        let next_data = materialize_cte_inner(recursive_query, storage, &iter_ctes);
+
+        // UNION deduplicates; UNION ALL keeps everything
+        let new_rows: Vec<Vec<Value>> = match union_type {
+            parser::UnionType::UnionAll | parser::UnionType::IntersectAll | parser::UnionType::ExceptAll => {
+                next_data.rows
+            }
+            _ => next_data.rows.into_iter().filter(|r| !seen.contains(r)).collect(),
+        };
+
+        if new_rows.is_empty() {
+            break;
+        }
+
+        seen.extend(new_rows.clone());
+        accumulated.extend(new_rows.clone());
+        current_rows = new_rows;
+    }
+
+    CteData { columns: output_columns, rows: accumulated }
+}
+
+/// Handle "SELECT expr, expr, ..." with no FROM clause — produces exactly one row.
+fn materialize_no_from_select(
+    query: &parser::SelectStatement,
+    storage: &Storage,
+    _existing_ctes: &HashMap<String, CteData>,
+) -> CteData {
+    let empty_row: Vec<Value> = Vec::new();
+    let empty_cols: Vec<ResultColumn> = Vec::new();
+    let empty_storage = Storage::new("/dev/null").unwrap();
+    let mut result_cols: Vec<ResultColumn> = Vec::new();
+    let mut result_vals: Vec<Value> = Vec::new();
+    for col in &query.columns {
+        let name = select_column_name(col);
+        let expr = match col {
+            parser::SelectColumn::Expr(e) => e.clone(),
+            parser::SelectColumn::Alias(inner, _) => {
+                if let parser::SelectColumn::Expr(e) = inner.as_ref() { e.clone() }
+                else { parser::Expression::Literal(Value::Null) }
+            }
+            parser::SelectColumn::Column(n) => parser::Expression::Literal(Value::String(n.clone())),
+            _ => parser::Expression::Literal(Value::Null),
+        };
+        let val = resolve_join_expression(&expr, &empty_row, &empty_cols, &empty_storage)
+            .unwrap_or(Value::Null);
+        result_cols.push(ResultColumn { table: String::new(), name });
+        result_vals.push(val);
+    }
+    CteData { columns: result_cols, rows: vec![result_vals] }
+}
+
+/// Execute a SELECT query and capture its result as columns + rows (non-recursive inner path)
+fn materialize_cte_inner(
     query: &parser::SelectStatement,
     storage: &Storage,
     existing_ctes: &HashMap<String, CteData>,
 ) -> CteData {
+    // Handle SELECT without FROM (e.g. "SELECT 1, 2+3") — produces one synthetic row
+    if let parser::FromClause::Table(name) = &query.from {
+        if name == "__no_from__" {
+            return materialize_no_from_select(query, storage, existing_ctes);
+        }
+    }
+
     let effective_name = from_name(&query.from, &query.from_alias);
 
     // Load FROM table
@@ -560,7 +690,7 @@ fn materialize_aggregate_cte(
 fn execute_insert_select(table_name: &str, select: &parser::SelectStatement, storage: &Storage) {
     let mut cte_map: HashMap<String, CteData> = HashMap::new();
     for cte in &select.ctes {
-        let cte_data = materialize_cte(&cte.query, storage, &cte_map);
+        let cte_data = materialize_cte(cte, storage, &cte_map);
         cte_map.insert(cte.name.clone(), cte_data);
     }
 
@@ -1000,7 +1130,7 @@ fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) -> (Vec<Str
     // Materialize CTEs
     let mut cte_map: HashMap<String, CteData> = HashMap::new();
     for cte in &stmt.ctes {
-        let cte_data = materialize_cte(&cte.query, storage, &cte_map);
+        let cte_data = materialize_cte(cte, storage, &cte_map);
         cte_map.insert(cte.name.clone(), cte_data);
     }
 

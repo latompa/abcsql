@@ -83,11 +83,307 @@ pub fn execute(storage: &Storage, sql: &str) -> Result<String, String> {
     }
 }
 
+// Column map type used throughout lib.rs: (table_alias, column_name)
+type LibCols = Vec<(String, String)>;
+// CTE map: name -> (columns, rows)
+type LibCteMap = std::collections::HashMap<String, (LibCols, Vec<Vec<Value>>)>;
+
+/// Load rows for a table name, checking the CTE map first then storage.
+fn lib_load_table<'a>(
+    name: &str,
+    cte_map: &'a LibCteMap,
+    storage: &Storage,
+) -> Result<(LibCols, Vec<Vec<Value>>), String> {
+    if let Some((cols, rows)) = cte_map.get(name) {
+        let tagged: LibCols = cols.iter().map(|(_, c)| (name.to_string(), c.clone())).collect();
+        return Ok((tagged, rows.clone()));
+    }
+    if let Ok(Some(view_sql)) = storage.load_view(name) {
+        let inner_stmt = match parser::parse_sql(&view_sql) {
+            Ok((_, parser::SqlStatement::Select(s))) => s,
+            _ => return Err(format!("View '{}' has invalid SQL", name)),
+        };
+        return lib_materialize_select(&inner_stmt, storage, cte_map);
+    }
+    let schema = storage.load_schema(name).map_err(|e| e.to_string())?;
+    let rows = storage.read_rows(name).map_err(|e| e.to_string())?;
+    let cols: LibCols = schema.columns.iter().map(|c| (name.to_string(), c.name.clone())).collect();
+    Ok((cols, rows))
+}
+
+/// Handle "SELECT expr, ..." with no FROM — returns a single synthetic row.
+fn lib_materialize_no_from_select(
+    stmt: &parser::SelectStatement,
+    storage: &Storage,
+) -> Result<(LibCols, Vec<Vec<Value>>), String> {
+    let empty_row: Vec<Value> = Vec::new();
+    let empty_cols: LibCols = Vec::new();
+    let mut out_cols: LibCols = Vec::new();
+    let mut out_vals: Vec<Value> = Vec::new();
+    for col in &stmt.columns {
+        let (col_name, expr) = match col {
+            parser::SelectColumn::Expr(e) => (format!("{:?}", e), e.clone()),
+            parser::SelectColumn::Alias(inner, alias) => {
+                if let parser::SelectColumn::Expr(e) = inner.as_ref() {
+                    (alias.clone(), e.clone())
+                } else {
+                    (alias.clone(), parser::Expression::Literal(Value::Null))
+                }
+            }
+            parser::SelectColumn::Column(n) => (n.clone(), parser::Expression::Column(n.clone())),
+            _ => ("?".to_string(), parser::Expression::Literal(Value::Null)),
+        };
+        let val = resolve_expr(&expr, &empty_row, &empty_cols, storage).unwrap_or(Value::Null);
+        out_cols.push((String::new(), col_name));
+        out_vals.push(val);
+    }
+    Ok((out_cols, vec![out_vals]))
+}
+
+/// Materialize a SELECT statement given an existing CTE map, returning (cols, rows).
+fn lib_materialize_select(
+    stmt: &parser::SelectStatement,
+    storage: &Storage,
+    cte_map: &LibCteMap,
+) -> Result<(LibCols, Vec<Vec<Value>>), String> {
+    // Handle SELECT without FROM — produces one synthetic row from expressions
+    if let parser::FromClause::Table(name) = &stmt.from {
+        if name == "__no_from__" {
+            return lib_materialize_no_from_select(stmt, storage);
+        }
+    }
+
+    let table_name = stmt.from.table_name().ok_or("Subquery FROM not supported here")?;
+    let from_alias = stmt.from_alias.as_deref().unwrap_or(table_name);
+
+    let (from_cols_raw, from_rows) = lib_load_table(table_name, cte_map, storage)?;
+    let mut combined_cols: LibCols = from_cols_raw.into_iter()
+        .map(|(_, c)| (from_alias.to_string(), c))
+        .collect();
+    let mut combined_rows: Vec<Vec<Value>> = from_rows;
+
+    // Process joins (simplified: only INNER/LEFT supported here)
+    for join in &stmt.joins {
+        let (join_cols_raw, join_rows) = lib_load_table(&join.table, cte_map, storage)?;
+        let join_alias = join.alias.as_deref().unwrap_or(&join.table);
+        let join_cols: LibCols = join_cols_raw.into_iter().map(|(_, c)| (join_alias.to_string(), c)).collect();
+
+        let mut new_rows = Vec::new();
+        for left_row in &combined_rows {
+            let mut matched = false;
+            for right_row in &join_rows {
+                let mut candidate = left_row.clone();
+                candidate.extend(right_row.iter().cloned());
+                let all_cols: LibCols = combined_cols.iter().chain(join_cols.iter()).cloned().collect();
+                let matches = match &join.on {
+                    Some(cond) => eval_condition(cond, &candidate, &all_cols, storage),
+                    None => true,
+                };
+                if matches {
+                    new_rows.push(candidate);
+                    matched = true;
+                }
+            }
+            if !matched && join.join_type == parser::JoinType::Left {
+                let mut row = left_row.clone();
+                row.extend(std::iter::repeat(Value::Null).take(join_cols.len()));
+                new_rows.push(row);
+            }
+        }
+        combined_cols.extend(join_cols);
+        combined_rows = new_rows;
+    }
+
+    // Apply WHERE
+    let rows: Vec<Vec<Value>> = combined_rows.into_iter()
+        .filter(|row| match &stmt.where_clause {
+            Some(wc) => eval_condition(&wc.condition, row, &combined_cols, storage),
+            None => true,
+        })
+        .collect();
+
+    // Apply OFFSET then LIMIT
+    let rows: Vec<_> = if let Some(off) = stmt.offset {
+        rows.into_iter().skip(off as usize).collect()
+    } else { rows };
+    let rows = if let Some(n) = stmt.limit {
+        rows.into_iter().take(n as usize).collect()
+    } else { rows };
+
+    // Project columns
+    let (out_cols, out_rows) = lib_project_rows(stmt, &combined_cols, rows, storage);
+    Ok((out_cols, out_rows))
+}
+
+/// Project a set of rows according to the SELECT column list.
+fn lib_project_rows(
+    stmt: &parser::SelectStatement,
+    combined_cols: &LibCols,
+    rows: Vec<Vec<Value>>,
+    storage: &Storage,
+) -> (LibCols, Vec<Vec<Value>>) {
+    match stmt.columns.as_slice() {
+        [parser::SelectColumn::All] => {
+            // * — return all columns as-is, but strip table prefix from names
+            let out_cols: LibCols = combined_cols.iter().map(|(_, c)| (String::new(), c.clone())).collect();
+            (out_cols, rows)
+        }
+        cols => {
+            let mut out_col_names: LibCols = Vec::new();
+            let mut col_sources: Vec<Option<usize>> = Vec::new(); // index into combined_cols or None for expr
+            let mut col_exprs: Vec<Option<parser::Expression>> = Vec::new();
+            for col in cols {
+                match col {
+                    parser::SelectColumn::Column(name) => {
+                        let idx = combined_cols.iter().position(|(_, c)| c == name);
+                        out_col_names.push((String::new(), name.clone()));
+                        col_sources.push(idx);
+                        col_exprs.push(None);
+                    }
+                    // table.column — look up by both table alias and column name
+                    parser::SelectColumn::QualifiedColumn(tbl, name) => {
+                        let idx = combined_cols.iter().position(|(t, c)| t == tbl && c == name);
+                        out_col_names.push((String::new(), name.clone()));
+                        col_sources.push(idx);
+                        col_exprs.push(None);
+                    }
+                    parser::SelectColumn::Alias(inner, alias) => {
+                        if let parser::SelectColumn::Expr(expr) = inner.as_ref() {
+                            out_col_names.push((String::new(), alias.clone()));
+                            col_sources.push(None);
+                            col_exprs.push(Some(expr.clone()));
+                        } else if let parser::SelectColumn::Column(name) = inner.as_ref() {
+                            let idx = combined_cols.iter().position(|(_, c)| c == name);
+                            out_col_names.push((String::new(), alias.clone()));
+                            col_sources.push(idx);
+                            col_exprs.push(None);
+                        } else if let parser::SelectColumn::QualifiedColumn(tbl, name) = inner.as_ref() {
+                            let idx = combined_cols.iter().position(|(t, c)| t == tbl && c == name);
+                            out_col_names.push((String::new(), alias.clone()));
+                            col_sources.push(idx);
+                            col_exprs.push(None);
+                        } else {
+                            out_col_names.push((String::new(), alias.clone()));
+                            col_sources.push(None);
+                            col_exprs.push(None);
+                        }
+                    }
+                    parser::SelectColumn::Expr(expr) => {
+                        out_col_names.push((String::new(), format!("{:?}", expr)));
+                        col_sources.push(None);
+                        col_exprs.push(Some(expr.clone()));
+                    }
+                    _ => {} // skip aggregates etc. in this simplified path
+                }
+            }
+            let out_rows: Vec<Vec<Value>> = rows.into_iter().map(|row| {
+                col_sources.iter().zip(col_exprs.iter()).map(|(src, expr)| {
+                    if let Some(idx) = src {
+                        row.get(*idx).cloned().unwrap_or(Value::Null)
+                    } else if let Some(e) = expr {
+                        resolve_expr(e, &row, combined_cols, storage).unwrap_or(Value::Null)
+                    } else {
+                        Value::Null
+                    }
+                }).collect()
+            }).collect();
+            (out_col_names, out_rows)
+        }
+    }
+}
+
+/// Fixpoint algorithm for a recursive CTE. Returns (cols, rows).
+fn lib_materialize_recursive_cte(
+    cte: &parser::CteDefinition,
+    storage: &Storage,
+    existing_ctes: &LibCteMap,
+) -> Result<(LibCols, Vec<Vec<Value>>), String> {
+    let query = &cte.query;
+
+    let (union_type, recursive_query) = match &query.union {
+        Some((ut, rq)) => (ut.clone(), rq.as_ref()),
+        None => {
+            // No UNION — just materialize normally
+            return lib_materialize_select(query, storage, existing_ctes);
+        }
+    };
+
+    // Anchor: left side of UNION
+    let mut anchor_stmt = query.clone();
+    anchor_stmt.union = None;
+    let (anchor_cols_raw, anchor_rows) = lib_materialize_select(&anchor_stmt, storage, existing_ctes)?;
+
+    // Determine output column names from CTE column list or anchor headers
+    let output_col_names: Vec<String> = if !cte.columns.is_empty() {
+        cte.columns.clone()
+    } else {
+        anchor_cols_raw.iter().map(|(_, c)| c.clone()).collect()
+    };
+    let output_cols: LibCols = output_col_names.iter().map(|n| (String::new(), n.clone())).collect();
+
+    let mut accumulated: Vec<Vec<Value>> = anchor_rows.clone();
+    let mut current_rows = anchor_rows;
+    let mut seen: Vec<Vec<Value>> = accumulated.clone();
+
+    let max_iterations = 10_000usize;
+    for _ in 0..max_iterations {
+        if current_rows.is_empty() {
+            break;
+        }
+
+        // Expose current rows under the CTE name
+        let mut iter_ctes = existing_ctes.clone();
+        iter_ctes.insert(cte.name.clone(), (output_cols.clone(), current_rows.clone()));
+
+        let (_, next_rows) = lib_materialize_select(recursive_query, storage, &iter_ctes)?;
+
+        let new_rows: Vec<Vec<Value>> = match union_type {
+            parser::UnionType::UnionAll | parser::UnionType::IntersectAll | parser::UnionType::ExceptAll => next_rows,
+            _ => next_rows.into_iter().filter(|r| !seen.contains(r)).collect(),
+        };
+
+        if new_rows.is_empty() {
+            break;
+        }
+
+        seen.extend(new_rows.clone());
+        accumulated.extend(new_rows.clone());
+        current_rows = new_rows;
+    }
+
+    Ok((output_cols, accumulated))
+}
+
 // Minimal select executor that loads data and applies WHERE, returning results as a string
 fn execute_select_to_string(
     stmt: &parser::SelectStatement,
     storage: &Storage,
 ) -> Result<String, String> {
+    // If there are CTEs, materialize them first (including recursive)
+    if !stmt.ctes.is_empty() {
+        let mut cte_map: LibCteMap = std::collections::HashMap::new();
+        for cte in &stmt.ctes {
+            let result = if cte.recursive {
+                lib_materialize_recursive_cte(cte, storage, &cte_map)?
+            } else {
+                lib_materialize_select(&cte.query, storage, &cte_map)?
+            };
+            // Apply column rename if CTE column list is provided
+            let (mut cols, rows) = result;
+            if !cte.columns.is_empty() {
+                for (i, col) in cols.iter_mut().enumerate() {
+                    if let Some(name) = cte.columns.get(i) {
+                        col.1 = name.clone();
+                    }
+                }
+            }
+            cte_map.insert(cte.name.clone(), (cols, rows));
+        }
+        // Now execute the main query using the CTE map
+        let (_, rows) = lib_materialize_select(stmt, storage, &cte_map)?;
+        return Ok(format!("({} rows)", rows.len()));
+    }
+
     let table_name = stmt.from.table_name().ok_or("Subquery FROM not supported here")?;
 
     // If FROM names a view, expand it by re-running the view's SELECT

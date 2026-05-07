@@ -163,6 +163,7 @@ pub struct SelectStatement {
     pub joins: Vec<JoinClause>,
     pub group_by: Vec<SelectColumn>,
     pub having: Option<WhereClause>,
+    pub window_defs: Vec<(String, WindowSpec)>,  // WINDOW clause named specs
     pub order_by: Vec<OrderByClause>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
@@ -247,6 +248,7 @@ pub struct FrameSpec {
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct WindowSpec {
+    pub base_window: Option<String>,   // e.g. "w" in OVER w or OVER (w ORDER BY ...)
     pub partition_by: Vec<Expression>,
     pub order_by: Vec<OrderByClause>,
     pub frame: Option<FrameSpec>,
@@ -1093,6 +1095,7 @@ pub fn parse_select_statement(input: &str) -> IResult<&str, SelectStatement> {
     let (input, where_clause) = nom::combinator::opt(parse_where)(input)?;
     let (input, group_by) = parse_group_by_clause(input)?;
     let (input, having) = parse_having_clause(input)?;
+    let (input, window_defs) = parse_window_clause(input)?;
     let (input, order_by) = parse_order_by_clause(input)?;
     let (input, (limit, offset)) = parse_limit_offset_clause(input)?;
 
@@ -1134,6 +1137,7 @@ pub fn parse_select_statement(input: &str) -> IResult<&str, SelectStatement> {
         joins,
         group_by,
         having,
+        window_defs,
         order_by,
         limit,
         offset,
@@ -1452,7 +1456,7 @@ fn parse_limit_offset_clause(input: &str) -> IResult<&str, (Option<u64>, Option<
 
 /// Check if identifier is a reserved keyword that can't be used as an alias
 fn is_reserved_keyword(s: &str) -> bool {
-    matches!(s.to_uppercase().as_str(), "ON" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "OUTER" | "CROSS" | "WHERE" | "ORDER" | "GROUP" | "LIMIT" | "OFFSET" | "HAVING" | "UNION" | "ALL" | "CASE" | "WHEN" | "THEN" | "ELSE" | "END" | "AND" | "OR" | "NOT" | "AS" | "VIEW" | "OVER" | "PARTITION" | "NULLS" | "FIRST" | "LAST" | "INTERSECT" | "EXCEPT" | "ROWS" | "RANGE" | "GROUPS" | "PRECEDING" | "FOLLOWING" | "UNBOUNDED" | "BETWEEN" | "USING" | "NATURAL" | "ANY" | "SOME" | "FILTER" | "RECURSIVE" | "CURRENT_DATE" | "CURRENT_TIMESTAMP" | "EXTRACT" | "INTERVAL" | "DATEDIFF" | "DATE_TRUNC" | "DATE_PART" | "DATEADD")
+    matches!(s.to_uppercase().as_str(), "ON" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "OUTER" | "CROSS" | "WHERE" | "ORDER" | "GROUP" | "LIMIT" | "OFFSET" | "HAVING" | "UNION" | "ALL" | "CASE" | "WHEN" | "THEN" | "ELSE" | "END" | "AND" | "OR" | "NOT" | "AS" | "VIEW" | "OVER" | "PARTITION" | "NULLS" | "FIRST" | "LAST" | "INTERSECT" | "EXCEPT" | "ROWS" | "RANGE" | "GROUPS" | "PRECEDING" | "FOLLOWING" | "UNBOUNDED" | "BETWEEN" | "USING" | "NATURAL" | "ANY" | "SOME" | "FILTER" | "RECURSIVE" | "CURRENT_DATE" | "CURRENT_TIMESTAMP" | "EXTRACT" | "INTERVAL" | "DATEDIFF" | "DATE_TRUNC" | "DATE_PART" | "DATEADD" | "WINDOW")
 }
 
 /// Parse optional table alias, rejecting reserved keywords
@@ -2369,8 +2373,40 @@ fn parse_expression_interval(input: &str) -> IResult<&str, Expression> {
     Ok((input, Expression::Literal(Value::Int(n * secs))))
 }
 
+/// Parse optional WINDOW clause: WINDOW name AS (...), name2 AS (...)
+fn parse_window_clause(input: &str) -> IResult<&str, Vec<(String, WindowSpec)>> {
+    let (input, _) = multispace0(input)?;
+    if let Ok((input2, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("WINDOW")(input) {
+        // Require whitespace after WINDOW so "windowfn" isn't matched
+        let (input2, _) = multispace1(input2)?;
+        let (input2, defs) = nom::multi::separated_list1(
+            nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+            parse_named_window_def,
+        )(input2)?;
+        Ok((input2, defs))
+    } else {
+        Ok((input, Vec::new()))
+    }
+}
+
+/// Parse one named window definition: name AS (window_spec)
+fn parse_named_window_def(input: &str) -> IResult<&str, (String, WindowSpec)> {
+    let (input, _) = multispace0(input)?;
+    let (input, name) = parse_identifier(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, _) = tag_no_case("AS")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, spec) = parse_window_spec(input)?;
+    Ok((input, (name.to_string(), spec)))
+}
+
 fn parse_window_spec(input: &str) -> IResult<&str, WindowSpec> {
     let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+
+    // Check for an optional base window name (identifier before PARTITION/ORDER/frame keywords)
+    let (input, base_window) = try_parse_base_window_name(input)?;
+
     let (input, _) = multispace0(input)?;
 
     // Optional PARTITION BY
@@ -2411,7 +2447,25 @@ fn parse_window_spec(input: &str) -> IResult<&str, WindowSpec> {
     let (input, frame) = parse_window_frame(input)?;
     let (input, _) = multispace0(input)?;
     let (input, _) = nom_char(')')(input)?;
-    Ok((input, WindowSpec { partition_by, order_by, frame }))
+    Ok((input, WindowSpec { base_window, partition_by, order_by, frame }))
+}
+
+/// Try to parse a base window name at the start of a window spec.
+/// Returns Some(name) only if the identifier is not a window-spec keyword.
+fn try_parse_base_window_name(input: &str) -> IResult<&str, Option<String>> {
+    // Keywords that can start a window spec clause (not a base window name)
+    const WINDOW_SPEC_KEYWORDS: &[&str] = &["PARTITION", "ORDER", "ROWS", "RANGE", "GROUPS", "BY"];
+    if let Ok((rest, name)) = parse_identifier(input) {
+        let upper = name.to_uppercase();
+        if !WINDOW_SPEC_KEYWORDS.contains(&upper.as_str()) {
+            // Not followed by '(' — that would make it look like a function call
+            let next = rest.trim_start();
+            if !next.starts_with('(') {
+                return Ok((rest, Some(name.to_string())));
+            }
+        }
+    }
+    Ok((input, None))
 }
 
 fn parse_frame_bound(input: &str) -> IResult<&str, FrameBound> {
@@ -2576,6 +2630,23 @@ fn parse_expression_window(input: &str) -> IResult<&str, Expression> {
     // OVER is mandatory — if missing this parser fails and alt tries next option
     let (input, _) = multispace1(input)?;
     let (input, _) = tag_no_case("OVER")(input)?;
+    let (input, _) = multispace1(input)?;
+
+    // Try bare identifier first: OVER w (not followed by '(')
+    if let Ok((rest, name)) = parse_identifier(input) {
+        let next = rest.trim_start();
+        if !next.starts_with('(') && !is_reserved_keyword(name) {
+            let spec = WindowSpec {
+                base_window: Some(name.to_string()),
+                partition_by: Vec::new(),
+                order_by: Vec::new(),
+                frame: None,
+            };
+            return Ok((rest, Expression::Window(func, spec)));
+        }
+    }
+
+    // Otherwise parse a full window spec with parens: OVER (...)
     let (input, _) = multispace0(input)?;
     let (input, spec) = parse_window_spec(input)?;
     Ok((input, Expression::Window(func, spec)))

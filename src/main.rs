@@ -904,6 +904,39 @@ fn prepare_rows(
     Some((combined_cols, filtered_rows))
 }
 
+/// Resolve a window spec by merging with its base named window (if any).
+fn resolve_window_spec(
+    spec: &parser::WindowSpec,
+    window_defs: &[(String, parser::WindowSpec)],
+) -> parser::WindowSpec {
+    let base = spec.base_window.as_ref().and_then(|name| {
+        window_defs.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, s)| s)
+    });
+    match base {
+        None => spec.clone(),
+        Some(base_spec) => {
+            // Merge: spec's own clauses override/extend the base
+            let partition_by = if spec.partition_by.is_empty() {
+                base_spec.partition_by.clone()
+            } else {
+                spec.partition_by.clone()
+            };
+            let order_by = if spec.order_by.is_empty() {
+                base_spec.order_by.clone()
+            } else {
+                spec.order_by.clone()
+            };
+            let frame = spec.frame.clone().or_else(|| base_spec.frame.clone());
+            parser::WindowSpec {
+                base_window: None,
+                partition_by,
+                order_by,
+                frame,
+            }
+        }
+    }
+}
+
 /// Compute all window function expressions in `columns`, appending results as virtual
 /// columns to each row. Returns updated (select_columns, rows, combined_cols).
 fn materialize_window_functions(
@@ -911,6 +944,7 @@ fn materialize_window_functions(
     mut rows: Vec<Vec<Value>>,
     mut combined_cols: Vec<ResultColumn>,
     storage: &Storage,
+    window_defs: &[(String, parser::WindowSpec)],
 ) -> (Vec<parser::SelectColumn>, Vec<Vec<Value>>, Vec<ResultColumn>) {
     // Collect unique window expressions with their position
     let mut win_exprs: Vec<parser::Expression> = Vec::new();
@@ -936,7 +970,8 @@ fn materialize_window_functions(
     // Compute values for each window expression and append as virtual columns
     for (win_idx, win_expr) in win_exprs.iter().enumerate() {
         if let parser::Expression::Window(func, spec) = win_expr {
-            let values = compute_window_values(func, spec, &rows, &combined_cols, storage);
+            let resolved = resolve_window_spec(spec, window_defs);
+            let values = compute_window_values(func, &resolved, &rows, &combined_cols, storage);
             combined_cols.push(ResultColumn {
                 table: String::new(),
                 name: format!("__win_{}", win_idx),
@@ -1139,9 +1174,9 @@ fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) -> (Vec<Str
         None => return (Vec::new(), Vec::new()),
     };
 
-    // Materialize window functions before projection
+    // Materialize window functions before projection, passing named window defs
     let (stmt_columns, filtered_rows, combined_cols) =
-        materialize_window_functions(&stmt.columns, filtered_rows, combined_cols, storage);
+        materialize_window_functions(&stmt.columns, filtered_rows, combined_cols, storage, &stmt.window_defs);
 
     // Check if any column is an aggregate or GROUP BY is present
     let has_aggregates = stmt_columns.iter().any(|c| matches!(c, parser::SelectColumn::Aggregate(_, _)));
@@ -1826,6 +1861,12 @@ fn format_expr(expr: &parser::Expression) -> String {
                     format!("{}({})", agg_name, column_header(col))
                 }
             };
+            // If it's a bare named window reference with no inline spec, format as "func OVER name"
+            if let Some(ref base_name) = spec.base_window {
+                if spec.partition_by.is_empty() && spec.order_by.is_empty() && spec.frame.is_none() {
+                    return format!("{} over {}", func_str, base_name);
+                }
+            }
             let part_str = if spec.partition_by.is_empty() {
                 String::new()
             } else {

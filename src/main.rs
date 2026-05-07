@@ -1520,6 +1520,18 @@ fn cmp_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Value::Float(a), Value::Int(b)) => a.partial_cmp(&(*b as f64)).unwrap_or(std::cmp::Ordering::Equal),
         (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
         (Value::String(a), Value::String(b)) => a.cmp(b),
+        (Value::Date(a), Value::Date(b)) => a.cmp(b),
+        (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
+        // Cross-type date comparisons
+        (Value::Date(a), Value::Timestamp(b)) => (*a as i64 * 86400).cmp(b),
+        (Value::Timestamp(a), Value::Date(b)) => a.cmp(&(*b as i64 * 86400)),
+        // Allow date/string comparison via coercion
+        (Value::Date(d), Value::String(s)) => {
+            if let Some(sd) = parser::parse_date_str(s) { d.cmp(&sd) } else { std::cmp::Ordering::Less }
+        }
+        (Value::String(s), Value::Date(d)) => {
+            if let Some(sd) = parser::parse_date_str(s) { sd.cmp(d) } else { std::cmp::Ordering::Greater }
+        }
         (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
         (Value::Null, _) => std::cmp::Ordering::Less,
         (_, Value::Null) => std::cmp::Ordering::Greater,
@@ -1763,6 +1775,14 @@ fn format_expr(expr: &parser::Expression) -> String {
                 parser::ScalarFunc::Sign => "sign",
                 parser::ScalarFunc::Trunc => "trunc",
                 parser::ScalarFunc::Reverse => "reverse",
+                parser::ScalarFunc::Year => "year",
+                parser::ScalarFunc::Month => "month",
+                parser::ScalarFunc::Day => "day",
+                parser::ScalarFunc::Hour => "hour",
+                parser::ScalarFunc::Minute => "minute",
+                parser::ScalarFunc::Second => "second",
+                parser::ScalarFunc::DayOfWeek => "dayofweek",
+                parser::ScalarFunc::DayOfYear => "dayofyear",
             };
             format!("{}({})", name, format_expr(inner))
         }
@@ -1839,6 +1859,12 @@ fn format_expr(expr: &parser::Expression) -> String {
         parser::Expression::Power(base, exp) => format!("power({}, {})", format_expr(base), format_expr(exp)),
         parser::Expression::Position(needle, haystack) => format!("position({} in {})", format_expr(needle), format_expr(haystack)),
         parser::Expression::Repeat(s, n) => format!("repeat({}, {})", format_expr(s), format_expr(n)),
+        parser::Expression::CurrentDate => "CURRENT_DATE".to_string(),
+        parser::Expression::CurrentTimestamp => "CURRENT_TIMESTAMP".to_string(),
+        parser::Expression::Extract(field, expr) => format!("EXTRACT({} FROM {})", field, format_expr(expr)),
+        parser::Expression::DateTrunc(field, expr) => format!("DATE_TRUNC('{}', {})", field.to_lowercase(), format_expr(expr)),
+        parser::Expression::DateDiff(unit, e1, e2) => format!("DATEDIFF({}, {}, {})", unit.to_lowercase(), format_expr(e1), format_expr(e2)),
+        parser::Expression::DateAdd(expr, n, unit) => format!("DATEADD({}, {}, {})", unit.to_lowercase(), n, format_expr(expr)),
         parser::Expression::Case(_, _) => "case".to_string(),
         parser::Expression::Aggregate(func, inner) => {
             let func_name = match func {
@@ -1872,6 +1898,8 @@ fn format_value(value: &Value) -> String {
         }
         Value::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
         Value::String(s) => s.clone(),
+        Value::Date(d) => parser::format_date(*d),
+        Value::Timestamp(ts) => parser::format_timestamp(*ts),
         Value::Null => "NULL".to_string(),
     }
 }
@@ -2232,6 +2260,116 @@ fn resolve_correlated_expr(
     }
 }
 
+/// Convert a Value to epoch days (for date arithmetic helpers)
+pub(crate) fn val_to_epoch_days(v: &Value) -> Option<i32> {
+    match v {
+        Value::Date(d) => Some(*d),
+        Value::Timestamp(ts) => Some((*ts / 86400) as i32),
+        Value::String(s) => parser::parse_date_str(s),
+        _ => None,
+    }
+}
+
+/// Evaluate EXTRACT(field FROM value)
+pub(crate) fn eval_extract(field: &str, v: Value) -> Option<Value> {
+    let days = match &v {
+        Value::Date(d) => *d,
+        Value::Timestamp(ts) => (*ts / 86400) as i32,
+        Value::String(s) => parser::parse_date_str(s)
+            .or_else(|| parser::parse_timestamp_str(s).map(|ts| (ts / 86400) as i32))?,
+        _ => return None,
+    };
+    let (y, m, d) = parser::epoch_days_to_date(days);
+    match field {
+        "YEAR"  => Some(Value::Int(y as i64)),
+        "MONTH" => Some(Value::Int(m as i64)),
+        "DAY" | "DAY_OF_MONTH" => Some(Value::Int(d as i64)),
+        "HOUR"   => if let Value::Timestamp(ts) = v { Some(Value::Int((ts % 86400) / 3600)) } else { Some(Value::Int(0)) },
+        "MINUTE" => if let Value::Timestamp(ts) = v { Some(Value::Int((ts % 86400 % 3600) / 60)) } else { Some(Value::Int(0)) },
+        "SECOND" => if let Value::Timestamp(ts) = v { Some(Value::Int(ts % 60)) } else { Some(Value::Int(0)) },
+        "DOW" | "DAY_OF_WEEK" => Some(Value::Int(((days % 7 + 4) % 7) as i64)),
+        "DOY" | "DAY_OF_YEAR" => {
+            let jan1 = parser::date_to_epoch_days(y, 1, 1);
+            Some(Value::Int((days - jan1 + 1) as i64))
+        }
+        "QUARTER" => Some(Value::Int(((m - 1) / 3 + 1) as i64)),
+        "WEEK" => {
+            let jan1 = parser::date_to_epoch_days(y, 1, 1);
+            Some(Value::Int(((days - jan1) / 7 + 1) as i64))
+        }
+        _ => None,
+    }
+}
+
+/// Evaluate DATE_TRUNC(unit, value)
+pub(crate) fn eval_date_trunc(field: &str, v: Value) -> Option<Value> {
+    let days = match &v {
+        Value::Date(d) => *d,
+        Value::Timestamp(ts) => (*ts / 86400) as i32,
+        Value::String(s) => parser::parse_date_str(s)?,
+        _ => return None,
+    };
+    let (y, m, _d) = parser::epoch_days_to_date(days);
+    let truncated_days = match field {
+        "YEAR"    => parser::date_to_epoch_days(y, 1, 1),
+        "MONTH"   => parser::date_to_epoch_days(y, m, 1),
+        "DAY"     => days,
+        "WEEK"    => { let dow = ((days % 7 + 4) % 7) as i32; days - dow }
+        "QUARTER" => { let q_month = ((m - 1) / 3) * 3 + 1; parser::date_to_epoch_days(y, q_month, 1) }
+        _ => return None,
+    };
+    match &v {
+        Value::Date(_)      => Some(Value::Date(truncated_days)),
+        Value::Timestamp(_) => Some(Value::Timestamp(truncated_days as i64 * 86400)),
+        _                   => Some(Value::Date(truncated_days)),
+    }
+}
+
+/// Evaluate DATEDIFF(unit, v1, v2) — returns v1 - v2 in the given unit
+pub(crate) fn eval_datediff(unit: &str, v1: Value, v2: Value) -> Option<Value> {
+    let days1 = val_to_epoch_days(&v1)?;
+    let days2 = val_to_epoch_days(&v2)?;
+    let diff_days = (days1 - days2) as i64;
+    let result = match unit.to_uppercase().as_str() {
+        "DAY" | "DD" | "DAYS" => diff_days,
+        "WEEK" | "WEEKS" => diff_days / 7,
+        "MONTH" | "MONTHS" => {
+            let (y1, m1, _) = parser::epoch_days_to_date(days1);
+            let (y2, m2, _) = parser::epoch_days_to_date(days2);
+            ((y1 - y2) * 12 + (m1 - m2)) as i64
+        }
+        "YEAR" | "YY" | "YEARS" => {
+            let (y1, _, _) = parser::epoch_days_to_date(days1);
+            let (y2, _, _) = parser::epoch_days_to_date(days2);
+            (y1 - y2) as i64
+        }
+        "HOUR" | "HOURS" => diff_days * 24,
+        "MINUTE" | "MINUTES" => diff_days * 1440,
+        "SECOND" | "SECONDS" => diff_days * 86400,
+        _ => return None,
+    };
+    Some(Value::Int(result))
+}
+
+/// Evaluate DATEADD(date, n, unit) — shift a date/timestamp by n units
+pub(crate) fn eval_dateadd(v: Value, n: i64, unit: &str) -> Option<Value> {
+    let secs_per_unit: i64 = match unit.to_uppercase().as_str() {
+        "SECOND" | "SECONDS" => 1,
+        "MINUTE" | "MINUTES" => 60,
+        "HOUR" | "HOURS" => 3600,
+        "DAY" | "DAYS" => 86400,
+        "WEEK" | "WEEKS" => 604800,
+        "MONTH" | "MONTHS" => 2592000,
+        "YEAR" | "YEARS" => 31536000,
+        _ => return None,
+    };
+    match v {
+        Value::Date(d) => Some(Value::Date((d as i64 + n * secs_per_unit / 86400) as i32)),
+        Value::Timestamp(ts) => Some(Value::Timestamp(ts + n * secs_per_unit)),
+        _ => None,
+    }
+}
+
 fn resolve_join_expression(
     expr: &parser::Expression,
     row: &[Value],
@@ -2350,6 +2488,26 @@ fn resolve_join_expression(
             let nv = resolve_join_expression(n, row, cols, storage)?;
             parser::apply_repeat(sv, nv)
         }
+        // Date/time expressions
+        parser::Expression::CurrentDate => Some(Value::Date(parser::current_epoch_days())),
+        parser::Expression::CurrentTimestamp => Some(Value::Timestamp(parser::current_epoch_secs())),
+        parser::Expression::Extract(field, expr) => {
+            let v = resolve_join_expression(expr, row, cols, storage)?;
+            eval_extract(field, v)
+        }
+        parser::Expression::DateTrunc(field, expr) => {
+            let v = resolve_join_expression(expr, row, cols, storage)?;
+            eval_date_trunc(field, v)
+        }
+        parser::Expression::DateDiff(unit, e1, e2) => {
+            let v1 = resolve_join_expression(e1, row, cols, storage)?;
+            let v2 = resolve_join_expression(e2, row, cols, storage)?;
+            eval_datediff(unit, v1, v2)
+        }
+        parser::Expression::DateAdd(date_expr, n, unit) => {
+            let v = resolve_join_expression(date_expr, row, cols, storage)?;
+            eval_dateadd(v, *n, unit)
+        }
     }
 }
 
@@ -2379,6 +2537,8 @@ fn eval_arith(left: &Value, op: &parser::ArithOp, right: &Value) -> Option<Value
             Value::Float(f) => format!("{}", f),
             Value::Null => return Some(Value::Null),
             Value::Bool(b) => b.to_string(),
+            Value::Date(d) => parser::format_date(*d),
+            Value::Timestamp(ts) => parser::format_timestamp(*ts),
         };
         let rs = match right {
             Value::String(s) => s.clone(),
@@ -2386,10 +2546,34 @@ fn eval_arith(left: &Value, op: &parser::ArithOp, right: &Value) -> Option<Value
             Value::Float(f) => format!("{}", f),
             Value::Null => return Some(Value::Null),
             Value::Bool(b) => b.to_string(),
+            Value::Date(d) => parser::format_date(*d),
+            Value::Timestamp(ts) => parser::format_timestamp(*ts),
         };
         return Some(Value::String(ls + &rs));
     }
     match (left, right) {
+        // Date +/- Int: treat int as days
+        (Value::Date(d), Value::Int(n)) => match op {
+            parser::ArithOp::Add => Some(Value::Date(d + *n as i32)),
+            parser::ArithOp::Sub => Some(Value::Date(d - *n as i32)),
+            _ => None,
+        },
+        // Date - Date: days between
+        (Value::Date(d1), Value::Date(d2)) => match op {
+            parser::ArithOp::Sub => Some(Value::Int((*d1 - *d2) as i64)),
+            _ => None,
+        },
+        // Timestamp +/- Int: treat int as seconds
+        (Value::Timestamp(ts), Value::Int(n)) => match op {
+            parser::ArithOp::Add => Some(Value::Timestamp(ts + n)),
+            parser::ArithOp::Sub => Some(Value::Timestamp(ts - n)),
+            _ => None,
+        },
+        // Timestamp - Timestamp: seconds between
+        (Value::Timestamp(ts1), Value::Timestamp(ts2)) => match op {
+            parser::ArithOp::Sub => Some(Value::Int(ts1 - ts2)),
+            _ => None,
+        },
         (Value::Int(l), Value::Int(r)) => {
             match op {
                 parser::ArithOp::Add => Some(Value::Int(l + r)),
@@ -2421,11 +2605,30 @@ fn compare_numeric(l: f64, r: f64, op: &parser::Operator) -> bool {
 }
 
 fn compare_values(left: &Value, op: &parser::Operator, right: &Value) -> bool {
+    // Use cmp_values for ordering-based comparisons between comparable types
+    let ordering = cmp_values(left, right);
+    // For types that have natural ordering, use cmp_values
     match (left, right) {
-        (Value::Int(l), Value::Int(r)) => compare_numeric(*l as f64, *r as f64, op),
-        (Value::Float(l), Value::Float(r)) => compare_numeric(*l, *r, op),
-        (Value::Int(l), Value::Float(r)) => compare_numeric(*l as f64, *r, op),
-        (Value::Float(l), Value::Int(r)) => compare_numeric(*l, *r as f64, op),
+        (Value::Int(_), Value::Int(_))
+        | (Value::Float(_), Value::Float(_))
+        | (Value::Int(_), Value::Float(_))
+        | (Value::Float(_), Value::Int(_))
+        | (Value::Date(_), Value::Date(_))
+        | (Value::Timestamp(_), Value::Timestamp(_))
+        | (Value::Date(_), Value::Timestamp(_))
+        | (Value::Timestamp(_), Value::Date(_))
+        | (Value::Date(_), Value::String(_))
+        | (Value::String(_), Value::Date(_)) => {
+            match op {
+                parser::Operator::Equals            => ordering == std::cmp::Ordering::Equal,
+                parser::Operator::NotEquals         => ordering != std::cmp::Ordering::Equal,
+                parser::Operator::GreaterThan       => ordering == std::cmp::Ordering::Greater,
+                parser::Operator::LessThan          => ordering == std::cmp::Ordering::Less,
+                parser::Operator::GreaterThanOrEqual=> ordering != std::cmp::Ordering::Less,
+                parser::Operator::LessThanOrEqual   => ordering != std::cmp::Ordering::Greater,
+                _ => false,
+            }
+        }
         (Value::Bool(l), Value::Bool(r)) => match op {
             parser::Operator::Equals => l == r,
             parser::Operator::NotEquals => l != r,

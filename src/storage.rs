@@ -159,6 +159,23 @@ impl Storage {
             }
         }
 
+        // Coerce string literals into Date/Timestamp values when the column type requires it
+        for (i, col_def) in schema.columns.iter().enumerate() {
+            match (&final_values[i], &col_def.data_type) {
+                (Value::String(s), DataType::Date) => {
+                    if let Some(days) = crate::parser::parse_date_str(s) {
+                        final_values[i] = Value::Date(days);
+                    }
+                }
+                (Value::String(s), DataType::Timestamp) => {
+                    if let Some(secs) = crate::parser::parse_timestamp_str(s) {
+                        final_values[i] = Value::Timestamp(secs);
+                    }
+                }
+                _ => {}
+            }
+        }
+
         // Validate types
         for (value, col_def) in final_values.iter().zip(schema.columns.iter()) {
             validate_value_type(value, &col_def.data_type, &col_def.name)?;
@@ -1153,6 +1170,8 @@ fn validate_value_type(value: &Value, data_type: &DataType, column_name: &str) -
         (Value::Float(_), DataType::Float) => Ok(()),
         (Value::Float(_), DataType::Double) => Ok(()),
         (Value::Bool(_), DataType::Boolean) => Ok(()),
+        (Value::Date(_), DataType::Date) => Ok(()),
+        (Value::Timestamp(_), DataType::Timestamp) => Ok(()),
         (Value::String(s), DataType::Date) => {
             validate_date_format(s, column_name)
         }
@@ -1544,6 +1563,168 @@ fn resolve_expression(expr: &Expression, row: &[Value], schema: &[ColumnDefiniti
             let nv = resolve_expression(n, row, schema, storage)?;
             apply_repeat(sv, nv)
         }
+        Expression::CurrentDate => Some(Value::Date(crate::parser::current_epoch_days())),
+        Expression::CurrentTimestamp => Some(Value::Timestamp(crate::parser::current_epoch_secs())),
+        Expression::Extract(field, inner) => {
+            let v = resolve_expression(inner, row, schema, storage)?;
+            storage_eval_extract(field, v)
+        }
+        Expression::DateTrunc(unit, inner) => {
+            let v = resolve_expression(inner, row, schema, storage)?;
+            storage_eval_date_trunc(unit, v)
+        }
+        Expression::DateDiff(unit, e1, e2) => {
+            let v1 = resolve_expression(e1, row, schema, storage)?;
+            let v2 = resolve_expression(e2, row, schema, storage)?;
+            storage_eval_datediff(unit, v1, v2)
+        }
+        Expression::DateAdd(inner, n, unit) => {
+            let v = resolve_expression(inner, row, schema, storage)?;
+            storage_eval_dateadd(v, *n, unit)
+        }
+    }
+}
+
+// Extract a date/time field from a Date or Timestamp value
+fn storage_eval_extract(field: &str, v: Value) -> Option<Value> {
+    let f = field.to_uppercase();
+    let (days, secs_in_day) = match &v {
+        Value::Date(d) => (*d, 0i64),
+        Value::Timestamp(ts) => {
+            let d = (*ts / 86400) as i32;
+            let s = ts.rem_euclid(86400);
+            (d, s)
+        }
+        Value::String(s) => {
+            if let Some(d) = crate::parser::parse_date_str(s) { (d, 0) }
+            else if let Some(ts) = crate::parser::parse_timestamp_str(s) {
+                let d = (ts / 86400) as i32;
+                let s2 = ts.rem_euclid(86400);
+                (d, s2)
+            } else { return None; }
+        }
+        _ => return None,
+    };
+    let (year, month, day) = crate::parser::epoch_days_to_date(days);
+    let hour = secs_in_day / 3600;
+    let minute = (secs_in_day % 3600) / 60;
+    let second = secs_in_day % 60;
+    match f.as_str() {
+        "YEAR" => Some(Value::Int(year as i64)),
+        "MONTH" => Some(Value::Int(month as i64)),
+        "DAY" => Some(Value::Int(day as i64)),
+        "HOUR" => Some(Value::Int(hour)),
+        "MINUTE" => Some(Value::Int(minute)),
+        "SECOND" => Some(Value::Int(second)),
+        "DOW" | "DAYOFWEEK" => {
+            // day of week: 0=Sunday using Tomohiko Sakamoto-style; epoch day 0 = Thursday
+            let dow = ((days as i64 + 4).rem_euclid(7)) as i64;
+            Some(Value::Int(dow))
+        }
+        "DOY" | "DAYOFYEAR" => {
+            let jan1 = crate::parser::date_to_epoch_days(year, 1, 1);
+            Some(Value::Int((days - jan1 + 1) as i64))
+        }
+        _ => None,
+    }
+}
+
+// Truncate a date/timestamp to the given unit
+fn storage_eval_date_trunc(unit: &str, v: Value) -> Option<Value> {
+    let u = unit.to_uppercase();
+    let (days, secs_in_day) = match &v {
+        Value::Date(d) => (*d, 0i64),
+        Value::Timestamp(ts) => {
+            let d = (*ts / 86400) as i32;
+            let s = ts.rem_euclid(86400);
+            (d, s)
+        }
+        _ => return None,
+    };
+    let (year, month, _day) = crate::parser::epoch_days_to_date(days);
+    match u.as_str() {
+        "YEAR" => Some(Value::Date(crate::parser::date_to_epoch_days(year, 1, 1))),
+        "MONTH" => Some(Value::Date(crate::parser::date_to_epoch_days(year, month, 1))),
+        "DAY" => Some(Value::Date(days)),
+        "HOUR" => {
+            let base = days as i64 * 86400;
+            Some(Value::Timestamp(base + (secs_in_day / 3600) * 3600))
+        }
+        "MINUTE" => {
+            let base = days as i64 * 86400;
+            Some(Value::Timestamp(base + (secs_in_day / 60) * 60))
+        }
+        _ => None,
+    }
+}
+
+// Compute difference between two dates/timestamps in the given unit
+fn storage_eval_datediff(unit: &str, v1: Value, v2: Value) -> Option<Value> {
+    let u = unit.to_uppercase();
+    let to_days = |v: Value| -> Option<i32> {
+        match v {
+            Value::Date(d) => Some(d),
+            Value::Timestamp(ts) => Some((ts / 86400) as i32),
+            Value::String(s) => crate::parser::parse_date_str(&s)
+                .or_else(|| crate::parser::parse_timestamp_str(&s).map(|ts| (ts / 86400) as i32)),
+            _ => None,
+        }
+    };
+    let to_secs = |v: Value| -> Option<i64> {
+        match v {
+            Value::Date(d) => Some(d as i64 * 86400),
+            Value::Timestamp(ts) => Some(ts),
+            Value::String(s) => crate::parser::parse_timestamp_str(&s)
+                .or_else(|| crate::parser::parse_date_str(&s).map(|d| d as i64 * 86400)),
+            _ => None,
+        }
+    };
+    match u.as_str() {
+        "DAY" => Some(Value::Int((to_days(v1)? - to_days(v2)?) as i64)),
+        "HOUR" => Some(Value::Int((to_secs(v1)? - to_secs(v2)?) / 3600)),
+        "MINUTE" => Some(Value::Int((to_secs(v1)? - to_secs(v2)?) / 60)),
+        "SECOND" => Some(Value::Int(to_secs(v1)? - to_secs(v2)?)),
+        "MONTH" => {
+            let d1 = to_days(v1)?;
+            let d2 = to_days(v2)?;
+            let (y1, m1, _) = crate::parser::epoch_days_to_date(d1);
+            let (y2, m2, _) = crate::parser::epoch_days_to_date(d2);
+            Some(Value::Int(((y1 - y2) * 12 + (m1 - m2)) as i64))
+        }
+        "YEAR" => {
+            let d1 = to_days(v1)?;
+            let d2 = to_days(v2)?;
+            let (y1, _, _) = crate::parser::epoch_days_to_date(d1);
+            let (y2, _, _) = crate::parser::epoch_days_to_date(d2);
+            Some(Value::Int((y1 - y2) as i64))
+        }
+        _ => None,
+    }
+}
+
+// Add an interval (n units) to a date/timestamp
+fn storage_eval_dateadd(v: Value, n: i64, unit: &str) -> Option<Value> {
+    let secs = crate::parser::interval_unit_secs(unit)?;
+    let total = secs * n;
+    match v {
+        Value::Date(d) => {
+            // If unit is days or coarser, keep as Date; otherwise promote to Timestamp
+            let u = unit.to_uppercase();
+            if matches!(u.as_str(), "HOUR" | "MINUTE" | "SECOND") {
+                Some(Value::Timestamp(d as i64 * 86400 + total))
+            } else {
+                Some(Value::Date((d as i64 + total / 86400) as i32))
+            }
+        }
+        Value::Timestamp(ts) => Some(Value::Timestamp(ts + total)),
+        Value::String(s) => {
+            if let Some(d) = crate::parser::parse_date_str(&s) {
+                storage_eval_dateadd(Value::Date(d), n, unit)
+            } else if let Some(ts) = crate::parser::parse_timestamp_str(&s) {
+                Some(Value::Timestamp(ts + total))
+            } else { None }
+        }
+        _ => None,
     }
 }
 
@@ -1584,6 +1765,31 @@ fn compare_values(left: &Value, op: &Operator, right: &Value) -> bool {
             Operator::LessThanOrEqual => l <= r,
             _ => false,
         },
+        // Date comparisons
+        (Value::Date(a), Value::Date(b)) => compare_numeric(*a as f64, *b as f64, op),
+        (Value::Timestamp(a), Value::Timestamp(b)) => compare_numeric(*a as f64, *b as f64, op),
+        (Value::Date(a), Value::Timestamp(b)) => compare_numeric((*a as i64 * 86400) as f64, *b as f64, op),
+        (Value::Timestamp(a), Value::Date(b)) => compare_numeric(*a as f64, (*b as i64 * 86400) as f64, op),
+        (Value::Date(d), Value::String(s)) => {
+            if let Some(rd) = crate::parser::parse_date_str(s) {
+                compare_numeric(*d as f64, rd as f64, op)
+            } else { false }
+        }
+        (Value::String(s), Value::Date(d)) => {
+            if let Some(ld) = crate::parser::parse_date_str(s) {
+                compare_numeric(ld as f64, *d as f64, op)
+            } else { false }
+        }
+        (Value::Timestamp(ts), Value::String(s)) => {
+            if let Some(rts) = crate::parser::parse_timestamp_str(s) {
+                compare_numeric(*ts as f64, rts as f64, op)
+            } else { false }
+        }
+        (Value::String(s), Value::Timestamp(ts)) => {
+            if let Some(lts) = crate::parser::parse_timestamp_str(s) {
+                compare_numeric(lts as f64, *ts as f64, op)
+            } else { false }
+        }
         (Value::Null, Value::Null) => match op {
             Operator::Equals => true,
             Operator::NotEquals => false,
@@ -1602,6 +1808,8 @@ fn storage_eval_arith(left: &Value, op: &ArithOp, right: &Value) -> Option<Value
             Value::Float(f) => format!("{}", f),
             Value::Null => return Some(Value::Null),
             Value::Bool(b) => b.to_string(),
+            Value::Date(d) => crate::parser::format_date(*d),
+            Value::Timestamp(ts) => crate::parser::format_timestamp(*ts),
         };
         let rs = match right {
             Value::String(s) => s.clone(),
@@ -1609,6 +1817,8 @@ fn storage_eval_arith(left: &Value, op: &ArithOp, right: &Value) -> Option<Value
             Value::Float(f) => format!("{}", f),
             Value::Null => return Some(Value::Null),
             Value::Bool(b) => b.to_string(),
+            Value::Date(d) => crate::parser::format_date(*d),
+            Value::Timestamp(ts) => crate::parser::format_timestamp(*ts),
         };
         return Some(Value::String(ls + &rs));
     }
@@ -1626,6 +1836,28 @@ fn storage_eval_arith(left: &Value, op: &ArithOp, right: &Value) -> Option<Value
         (Value::Float(l), Value::Float(r)) => storage_arith_f64(*l, op, *r),
         (Value::Int(l), Value::Float(r)) => storage_arith_f64(*l as f64, op, *r),
         (Value::Float(l), Value::Int(r)) => storage_arith_f64(*l, op, *r as f64),
+        // Date + Int / Date - Int → shift by days
+        (Value::Date(d), Value::Int(n)) => match op {
+            ArithOp::Add => Some(Value::Date(d + *n as i32)),
+            ArithOp::Sub => Some(Value::Date(d - *n as i32)),
+            _ => Some(Value::Null),
+        },
+        // Date - Date → difference in days
+        (Value::Date(a), Value::Date(b)) => match op {
+            ArithOp::Sub => Some(Value::Int((a - b) as i64)),
+            _ => Some(Value::Null),
+        },
+        // Timestamp + Int / Timestamp - Int → shift by seconds
+        (Value::Timestamp(ts), Value::Int(n)) => match op {
+            ArithOp::Add => Some(Value::Timestamp(ts + n)),
+            ArithOp::Sub => Some(Value::Timestamp(ts - n)),
+            _ => Some(Value::Null),
+        },
+        // Timestamp - Timestamp → difference in seconds
+        (Value::Timestamp(a), Value::Timestamp(b)) => match op {
+            ArithOp::Sub => Some(Value::Int(a - b)),
+            _ => Some(Value::Null),
+        },
         _ => Some(Value::Null),
     }
 }
@@ -1684,6 +1916,8 @@ fn serialize_value(v: &Value) -> String {
                 .replace('\n', "\\n");
             format!("STRING:{}", escaped)
         }
+        Value::Date(d) => format!("DATE:{}", d),
+        Value::Timestamp(ts) => format!("TIMESTAMP:{}", ts),
         Value::Null => "NULL".to_string(),
     }
 }
@@ -1743,6 +1977,14 @@ fn deserialize_row(s: &str) -> Result<Vec<Value>, StorageError> {
                 .replace("\\|", "|")
                 .replace("\\\\", "\\");
             values.push(Value::String(unescaped));
+        } else if let Some(date_str) = part.strip_prefix("DATE:") {
+            let d = date_str.parse::<i32>()
+                .map_err(|_| StorageError::InvalidData(format!("Invalid date epoch: {}", date_str)))?;
+            values.push(Value::Date(d));
+        } else if let Some(ts_str) = part.strip_prefix("TIMESTAMP:") {
+            let ts = ts_str.parse::<i64>()
+                .map_err(|_| StorageError::InvalidData(format!("Invalid timestamp epoch: {}", ts_str)))?;
+            values.push(Value::Timestamp(ts));
         } else {
             return Err(StorageError::InvalidData(format!("Invalid value format: {}", part)));
         }
@@ -2564,7 +2806,8 @@ mod tests {
         storage.insert_row(&insert).unwrap();
 
         let rows = storage.read_rows("events").unwrap();
-        assert_eq!(rows[0][1], Value::String("2024-03-15".to_string()));
+        // String "2024-03-15" is coerced to Date on insert; 2024-03-15 = 19797 days since epoch
+        assert_eq!(rows[0][1], Value::Date(19797));
 
         // invalid date should fail
         let bad_insert = InsertStatement {
@@ -2598,12 +2841,13 @@ mod tests {
         storage.insert_row(&insert).unwrap();
 
         let rows = storage.read_rows("logs").unwrap();
-        assert_eq!(rows[0][1], Value::String("2024-03-15 14:30:00".to_string()));
+        // String is coerced to Timestamp on insert; 2024-03-15 14:30:00 UTC = 1710513000 secs
+        assert_eq!(rows[0][1], Value::Timestamp(1710513000));
 
-        // invalid timestamp should fail
+        // a completely invalid timestamp string should fail
         let bad_insert = InsertStatement {
             table_name: "logs".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::String("bad".to_string()), Value::String("2024-03-15".to_string())]),
+            source: crate::parser::InsertSource::Values(vec![Value::String("bad".to_string()), Value::String("not-a-timestamp".to_string())]),
         };
         assert!(storage.insert_row(&bad_insert).is_err());
 

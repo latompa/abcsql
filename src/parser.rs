@@ -277,6 +277,15 @@ pub enum ScalarFunc {
     Sign,
     Trunc,
     Reverse,
+    // Date extraction functions
+    Year,
+    Month,
+    Day,
+    Hour,
+    Minute,
+    Second,
+    DayOfWeek,
+    DayOfYear,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -386,6 +395,17 @@ pub enum Expression {
     Repeat(Box<Expression>, Box<Expression>),
     // Window function: func() OVER (PARTITION BY ... ORDER BY ...)
     Window(WindowFunc, WindowSpec),
+    // Date/time expressions
+    CurrentDate,
+    CurrentTimestamp,
+    // EXTRACT(field FROM expr) or DATE_PART('field', expr)
+    Extract(String, Box<Expression>),
+    // DATE_TRUNC('unit', expr)
+    DateTrunc(String, Box<Expression>),
+    // DATEDIFF(unit, date1, date2) → integer difference
+    DateDiff(String, Box<Expression>, Box<Expression>),
+    // DATEADD(unit, n, date) → shifted date/timestamp
+    DateAdd(Box<Expression>, i64, String),
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -426,7 +446,108 @@ pub enum Value {
     Float(f64),
     Bool(bool),
     String(String),
+    Date(i32),       // days since 1970-01-01
+    Timestamp(i64),  // seconds since 1970-01-01 00:00:00 UTC
     Null,
+}
+
+/// Calendar math helpers — no external dependencies needed
+
+pub fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+}
+
+pub fn days_in_month(year: i32, month: i32) -> i32 {
+    match month {
+        1|3|5|7|8|10|12 => 31,
+        4|6|9|11 => 30,
+        2 => if is_leap_year(year) { 29 } else { 28 },
+        _ => 0,
+    }
+}
+
+/// Days since 1970-01-01 (civil calendar algorithm)
+pub fn date_to_epoch_days(y: i32, m: i32, d: i32) -> i32 {
+    let (y, m) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * m + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+pub fn epoch_days_to_date(z: i32) -> (i32, i32, i32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365*yoe + yoe/4 - yoe/100);
+    let mp = (5*doy + 2) / 153;
+    let d = doy - (153*mp + 2)/5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+/// Parse "YYYY-MM-DD" string into epoch days; returns None on parse failure
+pub fn parse_date_str(s: &str) -> Option<i32> {
+    let s = s.trim();
+    let parts: Vec<&str> = s.splitn(3, '-').collect();
+    if parts.len() != 3 { return None; }
+    let y: i32 = parts[0].parse().ok()?;
+    let m: i32 = parts[1].parse().ok()?;
+    let d: i32 = parts[2].parse().ok()?;
+    if m < 1 || m > 12 || d < 1 || d > 31 { return None; }
+    Some(date_to_epoch_days(y, m, d))
+}
+
+/// Parse "YYYY-MM-DD HH:MM:SS" or "YYYY-MM-DDTHH:MM:SS" into epoch seconds
+pub fn parse_timestamp_str(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (date_part, time_part) = if let Some(p) = s.find(' ') {
+        (&s[..p], &s[p+1..])
+    } else if let Some(p) = s.find('T') {
+        (&s[..p], &s[p+1..])
+    } else {
+        // date only → midnight
+        return parse_date_str(s).map(|d| d as i64 * 86400);
+    };
+    let days = parse_date_str(date_part)? as i64;
+    let tparts: Vec<&str> = time_part.splitn(3, ':').collect();
+    let h: i64 = tparts.get(0).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let m: i64 = tparts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let sec_str = tparts.get(2).copied().unwrap_or("0");
+    let sec_str = sec_str.split('.').next().unwrap_or("0");
+    let sec: i64 = sec_str.parse().unwrap_or(0);
+    Some(days * 86400 + h * 3600 + m * 60 + sec)
+}
+
+pub fn format_date(days: i32) -> String {
+    let (y, m, d) = epoch_days_to_date(days);
+    format!("{:04}-{:02}-{:02}", y, m, d)
+}
+
+pub fn format_timestamp(secs: i64) -> String {
+    // Handle negative timestamps carefully
+    let days = if secs >= 0 { secs / 86400 } else { (secs - 86399) / 86400 };
+    let time = secs - days * 86400;
+    let (y, m, d) = epoch_days_to_date(days as i32);
+    let h = time / 3600;
+    let min = (time % 3600) / 60;
+    let s = time % 60;
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, m, d, h, min, s)
+}
+
+pub fn current_epoch_days() -> i32 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+    (secs / 86400) as i32
+}
+
+pub fn current_epoch_secs() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
 }
 
 /// Parser functions
@@ -1110,7 +1231,10 @@ fn parse_arith_select_column(input: &str) -> IResult<&str, SelectColumn> {
         | Expression::Cast(_, _) | Expression::Window(_, _)
         | Expression::Greatest(_) | Expression::Least(_)
         | Expression::Power(_, _) | Expression::Position(_, _) | Expression::Repeat(_, _)
-        | Expression::Literal(_) | Expression::Subquery(_) => Ok((new_input, SelectColumn::Expr(expr))),
+        | Expression::Literal(_) | Expression::Subquery(_)
+        | Expression::CurrentDate | Expression::CurrentTimestamp
+        | Expression::Extract(_, _) | Expression::DateTrunc(_, _)
+        | Expression::DateDiff(_, _, _) | Expression::DateAdd(_, _, _) => Ok((new_input, SelectColumn::Expr(expr))),
         _ => Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag))),
     }
 }
@@ -1328,7 +1452,7 @@ fn parse_limit_offset_clause(input: &str) -> IResult<&str, (Option<u64>, Option<
 
 /// Check if identifier is a reserved keyword that can't be used as an alias
 fn is_reserved_keyword(s: &str) -> bool {
-    matches!(s.to_uppercase().as_str(), "ON" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "OUTER" | "CROSS" | "WHERE" | "ORDER" | "GROUP" | "LIMIT" | "OFFSET" | "HAVING" | "UNION" | "ALL" | "CASE" | "WHEN" | "THEN" | "ELSE" | "END" | "AND" | "OR" | "NOT" | "AS" | "VIEW" | "OVER" | "PARTITION" | "NULLS" | "FIRST" | "LAST" | "INTERSECT" | "EXCEPT" | "ROWS" | "RANGE" | "GROUPS" | "PRECEDING" | "FOLLOWING" | "UNBOUNDED" | "BETWEEN" | "USING" | "NATURAL" | "ANY" | "SOME" | "FILTER" | "RECURSIVE")
+    matches!(s.to_uppercase().as_str(), "ON" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "OUTER" | "CROSS" | "WHERE" | "ORDER" | "GROUP" | "LIMIT" | "OFFSET" | "HAVING" | "UNION" | "ALL" | "CASE" | "WHEN" | "THEN" | "ELSE" | "END" | "AND" | "OR" | "NOT" | "AS" | "VIEW" | "OVER" | "PARTITION" | "NULLS" | "FIRST" | "LAST" | "INTERSECT" | "EXCEPT" | "ROWS" | "RANGE" | "GROUPS" | "PRECEDING" | "FOLLOWING" | "UNBOUNDED" | "BETWEEN" | "USING" | "NATURAL" | "ANY" | "SOME" | "FILTER" | "RECURSIVE" | "CURRENT_DATE" | "CURRENT_TIMESTAMP" | "EXTRACT" | "INTERVAL" | "DATEDIFF" | "DATE_TRUNC" | "DATE_PART" | "DATEADD")
 }
 
 /// Parse optional table alias, rejecting reserved keywords
@@ -1728,7 +1852,7 @@ fn parse_term(input: &str) -> IResult<&str, Expression> {
 
 /// Parse atomic expression: subquery, aggregate, CASE, column, table.column, or literal
 fn parse_atom(input: &str) -> IResult<&str, Expression> {
-    // Split into two alt groups because nom::alt supports max 21 alternatives
+    // Split into three alt groups because nom::alt supports max 21 alternatives
     nom::branch::alt((
         nom::branch::alt((
             parse_expression_case,
@@ -1749,6 +1873,19 @@ fn parse_atom(input: &str) -> IResult<&str, Expression> {
             parse_expression_replace,
             parse_expression_lpad,
             parse_expression_rpad,
+            // Date/time expressions (try before window and scalar to catch keywords)
+            parse_expression_current_date,
+            parse_expression_current_timestamp,
+            parse_expression_extract,
+            parse_expression_date_trunc,
+            parse_expression_datediff,
+            parse_expression_dateadd,
+            parse_expression_date_part,
+            parse_expression_interval,
+            parse_expression_date_literal,
+        )),
+        nom::branch::alt((
+            parse_expression_timestamp_literal,
             parse_expression_window,
             parse_expression_scalar_func,
             parse_expression_aggregate,
@@ -1790,20 +1927,33 @@ fn parse_expression_nullif(input: &str) -> IResult<&str, Expression> {
 
 fn parse_expression_scalar_func(input: &str) -> IResult<&str, Expression> {
     let (input, func_name) = nom::branch::alt((
-        tag_no_case("UPPER"),
-        tag_no_case("LOWER"),
-        tag_no_case("LENGTH"),
-        tag_no_case("LTRIM"),
-        tag_no_case("RTRIM"),
-        tag_no_case("TRIM"),
-        tag_no_case("ABS"),
-        tag_no_case("CEILING"),
-        tag_no_case("CEIL"),
-        tag_no_case("FLOOR"),
-        tag_no_case("SQRT"),
-        tag_no_case("SIGN"),
-        tag_no_case("TRUNC"),
-        tag_no_case("REVERSE"),
+        nom::branch::alt((
+            tag_no_case("UPPER"),
+            tag_no_case("LOWER"),
+            tag_no_case("LENGTH"),
+            tag_no_case("LTRIM"),
+            tag_no_case("RTRIM"),
+            tag_no_case("TRIM"),
+            tag_no_case("ABS"),
+            tag_no_case("CEILING"),
+            tag_no_case("CEIL"),
+            tag_no_case("FLOOR"),
+            tag_no_case("SQRT"),
+            tag_no_case("SIGN"),
+            tag_no_case("TRUNC"),
+            tag_no_case("REVERSE"),
+        )),
+        nom::branch::alt((
+            tag_no_case("YEAR"),
+            tag_no_case("MONTH"),
+            tag_no_case("DAYOFMONTH"),
+            tag_no_case("DAYOFWEEK"),
+            tag_no_case("DAYOFYEAR"),
+            tag_no_case("HOUR"),
+            tag_no_case("MINUTE"),
+            tag_no_case("SECOND"),
+            tag_no_case("DAY"),
+        )),
     ))(input)?;
     let func = match func_name.to_uppercase().as_str() {
         "UPPER"   => ScalarFunc::Upper,
@@ -1819,8 +1969,17 @@ fn parse_expression_scalar_func(input: &str) -> IResult<&str, Expression> {
         "SIGN"    => ScalarFunc::Sign,
         "TRUNC"   => ScalarFunc::Trunc,
         "REVERSE" => ScalarFunc::Reverse,
+        "YEAR"    => ScalarFunc::Year,
+        "MONTH"   => ScalarFunc::Month,
+        "DAY" | "DAYOFMONTH" => ScalarFunc::Day,
+        "HOUR"    => ScalarFunc::Hour,
+        "MINUTE"  => ScalarFunc::Minute,
+        "SECOND"  => ScalarFunc::Second,
+        "DAYOFWEEK" => ScalarFunc::DayOfWeek,
+        "DAYOFYEAR" => ScalarFunc::DayOfYear,
         _ => unreachable!(),
     };
+    // These functions require a following '(' to avoid mistaking column names like "day", "month"
     let (input, _) = multispace0(input)?;
     let (input, _) = nom_char('(')(input)?;
     let (input, _) = multispace0(input)?;
@@ -2008,6 +2167,206 @@ fn parse_expression_repeat(input: &str) -> IResult<&str, Expression> {
     let (input, _) = multispace0(input)?;
     let (input, _) = nom_char(')')(input)?;
     Ok((input, Expression::Repeat(Box::new(s), Box::new(n))))
+}
+
+/// Parse CURRENT_DATE (no parentheses)
+fn parse_expression_current_date(input: &str) -> IResult<&str, Expression> {
+    let (input, _) = tag_no_case("CURRENT_DATE")(input)?;
+    // Make sure it's not followed by '(' (which would mean something else)
+    if input.trim_start().starts_with('(') {
+        return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)));
+    }
+    Ok((input, Expression::CurrentDate))
+}
+
+/// Parse CURRENT_TIMESTAMP or NOW() — both return the current timestamp
+fn parse_expression_current_timestamp(input: &str) -> IResult<&str, Expression> {
+    // Try CURRENT_TIMESTAMP first (no parens)
+    if let Ok((rest, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("CURRENT_TIMESTAMP")(input) {
+        // optionally consume empty parentheses
+        let rest2 = rest.trim_start();
+        if rest2.starts_with("()") {
+            return Ok((&rest2[2..], Expression::CurrentTimestamp));
+        }
+        return Ok((rest, Expression::CurrentTimestamp));
+    }
+    // Try NOW()
+    let (input, _) = tag_no_case("NOW")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, Expression::CurrentTimestamp))
+}
+
+/// Parse DATE 'YYYY-MM-DD' literal
+fn parse_expression_date_literal(input: &str) -> IResult<&str, Expression> {
+    let (input, _) = tag_no_case("DATE")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, val) = parse_string_value(input)?;
+    if let Value::String(s) = val {
+        match parse_date_str(&s) {
+            Some(d) => Ok((input, Expression::Literal(Value::Date(d)))),
+            None => Err(nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Verify))),
+        }
+    } else {
+        Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)))
+    }
+}
+
+/// Parse TIMESTAMP 'YYYY-MM-DD HH:MM:SS' literal
+fn parse_expression_timestamp_literal(input: &str) -> IResult<&str, Expression> {
+    let (input, _) = tag_no_case("TIMESTAMP")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, val) = parse_string_value(input)?;
+    if let Value::String(s) = val {
+        match parse_timestamp_str(&s) {
+            Some(ts) => Ok((input, Expression::Literal(Value::Timestamp(ts)))),
+            None => Err(nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Verify))),
+        }
+    } else {
+        Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)))
+    }
+}
+
+/// Parse EXTRACT(field FROM expr)
+fn parse_expression_extract(input: &str) -> IResult<&str, Expression> {
+    let (input, _) = tag_no_case("EXTRACT")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, field) = parse_identifier(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, _) = tag_no_case("FROM")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, expr) = parse_expression(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, Expression::Extract(field.to_uppercase(), Box::new(expr))))
+}
+
+/// Parse DATE_PART('field', expr) — PostgreSQL style
+fn parse_expression_date_part(input: &str) -> IResult<&str, Expression> {
+    let (input, _) = tag_no_case("DATE_PART")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, field_val) = parse_string_value(input)?;
+    let field = if let Value::String(s) = field_val { s.to_uppercase() } else {
+        return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)));
+    };
+    let (input, _) = nom::sequence::delimited(multispace0, nom_char(','), multispace0)(input)?;
+    let (input, expr) = parse_expression(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, Expression::Extract(field, Box::new(expr))))
+}
+
+/// Parse DATE_TRUNC('unit', expr)
+fn parse_expression_date_trunc(input: &str) -> IResult<&str, Expression> {
+    let (input, _) = tag_no_case("DATE_TRUNC")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, field_val) = parse_string_value(input)?;
+    let field = if let Value::String(s) = field_val { s.to_uppercase() } else {
+        return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)));
+    };
+    let (input, _) = nom::sequence::delimited(multispace0, nom_char(','), multispace0)(input)?;
+    let (input, expr) = parse_expression(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, Expression::DateTrunc(field, Box::new(expr))))
+}
+
+/// Parse DATEDIFF(unit, date1, date2) — returns integer difference
+fn parse_expression_datediff(input: &str) -> IResult<&str, Expression> {
+    let (input, _) = tag_no_case("DATEDIFF")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    // Unit can be a quoted string or an identifier
+    let (input, unit) = nom::branch::alt((
+        |i| { let (i, v) = parse_string_value(i)?; if let Value::String(s) = v { Ok((i, s.to_uppercase())) } else { Err(nom::Err::Error(nom::error::Error::new(i, nom::error::ErrorKind::Tag))) } },
+        |i| { let (i, s) = parse_identifier(i)?; Ok((i, s.to_uppercase())) },
+    ))(input)?;
+    let (input, _) = nom::sequence::delimited(multispace0, nom_char(','), multispace0)(input)?;
+    let (input, e1) = parse_expression(input)?;
+    let (input, _) = nom::sequence::delimited(multispace0, nom_char(','), multispace0)(input)?;
+    let (input, e2) = parse_expression(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, Expression::DateDiff(unit, Box::new(e1), Box::new(e2))))
+}
+
+/// Parse DATEADD(unit, n, date) — shift date/timestamp by n units
+fn parse_expression_dateadd(input: &str) -> IResult<&str, Expression> {
+    let (input, _) = nom::branch::alt((tag_no_case("DATE_ADD"), tag_no_case("DATEADD")))(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    // Unit first
+    let (input, unit) = nom::branch::alt((
+        |i| { let (i, v) = parse_string_value(i)?; if let Value::String(s) = v { Ok((i, s.to_uppercase())) } else { Err(nom::Err::Error(nom::error::Error::new(i, nom::error::ErrorKind::Tag))) } },
+        |i| { let (i, s) = parse_identifier(i)?; Ok((i, s.to_uppercase())) },
+    ))(input)?;
+    let (input, _) = nom::sequence::delimited(multispace0, nom_char(','), multispace0)(input)?;
+    // n (integer amount)
+    let (input, n) = nom::character::complete::i64(input)?;
+    let (input, _) = nom::sequence::delimited(multispace0, nom_char(','), multispace0)(input)?;
+    let (input, date_expr) = parse_expression(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, Expression::DateAdd(Box::new(date_expr), n, unit)))
+}
+
+/// Convert an INTERVAL unit name to seconds
+pub fn interval_unit_secs(unit: &str) -> Option<i64> {
+    match unit.to_uppercase().as_str() {
+        "SECOND" | "SECONDS" => Some(1),
+        "MINUTE" | "MINUTES" => Some(60),
+        "HOUR" | "HOURS" => Some(3600),
+        "DAY" | "DAYS" => Some(86400),
+        "WEEK" | "WEEKS" => Some(604800),
+        "MONTH" | "MONTHS" => Some(2592000),   // approximate 30 days
+        "YEAR" | "YEARS" => Some(31536000),    // approximate 365 days
+        _ => None,
+    }
+}
+
+/// Parse INTERVAL n unit (e.g. INTERVAL 7 DAY, INTERVAL '30' DAYS)
+/// Returns Literal(Int(total_seconds)) for use in date arithmetic
+fn parse_expression_interval(input: &str) -> IResult<&str, Expression> {
+    let (input, _) = tag_no_case("INTERVAL")(input)?;
+    let (input, _) = multispace1(input)?;
+    // Try quoted string form: INTERVAL '7' DAY or INTERVAL '7 days'
+    let (input, n, unit) = if let Ok((rest, val)) = parse_string_value(input) {
+        if let Value::String(s) = val {
+            let s = s.trim();
+            // Check if the string contains the unit: '7 days'
+            if let Some(sp) = s.find(|c: char| c.is_whitespace()) {
+                let n: i64 = s[..sp].trim().parse().map_err(|_| nom::Err::Error(nom::error::Error::new(rest, nom::error::ErrorKind::Tag)))?;
+                let unit = s[sp+1..].trim().to_uppercase();
+                (rest, n, unit)
+            } else {
+                // '7' followed by unit identifier
+                let n: i64 = s.parse().map_err(|_| nom::Err::Error(nom::error::Error::new(rest, nom::error::ErrorKind::Tag)))?;
+                let (rest, _) = multispace1(rest)?;
+                let (rest, u) = parse_identifier(rest)?;
+                (rest, n, u.to_uppercase())
+            }
+        } else {
+            return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)));
+        }
+    } else {
+        // Bare integer form: INTERVAL 7 DAY
+        let (rest, n) = nom::character::complete::i64(input)?;
+        let (rest, _) = multispace1(rest)?;
+        let (rest, u) = parse_identifier(rest)?;
+        (rest, n, u.to_uppercase())
+    };
+    let secs = interval_unit_secs(&unit).ok_or_else(|| nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)))?;
+    Ok((input, Expression::Literal(Value::Int(n * secs))))
 }
 
 fn parse_window_spec(input: &str) -> IResult<&str, WindowSpec> {
@@ -2324,10 +2683,12 @@ pub fn apply_concat(parts: Vec<Option<Value>>) -> Option<Value> {
     let mut result = String::new();
     for part in parts {
         match part {
-            Some(Value::String(s)) => result.push_str(&s),
-            Some(Value::Int(n))    => result.push_str(&n.to_string()),
-            Some(Value::Float(f))  => result.push_str(&f.to_string()),
-            Some(Value::Bool(b))   => result.push_str(if b { "true" } else { "false" }),
+            Some(Value::String(s))    => result.push_str(&s),
+            Some(Value::Int(n))       => result.push_str(&n.to_string()),
+            Some(Value::Float(f))     => result.push_str(&f.to_string()),
+            Some(Value::Bool(b))      => result.push_str(if b { "true" } else { "false" }),
+            Some(Value::Date(d))      => result.push_str(&format_date(d)),
+            Some(Value::Timestamp(ts))=> result.push_str(&format_timestamp(ts)),
             Some(Value::Null) | None => return None,
         }
     }
@@ -2395,11 +2756,13 @@ pub fn apply_rpad(s: Value, len: Value, pad: Value) -> Option<Value> {
 pub fn apply_cast(val: Value, type_name: &str) -> Option<Value> {
     match type_name {
         "INT" | "INTEGER" | "BIGINT" => match val {
-            Value::Int(n)    => Some(Value::Int(n)),
-            Value::Float(f)  => Some(Value::Int(f as i64)),
-            Value::Bool(b)   => Some(Value::Int(b as i64)),
-            Value::String(s) => s.trim().parse::<i64>().ok().map(Value::Int),
-            Value::Null      => Some(Value::Null),
+            Value::Int(n)       => Some(Value::Int(n)),
+            Value::Float(f)     => Some(Value::Int(f as i64)),
+            Value::Bool(b)      => Some(Value::Int(b as i64)),
+            Value::String(s)    => s.trim().parse::<i64>().ok().map(Value::Int),
+            Value::Date(d)      => Some(Value::Int(d as i64)),
+            Value::Timestamp(ts)=> Some(Value::Int(ts)),
+            Value::Null         => Some(Value::Null),
         },
         "FLOAT" | "DOUBLE" | "REAL" | "NUMERIC" | "DECIMAL" => match val {
             Value::Float(f)  => Some(Value::Float(f)),
@@ -2409,11 +2772,13 @@ pub fn apply_cast(val: Value, type_name: &str) -> Option<Value> {
             _ => None,
         },
         "TEXT" | "VARCHAR" | "STRING" | "CHAR" => match val {
-            Value::String(s) => Some(Value::String(s)),
-            Value::Int(n)    => Some(Value::String(n.to_string())),
-            Value::Float(f)  => Some(Value::String(f.to_string())),
-            Value::Bool(b)   => Some(Value::String(b.to_string())),
-            Value::Null      => Some(Value::Null),
+            Value::String(s)    => Some(Value::String(s)),
+            Value::Int(n)       => Some(Value::String(n.to_string())),
+            Value::Float(f)     => Some(Value::String(f.to_string())),
+            Value::Bool(b)      => Some(Value::String(b.to_string())),
+            Value::Date(d)      => Some(Value::String(format_date(d))),
+            Value::Timestamp(ts)=> Some(Value::String(format_timestamp(ts))),
+            Value::Null         => Some(Value::Null),
         },
         "BOOLEAN" | "BOOL" => match val {
             Value::Bool(b)   => Some(Value::Bool(b)),
@@ -2424,6 +2789,22 @@ pub fn apply_cast(val: Value, type_name: &str) -> Option<Value> {
                 _ => None,
             },
             Value::Null => Some(Value::Null),
+            _ => None,
+        },
+        "DATE" => match val {
+            Value::Date(d)      => Some(Value::Date(d)),
+            Value::Timestamp(ts)=> Some(Value::Date((ts / 86400) as i32)),
+            Value::String(s)    => parse_date_str(&s).map(Value::Date),
+            Value::Int(n)       => Some(Value::Date(n as i32)),
+            Value::Null         => Some(Value::Null),
+            _ => None,
+        },
+        "TIMESTAMP" => match val {
+            Value::Timestamp(ts)=> Some(Value::Timestamp(ts)),
+            Value::Date(d)      => Some(Value::Timestamp(d as i64 * 86400)),
+            Value::String(s)    => parse_timestamp_str(&s).map(Value::Timestamp),
+            Value::Int(n)       => Some(Value::Timestamp(n)),
+            Value::Null         => Some(Value::Null),
             _ => None,
         },
         _ => None, // unknown type
@@ -2453,6 +2834,8 @@ fn cmp_values_for_sort(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Value::Int(x), Value::Float(y)) => (*x as f64).partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
         (Value::Float(x), Value::Int(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(std::cmp::Ordering::Equal),
         (Value::String(x), Value::String(y)) => x.cmp(y),
+        (Value::Date(x), Value::Date(y)) => x.cmp(y),
+        (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
         _ => std::cmp::Ordering::Equal,
     }
 }
@@ -2501,6 +2884,42 @@ pub fn apply_scalar_func(func: &ScalarFunc, val: Value) -> Option<Value> {
         (ScalarFunc::Trunc, Value::Float(f)) => Some(Value::Float(f.trunc())),
         (ScalarFunc::Trunc, Value::Int(n))   => Some(Value::Int(n)),
         (ScalarFunc::Reverse, Value::String(s)) => Some(Value::String(s.chars().rev().collect())),
+        // Date extraction from Date values
+        (ScalarFunc::Year,  Value::Date(d))  => Some(Value::Int(epoch_days_to_date(d).0 as i64)),
+        (ScalarFunc::Month, Value::Date(d))  => Some(Value::Int(epoch_days_to_date(d).1 as i64)),
+        (ScalarFunc::Day,   Value::Date(d))  => Some(Value::Int(epoch_days_to_date(d).2 as i64)),
+        // Date extraction from Timestamp values
+        (ScalarFunc::Year,  Value::Timestamp(ts)) => Some(Value::Int(epoch_days_to_date((ts / 86400) as i32).0 as i64)),
+        (ScalarFunc::Month, Value::Timestamp(ts)) => Some(Value::Int(epoch_days_to_date((ts / 86400) as i32).1 as i64)),
+        (ScalarFunc::Day,   Value::Timestamp(ts)) => Some(Value::Int(epoch_days_to_date((ts / 86400) as i32).2 as i64)),
+        (ScalarFunc::Hour,   Value::Timestamp(ts)) => Some(Value::Int((ts % 86400) / 3600)),
+        (ScalarFunc::Minute, Value::Timestamp(ts)) => Some(Value::Int((ts % 86400 % 3600) / 60)),
+        (ScalarFunc::Second, Value::Timestamp(ts)) => Some(Value::Int(ts % 60)),
+        // DayOfWeek: Unix epoch (1970-01-01) was Thursday=4; 0=Sun,1=Mon,...,6=Sat
+        (ScalarFunc::DayOfWeek, Value::Date(d)) => Some(Value::Int(((d % 7 + 4) % 7) as i64)),
+        (ScalarFunc::DayOfWeek, Value::Timestamp(ts)) => {
+            let d = (ts / 86400) as i32;
+            Some(Value::Int(((d % 7 + 4) % 7) as i64))
+        }
+        (ScalarFunc::DayOfYear, Value::Date(d)) => {
+            let (y, _, _) = epoch_days_to_date(d);
+            let jan1 = date_to_epoch_days(y, 1, 1);
+            Some(Value::Int((d - jan1 + 1) as i64))
+        }
+        (ScalarFunc::DayOfYear, Value::Timestamp(ts)) => {
+            let d = (ts / 86400) as i32;
+            let (y, _, _) = epoch_days_to_date(d);
+            let jan1 = date_to_epoch_days(y, 1, 1);
+            Some(Value::Int((d - jan1 + 1) as i64))
+        }
+        // Allow string input by coercing to date
+        (ScalarFunc::Year, Value::String(s))  => parse_date_str(&s).map(|d| Value::Int(epoch_days_to_date(d).0 as i64)),
+        (ScalarFunc::Month, Value::String(s)) => parse_date_str(&s).map(|d| Value::Int(epoch_days_to_date(d).1 as i64)),
+        (ScalarFunc::Day, Value::String(s))   => parse_date_str(&s).map(|d| Value::Int(epoch_days_to_date(d).2 as i64)),
+        // Hour/Minute/Second from Date are always 0
+        (ScalarFunc::Hour, Value::Date(_))   => Some(Value::Int(0)),
+        (ScalarFunc::Minute, Value::Date(_)) => Some(Value::Int(0)),
+        (ScalarFunc::Second, Value::Date(_)) => Some(Value::Int(0)),
         _ => None,
     }
 }
@@ -2566,6 +2985,8 @@ fn parse_operator(input: &str) -> IResult<&str, Operator> {
 fn parse_value(input: &str) -> IResult<&str, Value> {
     let (input, _) = multispace0(input)?;
     let (input, value) = nom::branch::alt((
+        parse_date_value,
+        parse_timestamp_value,
         parse_string_value,
         parse_null_value,
         parse_bool_value,
@@ -2573,6 +2994,36 @@ fn parse_value(input: &str) -> IResult<&str, Value> {
         parse_int_value,
     ))(input)?;
     Ok((input, value))
+}
+
+/// Parse DATE 'YYYY-MM-DD' as Value::Date
+fn parse_date_value(input: &str) -> IResult<&str, Value> {
+    let (input, _) = tag_no_case("DATE")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, val) = parse_string_value(input)?;
+    if let Value::String(s) = val {
+        match parse_date_str(&s) {
+            Some(d) => Ok((input, Value::Date(d))),
+            None => Err(nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Verify))),
+        }
+    } else {
+        Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)))
+    }
+}
+
+/// Parse TIMESTAMP 'YYYY-MM-DD HH:MM:SS' as Value::Timestamp
+fn parse_timestamp_value(input: &str) -> IResult<&str, Value> {
+    let (input, _) = tag_no_case("TIMESTAMP")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, val) = parse_string_value(input)?;
+    if let Value::String(s) = val {
+        match parse_timestamp_str(&s) {
+            Some(ts) => Ok((input, Value::Timestamp(ts))),
+            None => Err(nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Verify))),
+        }
+    } else {
+        Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)))
+    }
 }
 
 fn parse_bool_value(input: &str) -> IResult<&str, Value> {

@@ -24,6 +24,12 @@ pub enum SqlStatement {
     Delete(DeleteStatement),
     Truncate(TruncateStatement),
     Merge(MergeStatement),
+    Begin,
+    Commit,
+    Rollback,
+    Savepoint(String),
+    RollbackToSavepoint(String),
+    ReleaseSavepoint(String),
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -675,6 +681,11 @@ pub fn parse_sql(input: &str) -> IResult<&str, SqlStatement> {
         parse_delete,
         parse_truncate,
         parse_merge,
+        parse_begin,
+        parse_commit,
+        parse_rollback,
+        parse_savepoint,
+        parse_release,
     ))(input)?;
     let (input, _) = multispace0(input)?;
     Ok((input, stmt))
@@ -1246,6 +1257,67 @@ fn parse_merge_when_clause(input: &str) -> IResult<&str, (bool, MergeAction)> {
 }
 
 // DROP INDEX name; / DROP TABLE [IF EXISTS] name;
+/// Parse BEGIN / BEGIN TRANSACTION / START TRANSACTION
+pub fn parse_begin(input: &str) -> IResult<&str, SqlStatement> {
+    let (input, _) = nom::branch::alt((tag_no_case("BEGIN"), tag_no_case("START")))(input)?;
+    let (input, _) = multispace0(input)?;
+    // Optional TRANSACTION keyword
+    let (input, _) = nom::combinator::opt(nom::sequence::terminated(tag_no_case("TRANSACTION"), multispace0))(input)?;
+    let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
+    Ok((input, SqlStatement::Begin))
+}
+
+/// Parse COMMIT [TRANSACTION]
+pub fn parse_commit(input: &str) -> IResult<&str, SqlStatement> {
+    let (input, _) = tag_no_case("COMMIT")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom::combinator::opt(nom::sequence::terminated(tag_no_case("TRANSACTION"), multispace0))(input)?;
+    let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
+    Ok((input, SqlStatement::Commit))
+}
+
+/// Parse ROLLBACK [TRANSACTION] or ROLLBACK TO [SAVEPOINT] name
+pub fn parse_rollback(input: &str) -> IResult<&str, SqlStatement> {
+    let (input, _) = tag_no_case("ROLLBACK")(input)?;
+    let (input, _) = multispace0(input)?;
+    // Check for ROLLBACK TO [SAVEPOINT] name
+    if let Ok((input2, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("TO")(input) {
+        let (input2, _) = multispace1(input2)?;
+        // Optional SAVEPOINT keyword
+        let (input2, _) = nom::combinator::opt(nom::sequence::terminated(tag_no_case("SAVEPOINT"), multispace1))(input2)?;
+        let (input2, name) = parse_identifier(input2)?;
+        let (input2, _) = multispace0(input2)?;
+        let (input2, _) = nom::combinator::opt(nom_char(';'))(input2)?;
+        return Ok((input2, SqlStatement::RollbackToSavepoint(name.to_string())));
+    }
+    // Plain ROLLBACK [TRANSACTION]
+    let (input, _) = nom::combinator::opt(nom::sequence::terminated(tag_no_case("TRANSACTION"), multispace0))(input)?;
+    let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
+    Ok((input, SqlStatement::Rollback))
+}
+
+/// Parse SAVEPOINT name
+pub fn parse_savepoint(input: &str) -> IResult<&str, SqlStatement> {
+    let (input, _) = tag_no_case("SAVEPOINT")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, name) = parse_identifier(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
+    Ok((input, SqlStatement::Savepoint(name.to_string())))
+}
+
+/// Parse RELEASE [SAVEPOINT] name
+pub fn parse_release(input: &str) -> IResult<&str, SqlStatement> {
+    let (input, _) = tag_no_case("RELEASE")(input)?;
+    let (input, _) = multispace1(input)?;
+    // Optional SAVEPOINT keyword
+    let (input, _) = nom::combinator::opt(nom::sequence::terminated(tag_no_case("SAVEPOINT"), multispace1))(input)?;
+    let (input, name) = parse_identifier(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
+    Ok((input, SqlStatement::ReleaseSavepoint(name.to_string())))
+}
+
 pub fn parse_drop(input: &str) -> IResult<&str, SqlStatement> {
     let (input, _) = tag_no_case("DROP")(input)?;
     let (input, _) = multispace1(input)?;
@@ -1938,7 +2010,7 @@ fn parse_limit_offset_clause(input: &str) -> IResult<&str, (Option<u64>, Option<
 
 /// Check if identifier is a reserved keyword that can't be used as an alias
 fn is_reserved_keyword(s: &str) -> bool {
-    matches!(s.to_uppercase().as_str(), "ON" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "OUTER" | "CROSS" | "WHERE" | "ORDER" | "GROUP" | "LIMIT" | "OFFSET" | "HAVING" | "UNION" | "ALL" | "CASE" | "WHEN" | "THEN" | "ELSE" | "END" | "AND" | "OR" | "NOT" | "AS" | "VIEW" | "OVER" | "PARTITION" | "NULLS" | "FIRST" | "LAST" | "INTERSECT" | "EXCEPT" | "ROWS" | "RANGE" | "GROUPS" | "PRECEDING" | "FOLLOWING" | "UNBOUNDED" | "BETWEEN" | "USING" | "NATURAL" | "ANY" | "SOME" | "FILTER" | "RECURSIVE" | "CURRENT_DATE" | "CURRENT_TIMESTAMP" | "EXTRACT" | "INTERVAL" | "DATEDIFF" | "DATE_TRUNC" | "DATE_PART" | "DATEADD" | "WINDOW" | "NTILE" | "PERCENT_RANK" | "CUME_DIST" | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" | "ROLLUP" | "CUBE" | "GROUPING" | "SETS" | "LATERAL" | "VALUES" | "RETURNING" | "CONFLICT" | "EXCLUDED" | "NOTHING" | "MERGE" | "MATCHED" | "TRUNCATE")
+    matches!(s.to_uppercase().as_str(), "ON" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "OUTER" | "CROSS" | "WHERE" | "ORDER" | "GROUP" | "LIMIT" | "OFFSET" | "HAVING" | "UNION" | "ALL" | "CASE" | "WHEN" | "THEN" | "ELSE" | "END" | "AND" | "OR" | "NOT" | "AS" | "VIEW" | "OVER" | "PARTITION" | "NULLS" | "FIRST" | "LAST" | "INTERSECT" | "EXCEPT" | "ROWS" | "RANGE" | "GROUPS" | "PRECEDING" | "FOLLOWING" | "UNBOUNDED" | "BETWEEN" | "USING" | "NATURAL" | "ANY" | "SOME" | "FILTER" | "RECURSIVE" | "CURRENT_DATE" | "CURRENT_TIMESTAMP" | "EXTRACT" | "INTERVAL" | "DATEDIFF" | "DATE_TRUNC" | "DATE_PART" | "DATEADD" | "WINDOW" | "NTILE" | "PERCENT_RANK" | "CUME_DIST" | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" | "ROLLUP" | "CUBE" | "GROUPING" | "SETS" | "LATERAL" | "VALUES" | "RETURNING" | "CONFLICT" | "EXCLUDED" | "NOTHING" | "MERGE" | "MATCHED" | "TRUNCATE" | "BEGIN" | "COMMIT" | "ROLLBACK" | "SAVEPOINT" | "RELEASE" | "START" | "TRANSACTION")
 }
 
 /// Parse optional table alias, handling both `table alias` and `table AS alias` forms
@@ -6326,5 +6398,81 @@ mod tests {
             }
             _ => panic!("expected Select"),
         }
+    }
+
+    // --- Transaction statement parser tests ---
+
+    #[test]
+    fn test_parse_begin() {
+        let (_, stmt) = parse_sql("BEGIN").unwrap();
+        assert_eq!(stmt, SqlStatement::Begin);
+    }
+
+    #[test]
+    fn test_parse_begin_transaction() {
+        let (_, stmt) = parse_sql("BEGIN TRANSACTION").unwrap();
+        assert_eq!(stmt, SqlStatement::Begin);
+    }
+
+    #[test]
+    fn test_parse_start_transaction() {
+        let (_, stmt) = parse_sql("START TRANSACTION;").unwrap();
+        assert_eq!(stmt, SqlStatement::Begin);
+    }
+
+    #[test]
+    fn test_parse_commit() {
+        let (_, stmt) = parse_sql("COMMIT").unwrap();
+        assert_eq!(stmt, SqlStatement::Commit);
+    }
+
+    #[test]
+    fn test_parse_commit_transaction() {
+        let (_, stmt) = parse_sql("COMMIT TRANSACTION;").unwrap();
+        assert_eq!(stmt, SqlStatement::Commit);
+    }
+
+    #[test]
+    fn test_parse_rollback() {
+        let (_, stmt) = parse_sql("ROLLBACK").unwrap();
+        assert_eq!(stmt, SqlStatement::Rollback);
+    }
+
+    #[test]
+    fn test_parse_rollback_transaction() {
+        let (_, stmt) = parse_sql("ROLLBACK TRANSACTION;").unwrap();
+        assert_eq!(stmt, SqlStatement::Rollback);
+    }
+
+    #[test]
+    fn test_parse_savepoint() {
+        let (_, stmt) = parse_sql("SAVEPOINT sp1").unwrap();
+        assert_eq!(stmt, SqlStatement::Savepoint("sp1".to_string()));
+    }
+
+    #[test]
+    fn test_parse_rollback_to_savepoint() {
+        let (_, stmt) = parse_sql("ROLLBACK TO SAVEPOINT sp1;").unwrap();
+        assert_eq!(stmt, SqlStatement::RollbackToSavepoint("sp1".to_string()));
+    }
+
+    #[test]
+    fn test_parse_rollback_to_name() {
+        // ROLLBACK TO name without SAVEPOINT keyword
+        let (_, stmt) = parse_sql("ROLLBACK TO sp1").unwrap();
+        assert_eq!(stmt, SqlStatement::RollbackToSavepoint("sp1".to_string()));
+    }
+
+    #[test]
+    fn test_parse_release_savepoint() {
+        let (_, stmt) = parse_sql("RELEASE SAVEPOINT sp1;").unwrap();
+        assert_eq!(stmt, SqlStatement::ReleaseSavepoint("sp1".to_string()));
+    }
+
+    #[test]
+    fn test_parse_release_name() {
+        // RELEASE name without SAVEPOINT keyword
+        let (_, stmt) = parse_sql("RELEASE sp1").unwrap();
+        assert_eq!(stmt, SqlStatement::ReleaseSavepoint("sp1".to_string()));
     }
 }

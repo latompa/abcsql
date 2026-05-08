@@ -5,9 +5,18 @@ use std::fmt;
 use std::collections::HashMap;
 use crate::parser::{CreateTableStatement, CreateIndexStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, InsertSource, OnConflict, UpdateStatement, DeleteStatement, TruncateStatement, MergeStatement, MergeSource, MergeAction, AlterTableStatement, AlterAction, Value, Condition, Expression, Operator, ArithOp, SelectStatement, SelectColumn, FromClause, apply_scalar_func, apply_round, apply_concat, apply_substr, apply_replace, apply_lpad, apply_rpad, apply_cast, apply_greatest, apply_least, apply_power, apply_position, apply_repeat};
 
+/// Before-image snapshot for a single transaction
+struct TransactionState {
+    // None = file didn't exist before the transaction (delete on rollback)
+    before_images: HashMap<PathBuf, Option<Vec<u8>>>,
+    // Named savepoints in creation order; each stores current on-disk bytes of modified files
+    savepoints: Vec<(String, HashMap<PathBuf, Option<Vec<u8>>>)>,
+}
+
 /// Storage engine for persisting tables to disk
 pub struct Storage {
     data_dir: PathBuf,
+    txn: std::sync::Mutex<Option<TransactionState>>,
 }
 
 #[derive(Debug)]
@@ -25,6 +34,7 @@ pub enum StorageError {
     ForeignKeyViolation { column: String, ref_table: String, ref_column: String },
     IndexAlreadyExists(String),
     IndexNotFound(String),
+    TransactionError(String),
 }
 
 impl From<io::Error> for StorageError {
@@ -59,6 +69,7 @@ impl fmt::Display for StorageError {
             }
             StorageError::IndexAlreadyExists(name) => write!(f, "Index '{}' already exists", name),
             StorageError::IndexNotFound(name) => write!(f, "Index '{}' not found", name),
+            StorageError::TransactionError(msg) => write!(f, "Transaction error: {}", msg),
         }
     }
 }
@@ -73,6 +84,11 @@ impl std::error::Error for StorageError {
 }
 
 impl Storage {
+    /// Create a no-op Storage for expression evaluation contexts that don't touch files
+    fn noop() -> Self {
+        Storage { data_dir: PathBuf::new(), txn: std::sync::Mutex::new(None) }
+    }
+
     /// Create a new Storage instance with the specified data directory
     pub fn new<P: AsRef<Path>>(data_dir: P) -> io::Result<Self> {
         let data_dir = data_dir.as_ref().to_path_buf();
@@ -82,7 +98,91 @@ impl Storage {
             fs::create_dir_all(&data_dir)?;
         }
 
-        Ok(Storage { data_dir })
+        Ok(Storage { data_dir, txn: std::sync::Mutex::new(None) })
+    }
+
+    /// Capture the before-image of a file once per transaction (idempotent)
+    fn snapshot_before_write(&self, path: &Path) {
+        let mut guard = self.txn.lock().unwrap();
+        if let Some(txn) = guard.as_mut() {
+            txn.before_images.entry(path.to_path_buf()).or_insert_with(|| fs::read(path).ok());
+        }
+    }
+
+    /// Snapshot the index meta file and all existing index data files for a table
+    fn snapshot_index_files(&self, table_name: &str) {
+        let meta = self.index_meta_path();
+        self.snapshot_before_write(&meta);
+        if let Ok(entries) = fs::read_dir(&self.data_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let s = name.to_string_lossy();
+                if s.starts_with(&format!("{}.idx.", table_name)) {
+                    self.snapshot_before_write(&entry.path());
+                }
+            }
+        }
+    }
+
+    // --- Transaction control ---
+
+    pub fn begin_transaction(&self) -> Result<(), StorageError> {
+        let mut guard = self.txn.lock().unwrap();
+        if guard.is_some() {
+            return Err(StorageError::TransactionError("already in a transaction".into()));
+        }
+        *guard = Some(TransactionState { before_images: HashMap::new(), savepoints: Vec::new() });
+        Ok(())
+    }
+
+    pub fn commit_transaction(&self) -> Result<(), StorageError> {
+        let mut guard = self.txn.lock().unwrap();
+        if guard.is_none() {
+            return Err(StorageError::TransactionError("no active transaction".into()));
+        }
+        *guard = None; // writes are already on disk — discard before-images
+        Ok(())
+    }
+
+    pub fn rollback_transaction(&self) -> Result<(), StorageError> {
+        let mut guard = self.txn.lock().unwrap();
+        let txn = guard.take().ok_or_else(|| StorageError::TransactionError("no active transaction".into()))?;
+        restore_files(&txn.before_images)?;
+        Ok(())
+    }
+
+    pub fn create_savepoint(&self, name: &str) -> Result<(), StorageError> {
+        let mut guard = self.txn.lock().unwrap();
+        let txn = guard.as_mut().ok_or_else(|| StorageError::TransactionError("no active transaction".into()))?;
+        // Snapshot current on-disk state of every file touched so far
+        let snapshot: HashMap<PathBuf, Option<Vec<u8>>> = txn.before_images.keys()
+            .map(|path| (path.clone(), fs::read(path).ok()))
+            .collect();
+        // Replace any existing savepoint with the same name
+        txn.savepoints.retain(|(n, _)| n != name);
+        txn.savepoints.push((name.to_string(), snapshot));
+        Ok(())
+    }
+
+    pub fn rollback_to_savepoint(&self, name: &str) -> Result<(), StorageError> {
+        let mut guard = self.txn.lock().unwrap();
+        let txn = guard.as_mut().ok_or_else(|| StorageError::TransactionError("no active transaction".into()))?;
+        let pos = txn.savepoints.iter().rposition(|(n, _)| n == name)
+            .ok_or_else(|| StorageError::TransactionError(format!("savepoint '{}' does not exist", name)))?;
+        let (_, snapshot) = &txn.savepoints[pos];
+        restore_files(snapshot)?;
+        // Truncate savepoints created after this one
+        txn.savepoints.truncate(pos + 1);
+        Ok(())
+    }
+
+    pub fn release_savepoint(&self, name: &str) -> Result<(), StorageError> {
+        let mut guard = self.txn.lock().unwrap();
+        let txn = guard.as_mut().ok_or_else(|| StorageError::TransactionError("no active transaction".into()))?;
+        let pos = txn.savepoints.iter().rposition(|(n, _)| n == name)
+            .ok_or_else(|| StorageError::TransactionError(format!("savepoint '{}' does not exist", name)))?;
+        txn.savepoints.remove(pos);
+        Ok(())
     }
 
     /// Create a new table by persisting its schema to disk
@@ -94,16 +194,21 @@ impl Storage {
             return Err(StorageError::TableAlreadyExists(stmt.table_name.clone()));
         }
 
+        // Snapshot before creating (all three paths don't exist yet → None)
+        self.snapshot_before_write(&schema_path);
+        let data_path = self.data_path(&stmt.table_name);
+        self.snapshot_before_write(&data_path);
+        let seq_path = self.seq_path(&stmt.table_name);
+        self.snapshot_before_write(&seq_path);
+
         self.write_schema_file(&stmt.table_name, &stmt.columns)?;
 
         // Create empty data file
-        let data_path = self.data_path(&stmt.table_name);
-        fs::File::create(data_path)?;
+        fs::File::create(&data_path)?;
 
         // Initialize sequence file for auto_increment columns
         if stmt.columns.iter().any(|c| c.auto_increment) {
-            let seq_path = self.seq_path(&stmt.table_name);
-            fs::write(seq_path, "0")?;
+            fs::write(&seq_path, "0")?;
         }
 
         Ok(())
@@ -112,6 +217,7 @@ impl Storage {
     /// Write (or overwrite) a schema file for a table
     fn write_schema_file(&self, table_name: &str, columns: &[ColumnDefinition]) -> Result<(), StorageError> {
         let schema_path = self.schema_path(table_name);
+        self.snapshot_before_write(&schema_path);
         let mut file = fs::File::create(schema_path)?;
         writeln!(file, "{}", table_name)?;
         for col in columns {
@@ -289,12 +395,15 @@ impl Storage {
 
         // Append row to data file
         let data_path = self.data_path(table_name);
-        let file = fs::OpenOptions::new().create(true).append(true).open(data_path)?;
+        self.snapshot_before_write(&data_path);
+        let file = fs::OpenOptions::new().create(true).append(true).open(&data_path)?;
         let mut writer = BufWriter::new(file);
         let row_str = serialize_row(&final_values);
         writeln!(writer, "{}", row_str)?;
         writer.flush()?;
 
+        // Also snapshot seq file if it was just incremented
+        self.snapshot_index_files(table_name);
         self.rebuild_indexes_for_table(table_name)?;
         Ok(Some(final_values))
     }
@@ -348,7 +457,9 @@ impl Storage {
 
         // Write rows back
         let data_path = self.data_path(table_name);
-        let file = fs::File::create(data_path)?;
+        self.snapshot_before_write(&data_path);
+        self.snapshot_index_files(table_name);
+        let file = fs::File::create(&data_path)?;
         let mut writer = BufWriter::new(file);
         for row in &rows {
             writeln!(writer, "{}", serialize_row(row))?;
@@ -482,7 +593,9 @@ impl Storage {
 
         // Write all rows back
         let data_path = self.data_path(&stmt.table_name);
-        let file = fs::File::create(data_path)?;
+        self.snapshot_before_write(&data_path);
+        self.snapshot_index_files(&stmt.table_name);
+        let file = fs::File::create(&data_path)?;
         let mut writer = BufWriter::new(file);
         for row in &rows {
             writeln!(writer, "{}", serialize_row(row))?;
@@ -566,7 +679,9 @@ impl Storage {
 
         // Write remaining rows back
         let data_path = self.data_path(&stmt.table_name);
-        let file = fs::File::create(data_path)?;
+        self.snapshot_before_write(&data_path);
+        self.snapshot_index_files(&stmt.table_name);
+        let file = fs::File::create(&data_path)?;
         let mut writer = BufWriter::new(file);
         for row in &remaining_rows {
             writeln!(writer, "{}", serialize_row(row))?;
@@ -584,7 +699,9 @@ impl Storage {
             return Err(StorageError::TableNotFound(stmt.table_name.clone()));
         }
         let data_path = self.data_path(&stmt.table_name);
-        fs::write(data_path, "")?;
+        self.snapshot_before_write(&data_path);
+        self.snapshot_index_files(&stmt.table_name);
+        fs::write(&data_path, "")?;
         self.rebuild_indexes_for_table(&stmt.table_name)?;
         Ok(())
     }
@@ -701,7 +818,9 @@ impl Storage {
 
         // Write all target rows back
         let data_path = self.data_path(&stmt.target);
-        let file = fs::File::create(data_path)?;
+        self.snapshot_before_write(&data_path);
+        self.snapshot_index_files(&stmt.target);
+        let file = fs::File::create(&data_path)?;
         let mut writer = BufWriter::new(file);
         for row in &target_rows {
             writeln!(writer, "{}", serialize_row(row))?;
@@ -873,15 +992,21 @@ impl Storage {
             return Err(StorageError::TableNotFound(table_name.to_string()));
         }
 
-        fs::remove_file(schema_path)?;
+        // Snapshot everything before deletion
+        self.snapshot_before_write(&schema_path);
+        self.snapshot_before_write(&data_path);
+        let seq_path = self.seq_path(table_name);
+        self.snapshot_before_write(&seq_path);
+        self.snapshot_index_files(table_name);
+
+        fs::remove_file(&schema_path)?;
 
         if data_path.exists() {
-            fs::remove_file(data_path)?;
+            fs::remove_file(&data_path)?;
         }
 
-        let seq_path = self.seq_path(table_name);
         if seq_path.exists() {
-            fs::remove_file(seq_path)?;
+            fs::remove_file(&seq_path)?;
         }
 
         // Drop all indexes for this table
@@ -898,7 +1023,7 @@ impl Storage {
         let remaining: Vec<_> = meta.iter().filter(|(_, t, _, _)| t != table_name).collect();
         let meta_path = self.index_meta_path();
         if meta_path.exists() {
-            let mut file = fs::File::create(meta_path)?;
+            let mut file = fs::File::create(&meta_path)?;
             for (name, table, col, unique) in remaining {
                 if *unique {
                     writeln!(file, "{}:{}:{}:UNIQUE", name, table, col)?;
@@ -947,7 +1072,9 @@ impl Storage {
 
         // Rewrite data: append Null to each row
         let data_path = self.data_path(&schema.table_name);
-        let file = fs::File::create(data_path)?;
+        self.snapshot_before_write(&data_path);
+        self.snapshot_index_files(&schema.table_name);
+        let file = fs::File::create(&data_path)?;
         let mut writer = BufWriter::new(file);
         for row in &rows {
             let mut new_row = row.clone();
@@ -961,7 +1088,8 @@ impl Storage {
         // Initialize sequence file if this is the first auto_increment column
         if col.auto_increment && !schema.columns.iter().any(|c| c.auto_increment) {
             let seq_path = self.seq_path(&schema.table_name);
-            fs::write(seq_path, "0")?;
+            self.snapshot_before_write(&seq_path);
+            fs::write(&seq_path, "0")?;
         }
 
         self.rebuild_indexes_for_table(&schema.table_name)?;
@@ -1006,7 +1134,9 @@ impl Storage {
         // Rewrite data without the dropped column
         let rows = self.read_rows(&schema.table_name)?;
         let data_path = self.data_path(&schema.table_name);
-        let file = fs::File::create(data_path)?;
+        self.snapshot_before_write(&data_path);
+        self.snapshot_index_files(&schema.table_name);
+        let file = fs::File::create(&data_path)?;
         let mut writer = BufWriter::new(file);
         for row in &rows {
             let new_row: Vec<Value> = row.iter().enumerate()
@@ -1027,8 +1157,9 @@ impl Storage {
         let dropped_col = &schema.columns[col_idx];
         if dropped_col.auto_increment && !new_columns.iter().any(|c| c.auto_increment) {
             let seq_path = self.seq_path(&schema.table_name);
+            self.snapshot_before_write(&seq_path);
             if seq_path.exists() {
-                fs::remove_file(seq_path)?;
+                fs::remove_file(&seq_path)?;
             }
         }
 
@@ -1109,23 +1240,34 @@ impl Storage {
             return Err(StorageError::TableAlreadyExists(new_name.to_string()));
         }
 
+        // Snapshot old files and new destinations before touching anything
+        let old_schema = self.schema_path(old_name);
+        let new_schema = self.schema_path(new_name);
+        self.snapshot_before_write(&old_schema);
+        self.snapshot_before_write(&new_schema);
+        let old_data = self.data_path(old_name);
+        let new_data = self.data_path(new_name);
+        self.snapshot_before_write(&old_data);
+        self.snapshot_before_write(&new_data);
+        let old_seq = self.seq_path(old_name);
+        let new_seq = self.seq_path(new_name);
+        self.snapshot_before_write(&old_seq);
+        self.snapshot_before_write(&new_seq);
+        self.snapshot_index_files(old_name);
+
         // Rewrite schema with new table name (first line) at the new path
         let schema = self.load_schema(old_name)?;
         self.write_schema_file(new_name, &schema.columns)?;
-        fs::remove_file(self.schema_path(old_name))?;
+        fs::remove_file(&old_schema)?;
 
         // Rename data file
-        let old_data = self.data_path(old_name);
-        let new_data = self.data_path(new_name);
         if old_data.exists() {
-            fs::rename(old_data, new_data)?;
+            fs::rename(&old_data, &new_data)?;
         }
 
         // Rename sequence file
-        let old_seq = self.seq_path(old_name);
-        let new_seq = self.seq_path(new_name);
         if old_seq.exists() {
-            fs::rename(old_seq, new_seq)?;
+            fs::rename(&old_seq, &new_seq)?;
         }
 
         // Update index metadata: any index entries owned by old_name now belong to new_name
@@ -1170,13 +1312,14 @@ impl Storage {
 
     fn write_index_meta(&self, entries: &[(String, String, String, bool)]) -> Result<(), StorageError> {
         let path = self.index_meta_path();
+        self.snapshot_before_write(&path);
         if entries.is_empty() {
             if path.exists() {
-                fs::remove_file(path)?;
+                fs::remove_file(&path)?;
             }
             return Ok(());
         }
-        let mut file = fs::File::create(path)?;
+        let mut file = fs::File::create(&path)?;
         for (name, table, col, unique) in entries {
             if *unique {
                 writeln!(file, "{}:{}:{}:UNIQUE", name, table, col)?;
@@ -1209,7 +1352,8 @@ impl Storage {
         if path.exists() {
             return Err(StorageError::InvalidSchema(format!("View '{}' already exists", view_name)));
         }
-        fs::write(path, select_sql).map_err(StorageError::IoError)
+        self.snapshot_before_write(&path);
+        fs::write(&path, select_sql).map_err(StorageError::IoError)
     }
 
     /// Load a view's SELECT SQL from disk
@@ -1227,7 +1371,8 @@ impl Storage {
         if !path.exists() {
             return Err(StorageError::TableNotFound(format!("View '{}' not found", view_name)));
         }
-        fs::remove_file(path).map_err(StorageError::IoError)
+        self.snapshot_before_write(&path);
+        fs::remove_file(&path).map_err(StorageError::IoError)
     }
 
     pub fn view_exists(&self, view_name: &str) -> bool {
@@ -1237,6 +1382,7 @@ impl Storage {
     /// Read and increment the auto_increment counter
     fn next_auto_increment(&self, table_name: &str) -> Result<i64, StorageError> {
         let seq_path = self.seq_path(table_name);
+        self.snapshot_before_write(&seq_path);
         let current: i64 = fs::read_to_string(&seq_path)
             .map_err(|_| StorageError::InvalidData("Missing sequence file".to_string()))?
             .trim()
@@ -1355,12 +1501,15 @@ impl Storage {
             }
         }
 
-        // Write index data
+        // Write index data (snapshot the new idx file — it doesn't exist yet)
+        let idx_path = self.index_data_path(&stmt.index_name);
+        self.snapshot_before_write(&idx_path);
         self.write_index_data(&stmt.index_name, &index)?;
 
-        // Append to metadata
+        // Append to metadata (snapshot meta before first write)
         let meta_path = self.index_meta_path();
-        let mut file = fs::OpenOptions::new().create(true).append(true).open(meta_path)?;
+        self.snapshot_before_write(&meta_path);
+        let mut file = fs::OpenOptions::new().create(true).append(true).open(&meta_path)?;
         if stmt.unique {
             writeln!(file, "{}:{}:{}:UNIQUE", stmt.index_name, stmt.table_name, stmt.column_name)?;
         } else {
@@ -1379,14 +1528,16 @@ impl Storage {
 
         // Remove index data file
         let idx_path = self.index_data_path(index_name);
+        self.snapshot_before_write(&idx_path);
         if idx_path.exists() {
-            fs::remove_file(idx_path)?;
+            fs::remove_file(&idx_path)?;
         }
 
         // Rewrite metadata without this index
         let remaining: Vec<_> = meta.iter().filter(|(name, _, _, _)| name != index_name).collect();
         let meta_path = self.index_meta_path();
-        let mut file = fs::File::create(meta_path)?;
+        self.snapshot_before_write(&meta_path);
+        let mut file = fs::File::create(&meta_path)?;
         for (name, table, col, unique) in remaining {
             if *unique {
                 writeln!(file, "{}:{}:{}:UNIQUE", name, table, col)?;
@@ -1401,7 +1552,8 @@ impl Storage {
     /// Write index data to disk
     fn write_index_data(&self, index_name: &str, index: &HashMap<String, Vec<usize>>) -> Result<(), StorageError> {
         let path = self.index_data_path(index_name);
-        let mut file = fs::File::create(path)?;
+        self.snapshot_before_write(&path);
+        let mut file = fs::File::create(&path)?;
         for (key, row_nums) in index {
             let nums: Vec<String> = row_nums.iter().map(|n| n.to_string()).collect();
             writeln!(file, "{}|{}", key, nums.join(","))?;
@@ -1492,6 +1644,17 @@ impl Storage {
         }
         Ok(())
     }
+}
+
+/// Restore files from a before-image snapshot (used by rollback / rollback to savepoint)
+fn restore_files(images: &HashMap<PathBuf, Option<Vec<u8>>>) -> Result<(), StorageError> {
+    for (path, maybe_bytes) in images {
+        match maybe_bytes {
+            Some(bytes) => fs::write(path, bytes)?,
+            None => { let _ = fs::remove_file(path); } // file didn't exist — remove it
+        }
+    }
+    Ok(())
 }
 
 /// Convert a DataType to its string representation
@@ -1769,7 +1932,7 @@ fn project_returning(row: &[Value], ret_cols: &[SelectColumn], schema_cols: &[Co
                         .unwrap_or(Value::Null)
                 } else { Value::Null }
             }
-            SelectColumn::Expr(e) => resolve_expression(e, row, schema_cols, &Storage { data_dir: std::path::PathBuf::new() })
+            SelectColumn::Expr(e) => resolve_expression(e, row, schema_cols, &Storage::noop())
                 .unwrap_or(Value::Null),
             _ => Value::Null,
         }
@@ -1886,7 +2049,7 @@ fn resolve_expr_cols(expr: &Expression, row: &[Value], cols: &[(String, String)]
 
 /// Resolve expression where EXCLUDED.col refers to excluded_row values
 fn resolve_expr_with_excluded(expr: &Expression, combined_row: &[Value], combined_cols: &[(String, String)]) -> Option<Value> {
-    resolve_expr_cols(expr, combined_row, combined_cols, &Storage { data_dir: std::path::PathBuf::new() })
+    resolve_expr_cols(expr, combined_row, combined_cols, &Storage::noop())
 }
 
 fn evaluate_condition(condition: &Condition, row: &[Value], schema: &[ColumnDefinition], storage: &Storage) -> bool {
@@ -4539,6 +4702,225 @@ mod tests {
         assert_eq!(rows[0][1], Value::String("Updated".to_string()));
         assert_eq!(rows[1][1], Value::String("Bob".to_string()));
 
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    // --- Transaction tests ---
+
+    fn make_txn_storage(suffix: &str) -> (Storage, std::path::PathBuf) {
+        let temp_dir = std::env::temp_dir().join(format!("abcsql_txn_{}", suffix));
+        let _ = fs::remove_dir_all(&temp_dir);
+        let s = Storage::new(&temp_dir).unwrap();
+        (s, temp_dir)
+    }
+
+    fn make_users_table(storage: &Storage) {
+        let stmt = CreateTableStatement {
+            table_name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id", DataType::Int),
+                ColumnDefinition::new("name", DataType::Varchar(None)),
+            ],
+        };
+        storage.create_table(&stmt).unwrap();
+    }
+
+    fn insert_user(storage: &Storage, id: i64, name: &str) {
+        use crate::parser::{InsertStatement, InsertSource};
+        let stmt = InsertStatement {
+            table_name: "users".to_string(),
+            columns: vec![],
+            source: InsertSource::Values(vec![vec![Value::Int(id), Value::String(name.to_string())]]),
+            on_conflict: None,
+            returning: None,
+        };
+        storage.insert_row(&stmt).unwrap();
+    }
+
+    #[test]
+    fn test_txn_basic_commit() {
+        let (storage, temp_dir) = make_txn_storage("commit");
+        make_users_table(&storage);
+
+        storage.begin_transaction().unwrap();
+        insert_user(&storage, 1, "Alice");
+        storage.commit_transaction().unwrap();
+
+        // Re-open storage and verify data persists
+        let storage2 = Storage::new(&temp_dir).unwrap();
+        let rows = storage2.read_rows("users").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][1], Value::String("Alice".to_string()));
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_txn_basic_rollback() {
+        let (storage, temp_dir) = make_txn_storage("rollback");
+        make_users_table(&storage);
+
+        storage.begin_transaction().unwrap();
+        insert_user(&storage, 1, "Alice");
+        // Verify row is present before rollback
+        assert_eq!(storage.read_rows("users").unwrap().len(), 1);
+        storage.rollback_transaction().unwrap();
+
+        // Table should be empty again
+        let rows = storage.read_rows("users").unwrap();
+        assert_eq!(rows.len(), 0);
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_txn_rollback_ddl() {
+        let (storage, temp_dir) = make_txn_storage("ddl");
+
+        storage.begin_transaction().unwrap();
+        make_users_table(&storage);
+        assert!(storage.table_exists("users"));
+        storage.rollback_transaction().unwrap();
+
+        // Table should no longer exist
+        assert!(!storage.table_exists("users"));
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_txn_savepoint_rollback() {
+        let (storage, temp_dir) = make_txn_storage("savepoint");
+        make_users_table(&storage);
+
+        storage.begin_transaction().unwrap();
+        insert_user(&storage, 1, "Alice");
+        storage.create_savepoint("sp1").unwrap();
+        insert_user(&storage, 2, "Bob");
+
+        // Both rows visible
+        assert_eq!(storage.read_rows("users").unwrap().len(), 2);
+
+        storage.rollback_to_savepoint("sp1").unwrap();
+
+        // Only Alice should remain
+        let rows = storage.read_rows("users").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][1], Value::String("Alice".to_string()));
+
+        storage.commit_transaction().unwrap();
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_txn_release_savepoint_then_rollback_fails() {
+        let (storage, temp_dir) = make_txn_storage("release");
+        make_users_table(&storage);
+
+        storage.begin_transaction().unwrap();
+        insert_user(&storage, 1, "Alice");
+        storage.create_savepoint("sp1").unwrap();
+        storage.release_savepoint("sp1").unwrap();
+
+        // Rollback to released savepoint should error
+        let result = storage.rollback_to_savepoint("sp1");
+        assert!(result.is_err());
+
+        storage.rollback_transaction().unwrap();
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_txn_nested_savepoints() {
+        let (storage, temp_dir) = make_txn_storage("nested");
+        make_users_table(&storage);
+
+        storage.begin_transaction().unwrap();
+        insert_user(&storage, 1, "Alice");
+        storage.create_savepoint("sp1").unwrap();
+        insert_user(&storage, 2, "Bob");
+        storage.create_savepoint("sp2").unwrap();
+        insert_user(&storage, 3, "Carol");
+
+        // All three visible
+        assert_eq!(storage.read_rows("users").unwrap().len(), 3);
+
+        // Roll back to sp1 — should be back to just Alice
+        storage.rollback_to_savepoint("sp1").unwrap();
+        let rows = storage.read_rows("users").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][1], Value::String("Alice".to_string()));
+
+        // sp2 should also be gone now
+        let result = storage.rollback_to_savepoint("sp2");
+        assert!(result.is_err());
+
+        storage.commit_transaction().unwrap();
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_txn_no_transaction_errors() {
+        let (storage, temp_dir) = make_txn_storage("notxn");
+
+        // COMMIT without BEGIN
+        assert!(storage.commit_transaction().is_err());
+        // ROLLBACK without BEGIN
+        assert!(storage.rollback_transaction().is_err());
+        // SAVEPOINT without BEGIN
+        assert!(storage.create_savepoint("sp1").is_err());
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_txn_autoincrement_rolled_back() {
+        let (storage, temp_dir) = make_txn_storage("autoinc");
+
+        // Create table with auto-increment id
+        let stmt = CreateTableStatement {
+            table_name: "items".to_string(),
+            columns: vec![{
+                let mut c = ColumnDefinition::new("id", DataType::Int);
+                c.auto_increment = true;
+                c.primary_key = true;
+                c
+            }, ColumnDefinition::new("name", DataType::Varchar(None))],
+        };
+        storage.create_table(&stmt).unwrap();
+
+        use crate::parser::{InsertStatement, InsertSource};
+        let ins = || InsertStatement {
+            table_name: "items".to_string(),
+            columns: vec!["name".to_string()],
+            source: InsertSource::Values(vec![vec![Value::String("thing".to_string())]]),
+            on_conflict: None,
+            returning: None,
+        };
+
+        // BEGIN → insert (gets id=1) → ROLLBACK
+        storage.begin_transaction().unwrap();
+        let (_, _) = storage.insert_row(&ins()).unwrap();
+        storage.rollback_transaction().unwrap();
+
+        // After rollback, seq should be back to 0; next insert should get id=1 again
+        storage.begin_transaction().unwrap();
+        let (_, _) = storage.insert_row(&ins()).unwrap();
+        storage.commit_transaction().unwrap();
+
+        let rows = storage.read_rows("items").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::Int(1));
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_txn_double_begin_error() {
+        let (storage, temp_dir) = make_txn_storage("dbl_begin");
+        storage.begin_transaction().unwrap();
+        assert!(storage.begin_transaction().is_err());
+        storage.rollback_transaction().unwrap();
         fs::remove_dir_all(&temp_dir).unwrap();
     }
 }

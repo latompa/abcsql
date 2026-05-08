@@ -108,6 +108,24 @@ pub fn execute(storage: &Storage, sql: &str) -> Result<String, String> {
                 .map(|_| format!("Dropped view '{}'", stmt.view_name))
                 .map_err(|e| e.to_string())
         }
+        SqlStatement::Begin => {
+            storage.begin_transaction().map(|_| "BEGIN".to_string()).map_err(|e| e.to_string())
+        }
+        SqlStatement::Commit => {
+            storage.commit_transaction().map(|_| "COMMIT".to_string()).map_err(|e| e.to_string())
+        }
+        SqlStatement::Rollback => {
+            storage.rollback_transaction().map(|_| "ROLLBACK".to_string()).map_err(|e| e.to_string())
+        }
+        SqlStatement::Savepoint(name) => {
+            storage.create_savepoint(&name).map(|_| "SAVEPOINT".to_string()).map_err(|e| e.to_string())
+        }
+        SqlStatement::RollbackToSavepoint(name) => {
+            storage.rollback_to_savepoint(&name).map(|_| "ROLLBACK".to_string()).map_err(|e| e.to_string())
+        }
+        SqlStatement::ReleaseSavepoint(name) => {
+            storage.release_savepoint(&name).map(|_| "RELEASE".to_string()).map_err(|e| e.to_string())
+        }
     }
 }
 

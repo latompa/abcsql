@@ -247,6 +247,42 @@ fn execute_sql(sql: &str, storage: &Storage) {
                 Err(e) => eprintln!("Error: {}", e),
             }
         }
+        SqlStatement::Begin => {
+            match storage.begin_transaction() {
+                Ok(()) => println!("BEGIN"),
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        }
+        SqlStatement::Commit => {
+            match storage.commit_transaction() {
+                Ok(()) => println!("COMMIT"),
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        }
+        SqlStatement::Rollback => {
+            match storage.rollback_transaction() {
+                Ok(()) => println!("ROLLBACK"),
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        }
+        SqlStatement::Savepoint(name) => {
+            match storage.create_savepoint(&name) {
+                Ok(()) => println!("SAVEPOINT"),
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        }
+        SqlStatement::RollbackToSavepoint(name) => {
+            match storage.rollback_to_savepoint(&name) {
+                Ok(()) => println!("ROLLBACK"),
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        }
+        SqlStatement::ReleaseSavepoint(name) => {
+            match storage.release_savepoint(&name) {
+                Ok(()) => println!("RELEASE"),
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        }
     }
 }
 

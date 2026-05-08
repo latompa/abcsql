@@ -22,6 +22,39 @@ pub enum SqlStatement {
     Select(SelectStatement),
     Update(UpdateStatement),
     Delete(DeleteStatement),
+    Truncate(TruncateStatement),
+    Merge(MergeStatement),
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct TruncateStatement {
+    pub table_name: String,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct MergeStatement {
+    pub target: String,
+    pub target_alias: Option<String>,
+    pub source: MergeSource,
+    pub source_alias: Option<String>,
+    pub on: Condition,
+    pub when_matched: Option<MergeAction>,
+    pub when_not_matched: Option<MergeAction>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum MergeSource {
+    Table(String),
+    Subquery(Box<SelectStatement>),
+    Values(Vec<Vec<Expression>>, Vec<String>),  // rows and optional column names
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum MergeAction {
+    Update(Vec<Assignment>),
+    Delete,
+    Insert(Vec<String>, Vec<Expression>),  // (column_names, values)
+    DoNothing,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -114,20 +147,33 @@ pub enum DataType {
 #[derive(Debug, PartialEq, Clone)]
 pub struct InsertStatement {
     pub table_name: String,
+    pub columns: Vec<String>,   // empty means "all columns in schema order"
     pub source: InsertSource,
+    pub on_conflict: Option<OnConflict>,
+    pub returning: Option<Vec<SelectColumn>>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum InsertSource {
-    Values(Vec<Value>),
+    Values(Vec<Vec<Value>>),    // multi-row: each inner Vec is one row
     Select(Box<SelectStatement>),
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum OnConflict {
+    DoNothing,
+    DoUpdate {
+        conflict_columns: Vec<String>,
+        assignments: Vec<Assignment>,
+    },
 }
 
 #[cfg(test)]
 impl InsertStatement {
+    // Backwards-compat helper: returns first row's values
     pub fn values(&self) -> &[Value] {
         match &self.source {
-            InsertSource::Values(v) => v,
+            InsertSource::Values(rows) => rows.first().map(|r| r.as_slice()).unwrap_or(&[]),
             InsertSource::Select(_) => &[],
         }
     }
@@ -137,19 +183,23 @@ impl InsertStatement {
 pub struct UpdateStatement {
     pub table_name: String,
     pub assignments: Vec<Assignment>,
+    pub from: Option<(String, Option<String>)>,  // (table_name, alias) for UPDATE ... FROM
     pub where_clause: Option<WhereClause>,
+    pub returning: Option<Vec<SelectColumn>>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct Assignment {
     pub column: String,
-    pub value: Value,
+    pub value: Expression,   // supports column references and arithmetic
 }
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct DeleteStatement {
     pub table_name: String,
+    pub using: Option<(String, Option<String>)>,  // (table_name, alias) for DELETE ... USING
     pub where_clause: Option<WhereClause>,
+    pub returning: Option<Vec<SelectColumn>>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -623,6 +673,8 @@ pub fn parse_sql(input: &str) -> IResult<&str, SqlStatement> {
         parse_select,
         parse_update,
         parse_delete,
+        parse_truncate,
+        parse_merge,
     ))(input)?;
     let (input, _) = multispace0(input)?;
     Ok((input, stmt))
@@ -831,37 +883,125 @@ pub fn parse_insert(input: &str) -> IResult<&str, SqlStatement> {
     let (input, _) = tag_no_case("INTO")(input)?;
     let (input, _) = multispace1(input)?;
     let (input, table_name) = parse_identifier(input)?;
+
+    // Parse optional column list: (col1, col2, ...)
+    let (input, columns) = nom::combinator::opt(|input| {
+        let (input, _) = multispace0(input)?;
+        let (input, _) = nom_char('(')(input)?;
+        let (input, _) = multispace0(input)?;
+        let (input, cols) = nom::multi::separated_list1(
+            nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+            parse_identifier,
+        )(input)?;
+        let (input, _) = multispace0(input)?;
+        let (input, _) = nom_char(')')(input)?;
+        Ok((input, cols.into_iter().map(|s| s.to_string()).collect::<Vec<_>>()))
+    })(input)?;
+    let columns = columns.unwrap_or_default();
+
     let (input, _) = multispace1(input)?;
 
     // Try INSERT INTO ... SELECT first, then VALUES
-    let (input, source) = if let Ok((input, select)) = parse_select_statement(input) {
-        let (input, _) = multispace0(input)?;
-        let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
-        return Ok((input, SqlStatement::Insert(InsertStatement {
+    let (input, source) = if let Ok((i2, select)) = parse_select_statement(input) {
+        let (i2, _) = multispace0(i2)?;
+        let (i2, on_conflict) = parse_on_conflict(i2)?;
+        let (i2, returning) = parse_returning(i2)?;
+        let (i2, _) = multispace0(i2)?;
+        let (i2, _) = nom::combinator::opt(nom_char(';'))(i2)?;
+        return Ok((i2, SqlStatement::Insert(InsertStatement {
             table_name: table_name.to_string(),
+            columns,
             source: InsertSource::Select(Box::new(select)),
+            on_conflict,
+            returning,
         })));
     } else {
         let (input, _) = tag_no_case("VALUES")(input)?;
         let (input, _) = multispace0(input)?;
-        let (input, values) = delimited(
-            nom_char('('),
-            separated_list0(
-                delimited(multispace0, nom_char(','), multispace0),
-                parse_value
-            ),
-            nom_char(')'),
+        // Parse one or more rows separated by commas
+        let (input, rows) = nom::multi::separated_list1(
+            nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+            |input| {
+                let (input, _) = nom_char('(')(input)?;
+                let (input, _) = multispace0(input)?;
+                let (input, values) = separated_list0(
+                    delimited(multispace0, nom_char(','), multispace0),
+                    parse_value,
+                )(input)?;
+                let (input, _) = multispace0(input)?;
+                let (input, _) = nom_char(')')(input)?;
+                Ok((input, values))
+            }
         )(input)?;
-        (input, InsertSource::Values(values))
+        (input, InsertSource::Values(rows))
     };
 
+    let (input, on_conflict) = parse_on_conflict(input)?;
+    let (input, returning) = parse_returning(input)?;
     let (input, _) = multispace0(input)?;
     let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
 
     Ok((input, SqlStatement::Insert(InsertStatement {
         table_name: table_name.to_string(),
+        columns,
         source,
+        on_conflict,
+        returning,
     })))
+}
+
+/// Parse optional ON CONFLICT clause
+fn parse_on_conflict(input: &str) -> IResult<&str, Option<OnConflict>> {
+    nom::combinator::opt(|input| {
+        let (input, _) = multispace1(input)?;
+        let (input, _) = tag_no_case("ON")(input)?;
+        let (input, _) = multispace1(input)?;
+        let (input, _) = tag_no_case("CONFLICT")(input)?;
+        let (input, _) = multispace0(input)?;
+        // Optional conflict column list
+        let (input, conflict_columns) = nom::combinator::opt(|input| {
+            let (input, _) = nom_char('(')(input)?;
+            let (input, _) = multispace0(input)?;
+            let (input, cols) = nom::multi::separated_list1(
+                nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+                parse_identifier,
+            )(input)?;
+            let (input, _) = multispace0(input)?;
+            let (input, _) = nom_char(')')(input)?;
+            Ok((input, cols.into_iter().map(|s| s.to_string()).collect::<Vec<_>>()))
+        })(input)?;
+        let conflict_columns = conflict_columns.unwrap_or_default();
+        let (input, _) = multispace1(input)?;
+        let (input, _) = tag_no_case("DO")(input)?;
+        let (input, _) = multispace1(input)?;
+        // DO NOTHING
+        if let Ok((input, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("NOTHING")(input) {
+            return Ok((input, OnConflict::DoNothing));
+        }
+        // DO UPDATE SET ...
+        let (input, _) = tag_no_case("UPDATE")(input)?;
+        let (input, _) = multispace1(input)?;
+        let (input, _) = tag_no_case("SET")(input)?;
+        let (input, _) = multispace1(input)?;
+        let (input, assignments) = nom::multi::separated_list1(
+            nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+            parse_assignment,
+        )(input)?;
+        Ok((input, OnConflict::DoUpdate { conflict_columns, assignments }))
+    })(input)
+}
+
+/// Parse optional RETURNING clause
+fn parse_returning(input: &str) -> IResult<&str, Option<Vec<SelectColumn>>> {
+    nom::combinator::opt(|input| {
+        let (input, _) = multispace1(input)?;
+        let (input, _) = tag_no_case("RETURNING")(input)?;
+        let (input, _) = multispace1(input)?;
+        nom::multi::separated_list1(
+            nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+            parse_select_column,
+        )(input)
+    })(input)
 }
 
 /// Parse UPDATE statement
@@ -876,25 +1016,37 @@ pub fn parse_update(input: &str) -> IResult<&str, SqlStatement> {
         delimited(multispace0, nom_char(','), multispace0),
         parse_assignment
     )(input)?;
+    // Optional FROM clause for join-based updates
+    let (input, from) = nom::combinator::opt(|input| {
+        let (input, _) = multispace1(input)?;
+        let (input, _) = tag_no_case("FROM")(input)?;
+        let (input, _) = multispace1(input)?;
+        let (input, tbl) = parse_identifier(input)?;
+        let (input, alias) = nom::combinator::opt(parse_table_alias)(input)?;
+        Ok((input, (tbl.to_string(), alias)))
+    })(input)?;
     let (input, where_clause) = nom::combinator::opt(parse_where)(input)?;
+    let (input, returning) = parse_returning(input)?;
     let (input, _) = multispace0(input)?;
     let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
 
     Ok((input, SqlStatement::Update(UpdateStatement {
         table_name: table_name.to_string(),
         assignments,
+        from,
         where_clause,
+        returning,
     })))
 }
 
-/// Parse assignment: column = value
-fn parse_assignment(input: &str) -> IResult<&str, Assignment> {
+/// Parse assignment: column = expression
+pub fn parse_assignment(input: &str) -> IResult<&str, Assignment> {
     let (input, _) = multispace0(input)?;
     let (input, column) = parse_identifier(input)?;
     let (input, _) = multispace0(input)?;
     let (input, _) = nom_char('=')(input)?;
     let (input, _) = multispace0(input)?;
-    let (input, value) = parse_value(input)?;
+    let (input, value) = parse_expression(input)?;
     let (input, _) = multispace0(input)?;
 
     Ok((input, Assignment {
@@ -910,14 +1062,187 @@ pub fn parse_delete(input: &str) -> IResult<&str, SqlStatement> {
     let (input, _) = tag_no_case("FROM")(input)?;
     let (input, _) = multispace1(input)?;
     let (input, table_name) = parse_identifier(input)?;
+    // Optional USING clause for join-based deletes
+    let (input, using) = nom::combinator::opt(|input| {
+        let (input, _) = multispace1(input)?;
+        let (input, _) = tag_no_case("USING")(input)?;
+        let (input, _) = multispace1(input)?;
+        let (input, tbl) = parse_identifier(input)?;
+        let (input, alias) = nom::combinator::opt(parse_table_alias)(input)?;
+        Ok((input, (tbl.to_string(), alias)))
+    })(input)?;
     let (input, where_clause) = nom::combinator::opt(parse_where)(input)?;
+    let (input, returning) = parse_returning(input)?;
     let (input, _) = multispace0(input)?;
     let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
 
     Ok((input, SqlStatement::Delete(DeleteStatement {
         table_name: table_name.to_string(),
+        using,
         where_clause,
+        returning,
     })))
+}
+
+/// Parse TRUNCATE [TABLE] table_name
+pub fn parse_truncate(input: &str) -> IResult<&str, SqlStatement> {
+    let (input, _) = tag_no_case("TRUNCATE")(input)?;
+    let (input, _) = multispace1(input)?;
+    // Optional TABLE keyword
+    let (input, _) = nom::combinator::opt(nom::sequence::terminated(tag_no_case("TABLE"), multispace1))(input)?;
+    let (input, table_name) = parse_identifier(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
+    Ok((input, SqlStatement::Truncate(TruncateStatement { table_name: table_name.to_string() })))
+}
+
+/// Parse MERGE INTO target USING source ON condition WHEN ... THEN ...
+pub fn parse_merge(input: &str) -> IResult<&str, SqlStatement> {
+    let (input, _) = tag_no_case("MERGE")(input)?;
+    let (input, _) = multispace1(input)?;
+    // Optional INTO keyword
+    let (input, _) = nom::combinator::opt(nom::sequence::terminated(tag_no_case("INTO"), multispace1))(input)?;
+    let (input, target) = parse_identifier(input)?;
+    let (input, target_alias) = nom::combinator::opt(parse_table_alias)(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, _) = tag_no_case("USING")(input)?;
+    let (input, _) = multispace1(input)?;
+
+    // Source can be: (VALUES ...) AS alias, (SELECT ...) AS alias, or table [alias]
+    let (input, source, source_alias) = if let Ok((input, _)) = nom_char::<&str, nom::error::Error<&str>>('(')(input) {
+        let (input, _) = multispace0(input)?;
+        // Try VALUES first
+        if let Ok((input, rows)) = parse_values_clause(input) {
+            let (input, _) = multispace0(input)?;
+            let (input, _) = nom_char(')')(input)?;
+            // Parse alias and optional column names
+            let (input, (alias, col_names)) = parse_values_alias(input)?;
+            (input, MergeSource::Values(rows, col_names), Some(alias))
+        } else {
+            let (input, subquery) = parse_select_statement(input)?;
+            let (input, _) = multispace0(input)?;
+            let (input, _) = nom_char(')')(input)?;
+            let (input, alias) = nom::combinator::opt(parse_table_alias)(input)?;
+            (input, MergeSource::Subquery(Box::new(subquery)), alias)
+        }
+    } else {
+        let (input, tbl) = parse_identifier(input)?;
+        let (input, alias) = nom::combinator::opt(parse_table_alias)(input)?;
+        (input, MergeSource::Table(tbl.to_string()), alias)
+    };
+
+    let (input, _) = multispace1(input)?;
+    let (input, _) = tag_no_case("ON")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, on) = parse_condition(input)?;
+
+    // Parse WHEN MATCHED / WHEN NOT MATCHED clauses (at most one of each)
+    let (input, (when_matched, when_not_matched)) = parse_merge_when_clauses(input)?;
+
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
+
+    Ok((input, SqlStatement::Merge(MergeStatement {
+        target: target.to_string(),
+        target_alias,
+        source,
+        source_alias,
+        on,
+        when_matched,
+        when_not_matched,
+    })))
+}
+
+/// Parse WHEN MATCHED / WHEN NOT MATCHED clauses for MERGE
+fn parse_merge_when_clauses(input: &str) -> IResult<&str, (Option<MergeAction>, Option<MergeAction>)> {
+    let mut input = input;
+    let mut when_matched: Option<MergeAction> = None;
+    let mut when_not_matched: Option<MergeAction> = None;
+
+    // Try parsing up to 2 WHEN clauses
+    for _ in 0..4 {
+        let trimmed = input.trim_start();
+        if !trimmed.to_uppercase().starts_with("WHEN") {
+            break;
+        }
+        match parse_merge_when_clause(trimmed) {
+            Ok((rest, (is_matched, action))) => {
+                if is_matched && when_matched.is_none() {
+                    when_matched = Some(action);
+                } else if !is_matched && when_not_matched.is_none() {
+                    when_not_matched = Some(action);
+                }
+                input = rest;
+            }
+            Err(_) => break,
+        }
+    }
+    Ok((input, (when_matched, when_not_matched)))
+}
+
+/// Parse a single WHEN clause — returns (is_matched, action)
+fn parse_merge_when_clause(input: &str) -> IResult<&str, (bool, MergeAction)> {
+    let (input, _) = multispace0(input)?;
+    let (input, _) = tag_no_case("WHEN")(input)?;
+    let (input, _) = multispace1(input)?;
+    // Check for NOT MATCHED
+    let (input, is_not) = nom::combinator::opt(nom::sequence::terminated(
+        tag_no_case::<&str, &str, nom::error::Error<&str>>("NOT"),
+        multispace1,
+    ))(input)?;
+    let (input, _) = tag_no_case("MATCHED")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, _) = tag_no_case("THEN")(input)?;
+    let (input, _) = multispace1(input)?;
+    let is_matched = is_not.is_none();
+
+    // Parse the action: UPDATE SET ..., DELETE, INSERT ..., or DO NOTHING
+    let action = if let Ok((input, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("UPDATE")(input) {
+        let (input, _) = multispace1(input)?;
+        let (input, _) = tag_no_case("SET")(input)?;
+        let (input, _) = multispace1(input)?;
+        let (input, assignments) = nom::multi::separated_list1(
+            nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+            parse_assignment,
+        )(input)?;
+        return Ok((input, (is_matched, MergeAction::Update(assignments))));
+    } else if let Ok((input, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("DELETE")(input) {
+        return Ok((input, (is_matched, MergeAction::Delete)));
+    } else if let Ok((input, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("INSERT")(input) {
+        let (input, _) = multispace0(input)?;
+        // Optional column list
+        let (input, cols) = nom::combinator::opt(|input| {
+            let (input, _) = nom_char('(')(input)?;
+            let (input, _) = multispace0(input)?;
+            let (input, cols) = nom::multi::separated_list1(
+                nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+                parse_identifier,
+            )(input)?;
+            let (input, _) = multispace0(input)?;
+            let (input, _) = nom_char(')')(input)?;
+            Ok((input, cols.into_iter().map(|s| s.to_string()).collect::<Vec<_>>()))
+        })(input)?;
+        let (input, _) = multispace1(input)?;
+        let (input, _) = tag_no_case("VALUES")(input)?;
+        let (input, _) = multispace0(input)?;
+        let (input, _) = nom_char('(')(input)?;
+        let (input, _) = multispace0(input)?;
+        let (input, exprs) = nom::multi::separated_list1(
+            nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+            parse_expression,
+        )(input)?;
+        let (input, _) = multispace0(input)?;
+        let (input, _) = nom_char(')')(input)?;
+        return Ok((input, (is_matched, MergeAction::Insert(cols.unwrap_or_default(), exprs))));
+    } else {
+        // DO NOTHING (if someone writes it)
+        let _ = nom::combinator::opt(nom::sequence::pair(
+            tag_no_case::<&str, &str, nom::error::Error<&str>>("DO"),
+            nom::sequence::preceded(multispace1, tag_no_case("NOTHING")),
+        ))(input);
+        MergeAction::DoNothing
+    };
+    Ok((input, (is_matched, action)))
 }
 
 // DROP INDEX name; / DROP TABLE [IF EXISTS] name;
@@ -1613,7 +1938,7 @@ fn parse_limit_offset_clause(input: &str) -> IResult<&str, (Option<u64>, Option<
 
 /// Check if identifier is a reserved keyword that can't be used as an alias
 fn is_reserved_keyword(s: &str) -> bool {
-    matches!(s.to_uppercase().as_str(), "ON" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "OUTER" | "CROSS" | "WHERE" | "ORDER" | "GROUP" | "LIMIT" | "OFFSET" | "HAVING" | "UNION" | "ALL" | "CASE" | "WHEN" | "THEN" | "ELSE" | "END" | "AND" | "OR" | "NOT" | "AS" | "VIEW" | "OVER" | "PARTITION" | "NULLS" | "FIRST" | "LAST" | "INTERSECT" | "EXCEPT" | "ROWS" | "RANGE" | "GROUPS" | "PRECEDING" | "FOLLOWING" | "UNBOUNDED" | "BETWEEN" | "USING" | "NATURAL" | "ANY" | "SOME" | "FILTER" | "RECURSIVE" | "CURRENT_DATE" | "CURRENT_TIMESTAMP" | "EXTRACT" | "INTERVAL" | "DATEDIFF" | "DATE_TRUNC" | "DATE_PART" | "DATEADD" | "WINDOW" | "NTILE" | "PERCENT_RANK" | "CUME_DIST" | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" | "ROLLUP" | "CUBE" | "GROUPING" | "SETS" | "LATERAL" | "VALUES")
+    matches!(s.to_uppercase().as_str(), "ON" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "OUTER" | "CROSS" | "WHERE" | "ORDER" | "GROUP" | "LIMIT" | "OFFSET" | "HAVING" | "UNION" | "ALL" | "CASE" | "WHEN" | "THEN" | "ELSE" | "END" | "AND" | "OR" | "NOT" | "AS" | "VIEW" | "OVER" | "PARTITION" | "NULLS" | "FIRST" | "LAST" | "INTERSECT" | "EXCEPT" | "ROWS" | "RANGE" | "GROUPS" | "PRECEDING" | "FOLLOWING" | "UNBOUNDED" | "BETWEEN" | "USING" | "NATURAL" | "ANY" | "SOME" | "FILTER" | "RECURSIVE" | "CURRENT_DATE" | "CURRENT_TIMESTAMP" | "EXTRACT" | "INTERVAL" | "DATEDIFF" | "DATE_TRUNC" | "DATE_PART" | "DATEADD" | "WINDOW" | "NTILE" | "PERCENT_RANK" | "CUME_DIST" | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" | "ROLLUP" | "CUBE" | "GROUPING" | "SETS" | "LATERAL" | "VALUES" | "RETURNING" | "CONFLICT" | "EXCLUDED" | "NOTHING" | "MERGE" | "MATCHED" | "TRUNCATE")
 }
 
 /// Parse optional table alias, handling both `table alias` and `table AS alias` forms
@@ -3885,7 +4210,7 @@ mod tests {
                 assert_eq!(upd.table_name, "users");
                 assert_eq!(upd.assignments.len(), 1);
                 assert_eq!(upd.assignments[0].column, "name");
-                assert_eq!(upd.assignments[0].value, Value::String("Bob".to_string()));
+                assert_eq!(upd.assignments[0].value, Expression::Literal(Value::String("Bob".to_string())));
                 assert!(upd.where_clause.is_some());
             }
             _ => panic!("Expected Update"),
@@ -3918,7 +4243,7 @@ mod tests {
                 assert_eq!(upd.table_name, "users");
                 assert_eq!(upd.assignments.len(), 1);
                 assert_eq!(upd.assignments[0].column, "active");
-                assert_eq!(upd.assignments[0].value, Value::Int(0));
+                assert_eq!(upd.assignments[0].value, Expression::Literal(Value::Int(0)));
                 assert!(upd.where_clause.is_none());
             }
             _ => panic!("Expected Update"),
@@ -3946,7 +4271,7 @@ mod tests {
 
         match stmt {
             SqlStatement::Update(upd) => {
-                assert_eq!(upd.assignments[0].value, Value::Null);
+                assert_eq!(upd.assignments[0].value, Expression::Literal(Value::Null));
             }
             _ => panic!("Expected Update"),
         }

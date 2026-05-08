@@ -3,7 +3,7 @@ use std::io::{self, Write as IoWrite, BufWriter, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::fmt;
 use std::collections::HashMap;
-use crate::parser::{CreateTableStatement, CreateIndexStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, UpdateStatement, DeleteStatement, AlterTableStatement, AlterAction, Value, Condition, Expression, Operator, ArithOp, SelectStatement, SelectColumn, FromClause, apply_scalar_func, apply_round, apply_concat, apply_substr, apply_replace, apply_lpad, apply_rpad, apply_cast, apply_greatest, apply_least, apply_power, apply_position, apply_repeat};
+use crate::parser::{CreateTableStatement, CreateIndexStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, InsertSource, OnConflict, UpdateStatement, DeleteStatement, TruncateStatement, MergeStatement, MergeSource, MergeAction, AlterTableStatement, AlterAction, Value, Condition, Expression, Operator, ArithOp, SelectStatement, SelectColumn, FromClause, apply_scalar_func, apply_round, apply_concat, apply_substr, apply_replace, apply_lpad, apply_rpad, apply_cast, apply_greatest, apply_least, apply_power, apply_position, apply_repeat};
 
 /// Storage engine for persisting tables to disk
 pub struct Storage {
@@ -132,36 +132,85 @@ impl Storage {
         Ok(())
     }
 
-    /// Insert a row of data into a table
-    pub fn insert_row(&self, stmt: &InsertStatement) -> Result<(), StorageError> {
-        let values = match &stmt.source {
-            crate::parser::InsertSource::Values(v) => v,
-            crate::parser::InsertSource::Select(_) => panic!("insert_row called with Select source — caller must resolve to values first"),
+    /// Insert row(s) into a table. Returns (rows_inserted, returning_rows).
+    pub fn insert_row(&self, stmt: &InsertStatement) -> Result<(usize, Option<Vec<Vec<Value>>>), StorageError> {
+        let rows = match &stmt.source {
+            InsertSource::Values(rows) => rows,
+            InsertSource::Select(_) => panic!("insert_row called with Select source — caller must resolve to values first"),
         };
 
-        // Load schema to validate the insert
         let schema = self.load_schema(&stmt.table_name)?;
+        let mut count = 0usize;
+        let mut returning_rows: Vec<Vec<Value>> = Vec::new();
 
-        // Validate column count
-        if values.len() != schema.columns.len() {
-            return Err(StorageError::ColumnCountMismatch {
-                expected: schema.columns.len(),
-                got: values.len(),
-            });
+        for values in rows {
+            // Map values to schema positions when a column list is provided
+            let mapped_values = if stmt.columns.is_empty() {
+                values.clone()
+            } else {
+                schema.columns.iter().map(|col_def| {
+                    stmt.columns.iter().position(|c| c.eq_ignore_ascii_case(&col_def.name))
+                        .and_then(|i| values.get(i).cloned())
+                        .unwrap_or(Value::Null)
+                }).collect()
+            };
+
+            // Validate column count (only when no explicit column list)
+            if stmt.columns.is_empty() && mapped_values.len() != schema.columns.len() {
+                return Err(StorageError::ColumnCountMismatch {
+                    expected: schema.columns.len(),
+                    got: mapped_values.len(),
+                });
+            }
+
+            let result = self.insert_single_row(&stmt.table_name, mapped_values, &schema, &stmt.on_conflict);
+            match result {
+                Ok(Some(final_values)) => {
+                    if let Some(ref ret_cols) = stmt.returning {
+                        let ret_row = project_returning(&final_values, ret_cols, &schema.columns);
+                        returning_rows.push(ret_row);
+                    }
+                    count += 1;
+                }
+                Ok(None) => {
+                    // ON CONFLICT DO NOTHING — skip silently
+                }
+                Err(StorageError::DuplicateKey { ref column, ref value }) => {
+                    // Re-check for on_conflict handler
+                    if stmt.on_conflict.is_none() {
+                        return Err(StorageError::DuplicateKey { column: column.clone(), value: value.clone() });
+                    }
+                    // ON CONFLICT DO NOTHING or DO UPDATE already handled inside insert_single_row
+                    unreachable!("on_conflict should be handled in insert_single_row");
+                }
+                Err(e) => return Err(e),
+            }
         }
 
+        let returning = if stmt.returning.is_some() { Some(returning_rows) } else { None };
+        Ok((count, returning))
+    }
+
+    /// Insert a single row; handles ON CONFLICT. Returns Some(final_values) on success, None for DO NOTHING.
+    fn insert_single_row(
+        &self,
+        table_name: &str,
+        values: Vec<Value>,
+        schema: &CreateTableStatement,
+        on_conflict: &Option<OnConflict>,
+    ) -> Result<Option<Vec<Value>>, StorageError> {
         // Build final values, filling in auto_increment where NULL is provided
-        let mut final_values = values.clone();
+        let mut final_values = values;
         for (i, col_def) in schema.columns.iter().enumerate() {
             if col_def.auto_increment && final_values[i] == Value::Null {
-                let next_val = self.next_auto_increment(&stmt.table_name)?;
+                let next_val = self.next_auto_increment(table_name)?;
                 final_values[i] = Value::Int(next_val);
             }
         }
 
-        // Coerce string literals into Date/Timestamp values when the column type requires it
+        // Coerce string literals into Date/Timestamp values
         for (i, col_def) in schema.columns.iter().enumerate() {
-            match (&final_values[i], &col_def.data_type) {
+            match (&final_values[i].clone(), &col_def.data_type) {
                 (Value::String(s), DataType::Date) => {
                     if let Some(days) = crate::parser::parse_date_str(s) {
                         final_values[i] = Value::Date(days);
@@ -188,35 +237,46 @@ impl Storage {
             }
         }
 
-        // Enforce primary key constraints (NOT NULL + unique)
+        // Enforce primary key NOT NULL
         for (i, col_def) in schema.columns.iter().enumerate() {
             if col_def.primary_key && final_values[i] == Value::Null {
                 return Err(StorageError::NullConstraint { column: col_def.name.clone() });
             }
         }
 
-        // Enforce uniqueness for PRIMARY KEY and UNIQUE columns
+        // Check uniqueness — handle ON CONFLICT if there's a duplicate
         let unique_columns: Vec<(usize, &ColumnDefinition)> = schema.columns.iter()
             .enumerate()
             .filter(|(_, c)| c.primary_key || c.unique)
             .collect();
+
         if !unique_columns.is_empty() {
-            let existing_rows = self.read_rows(&stmt.table_name)?;
+            let existing_rows = self.read_rows(table_name)?;
             for row in &existing_rows {
                 for &(i, col_def) in &unique_columns {
-                    // NULL values don't violate uniqueness
                     if final_values[i] != Value::Null && row[i] == final_values[i] {
-                        return Err(StorageError::DuplicateKey {
-                            column: col_def.name.clone(),
-                            value: format!("{:?}", final_values[i]),
-                        });
+                        // Conflict detected — check ON CONFLICT handler
+                        match on_conflict {
+                            Some(OnConflict::DoNothing) => return Ok(None),
+                            Some(OnConflict::DoUpdate { assignments, .. }) => {
+                                return self.apply_conflict_update(table_name, schema, &final_values, assignments);
+                            }
+                            None => {
+                                return Err(StorageError::DuplicateKey {
+                                    column: col_def.name.clone(),
+                                    value: format!("{:?}", final_values[i]),
+                                });
+                            }
+                        }
                     }
                 }
             }
         }
 
-        // Enforce unique index constraints
-        self.check_unique_indexes(&stmt.table_name, &final_values)?;
+        // Check unique index constraints
+        if let Err(e) = self.check_unique_indexes_conflict(table_name, &final_values, on_conflict, schema) {
+            return Err(e);
+        }
 
         // Enforce foreign key constraints
         for (i, col_def) in schema.columns.iter().enumerate() {
@@ -227,96 +287,263 @@ impl Storage {
             }
         }
 
-        // Serialize row and append to data file
-        let data_path = self.data_path(&stmt.table_name);
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(data_path)?;
-
+        // Append row to data file
+        let data_path = self.data_path(table_name);
+        let file = fs::OpenOptions::new().create(true).append(true).open(data_path)?;
         let mut writer = BufWriter::new(file);
         let row_str = serialize_row(&final_values);
         writeln!(writer, "{}", row_str)?;
         writer.flush()?;
 
-        // Rebuild any indexes on this table
-        self.rebuild_indexes_for_table(&stmt.table_name)?;
+        self.rebuild_indexes_for_table(table_name)?;
+        Ok(Some(final_values))
+    }
 
+    /// Apply DO UPDATE assignments when a conflict is detected; returns the final updated row.
+    fn apply_conflict_update(
+        &self,
+        table_name: &str,
+        schema: &CreateTableStatement,
+        excluded_values: &[Value],  // the incoming (conflicting) row values
+        assignments: &[crate::parser::Assignment],
+    ) -> Result<Option<Vec<Value>>, StorageError> {
+        // Build column context for EXCLUDED.col resolution
+        let excluded_cols: Vec<(String, String)> = schema.columns.iter()
+            .map(|c| ("EXCLUDED".to_string(), c.name.clone()))
+            .collect();
+
+        // Read all rows to find the conflicting one and update it
+        let mut rows = self.read_rows(table_name)?;
+        let unique_columns: Vec<(usize, &ColumnDefinition)> = schema.columns.iter()
+            .enumerate()
+            .filter(|(_, c)| c.primary_key || c.unique)
+            .collect();
+
+        let mut updated_row: Option<Vec<Value>> = None;
+        for row in &mut rows {
+            // Find conflicting row
+            let is_conflict = unique_columns.iter().any(|(i, _)| {
+                excluded_values[*i] != Value::Null && row[*i] == excluded_values[*i]
+            });
+            if is_conflict {
+                // Build combined context: target row cols + EXCLUDED cols
+                let target_cols: Vec<(String, String)> = schema.columns.iter()
+                    .map(|c| (table_name.to_string(), c.name.clone()))
+                    .collect();
+                let mut combined_cols: Vec<(String, String)> = target_cols;
+                combined_cols.extend(excluded_cols.clone());
+                let mut combined_row: Vec<Value> = row.clone();
+                combined_row.extend(excluded_values.iter().cloned());
+
+                for assignment in assignments {
+                    if let Some(col_idx) = schema.columns.iter().position(|c| c.name == assignment.column) {
+                        let new_val = resolve_expr_with_excluded(&assignment.value, &combined_row, &combined_cols);
+                        row[col_idx] = new_val.unwrap_or(Value::Null);
+                    }
+                }
+                updated_row = Some(row.clone());
+                break;
+            }
+        }
+
+        // Write rows back
+        let data_path = self.data_path(table_name);
+        let file = fs::File::create(data_path)?;
+        let mut writer = BufWriter::new(file);
+        for row in &rows {
+            writeln!(writer, "{}", serialize_row(row))?;
+        }
+        writer.flush()?;
+        self.rebuild_indexes_for_table(table_name)?;
+
+        Ok(updated_row.map(Some).unwrap_or(None))
+    }
+
+    /// Like check_unique_indexes but aware of ON CONFLICT
+    fn check_unique_indexes_conflict(
+        &self,
+        table_name: &str,
+        values: &[Value],
+        on_conflict: &Option<OnConflict>,
+        schema: &CreateTableStatement,
+    ) -> Result<(), StorageError> {
+        let meta = self.load_index_meta()?;
+        for (idx_name, t, col_name, unique) in &meta {
+            if !unique || t != table_name { continue; }
+            let col_idx = schema.columns.iter()
+                .position(|c| &c.name == col_name)
+                .ok_or_else(|| StorageError::ColumnNotFound(col_name.clone()))?;
+            let val = &values[col_idx];
+            if *val == Value::Null { continue; }
+            if let Some(row_nums) = self.lookup_index(idx_name, val)? {
+                if !row_nums.is_empty() {
+                    match on_conflict {
+                        Some(OnConflict::DoNothing) => return Err(StorageError::DuplicateKey {
+                            column: col_name.clone(),
+                            value: format!("{:?}", val),
+                        }),
+                        _ => {
+                            return Err(StorageError::DuplicateKey {
+                                column: col_name.clone(),
+                                value: format!("{:?}", val),
+                            });
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
-    /// Update rows in a table matching the WHERE condition
-    pub fn update_rows(&self, stmt: &UpdateStatement) -> Result<usize, StorageError> {
+    /// Update rows in a table matching the WHERE condition. Returns (count, returning_rows).
+    pub fn update_rows(&self, stmt: &UpdateStatement) -> Result<(usize, Option<Vec<Vec<Value>>>), StorageError> {
         let schema = self.load_schema(&stmt.table_name)?;
 
-        // Validate that all columns in assignments exist and have correct types
-        for assignment in &stmt.assignments {
-            let col_def = schema.columns.iter()
-                .find(|c| c.name == assignment.column)
-                .ok_or_else(|| StorageError::ColumnNotFound(assignment.column.clone()))?;
-            validate_value_type(&assignment.value, &col_def.data_type, &col_def.name)?;
-            // Prevent setting NOT NULL or primary key columns to NULL
-            if (col_def.not_null || col_def.primary_key) && assignment.value == Value::Null {
-                return Err(StorageError::NullConstraint { column: col_def.name.clone() });
-            }
-        }
+        // Build column context for the target table
+        let target_cols: Vec<(String, String)> = schema.columns.iter()
+            .map(|c| (stmt.table_name.clone(), c.name.clone()))
+            .collect();
 
-        // Read all existing rows
-        let mut rows = self.read_rows(&stmt.table_name)?;
-        let mut updated_count = 0;
-
-        // Update matching rows
-        for row in &mut rows {
-            let matches = match &stmt.where_clause {
-                Some(wc) => evaluate_condition(&wc.condition, row, &schema.columns, self),
-                None => true, // No WHERE clause means update all rows
+        // If FROM clause present, load the join table
+        let (from_cols, from_rows): (Vec<(String, String)>, Vec<Vec<Value>>) =
+            if let Some((from_table, from_alias)) = &stmt.from {
+                let from_schema = self.load_schema(from_table)?;
+                let alias = from_alias.as_deref().unwrap_or(from_table.as_str());
+                let cols = from_schema.columns.iter()
+                    .map(|c| (alias.to_string(), c.name.clone()))
+                    .collect();
+                let rows = self.read_rows(from_table)?;
+                (cols, rows)
+            } else {
+                (Vec::new(), vec![Vec::new()])  // single empty join row when no FROM
             };
 
-            if matches {
-                // Apply assignments
-                for assignment in &stmt.assignments {
-                    if let Some(col_idx) = schema.columns.iter().position(|c| c.name == assignment.column) {
-                        row[col_idx] = assignment.value.clone();
-                    }
-                }
-                updated_count += 1;
+        // Validate assignment columns exist and literal types match upfront
+        for assignment in &stmt.assignments {
+            let col_def = schema.columns.iter().find(|c| c.name == assignment.column)
+                .ok_or_else(|| StorageError::ColumnNotFound(assignment.column.clone()))?;
+            // Check type immediately when the RHS is a plain literal
+            if let Expression::Literal(val) = &assignment.value {
+                validate_value_type(val, &col_def.data_type, &assignment.column)?;
             }
         }
 
-        // Write all rows back to file (overwrite)
+        let mut rows = self.read_rows(&stmt.table_name)?;
+        let mut updated_count = 0;
+        let mut returning_rows: Vec<Vec<Value>> = Vec::new();
+
+        // Determine which target row indices to update (handles FROM cross-join)
+        let mut rows_to_update: Vec<bool> = vec![false; rows.len()];
+        for (row_idx, row) in rows.iter().enumerate() {
+            for from_row in &from_rows {
+                // Build combined column context (target + from)
+                let mut combined_row: Vec<Value> = row.clone();
+                combined_row.extend(from_row.iter().cloned());
+                let mut combined_cols: Vec<(String, String)> = target_cols.clone();
+                combined_cols.extend(from_cols.iter().cloned());
+
+                let matches = match &stmt.where_clause {
+                    Some(wc) => eval_condition_cols(&wc.condition, &combined_row, &combined_cols, self),
+                    None => true,
+                };
+                if matches {
+                    rows_to_update[row_idx] = true;
+                    break;
+                }
+            }
+        }
+
+        // Apply assignments to matched rows
+        for (row_idx, row) in rows.iter_mut().enumerate() {
+            if !rows_to_update[row_idx] { continue; }
+
+            // Build combined context using an empty from_row for expression resolution
+            let mut combined_row: Vec<Value> = row.clone();
+            let first_from = from_rows.first().cloned().unwrap_or_default();
+            combined_row.extend(first_from.iter().cloned());
+            let mut combined_cols: Vec<(String, String)> = target_cols.clone();
+            combined_cols.extend(from_cols.iter().cloned());
+
+            for assignment in &stmt.assignments {
+                if let Some(col_idx) = schema.columns.iter().position(|c| c.name == assignment.column) {
+                    let new_val = resolve_expr_cols(&assignment.value, &combined_row, &combined_cols, self)
+                        .unwrap_or(Value::Null);
+                    // Type-check the resolved value
+                    validate_value_type(&new_val, &schema.columns[col_idx].data_type, &assignment.column)?;
+                    row[col_idx] = new_val;
+                }
+            }
+            if stmt.returning.is_some() {
+                let ret_row = project_returning(row, stmt.returning.as_ref().unwrap(), &schema.columns);
+                returning_rows.push(ret_row);
+            }
+            updated_count += 1;
+        }
+
+        // Write all rows back
         let data_path = self.data_path(&stmt.table_name);
         let file = fs::File::create(data_path)?;
         let mut writer = BufWriter::new(file);
         for row in &rows {
-            let row_str = serialize_row(row);
-            writeln!(writer, "{}", row_str)?;
+            writeln!(writer, "{}", serialize_row(row))?;
         }
         writer.flush()?;
 
         self.rebuild_indexes_for_table(&stmt.table_name)?;
-        Ok(updated_count)
+        let returning = if stmt.returning.is_some() { Some(returning_rows) } else { None };
+        Ok((updated_count, returning))
     }
 
-    /// Delete rows from a table matching the WHERE condition
-    pub fn delete_rows(&self, stmt: &DeleteStatement) -> Result<usize, StorageError> {
+    /// Delete rows from a table matching the WHERE condition. Returns (count, returning_rows).
+    pub fn delete_rows(&self, stmt: &DeleteStatement) -> Result<(usize, Option<Vec<Vec<Value>>>), StorageError> {
         let schema = self.load_schema(&stmt.table_name)?;
+        let target_cols: Vec<(String, String)> = schema.columns.iter()
+            .map(|c| (stmt.table_name.clone(), c.name.clone()))
+            .collect();
 
-        // Read all existing rows
+        // If USING clause present, load the join table
+        let (using_cols, using_rows): (Vec<(String, String)>, Vec<Vec<Value>>) =
+            if let Some((using_table, using_alias)) = &stmt.using {
+                let using_schema = self.load_schema(using_table)?;
+                let alias = using_alias.as_deref().unwrap_or(using_table.as_str());
+                let cols = using_schema.columns.iter()
+                    .map(|c| (alias.to_string(), c.name.clone()))
+                    .collect();
+                let rows = self.read_rows(using_table)?;
+                (cols, rows)
+            } else {
+                (Vec::new(), vec![Vec::new()])
+            };
+
         let rows = self.read_rows(&stmt.table_name)?;
+        let mut remaining_rows: Vec<Vec<Value>> = Vec::new();
+        let mut deleted_rows: Vec<Vec<Value>> = Vec::new();
 
-        // Split into rows to keep and rows to delete
-        let (remaining_rows, deleted_rows): (Vec<_>, Vec<_>) = rows
-            .into_iter()
-            .partition(|row| {
-                match &stmt.where_clause {
-                    Some(wc) => !evaluate_condition(&wc.condition, row, &schema.columns, self),
-                    None => false,
+        for row in rows {
+            let mut should_delete = false;
+            for using_row in &using_rows {
+                let mut combined_row: Vec<Value> = row.clone();
+                combined_row.extend(using_row.iter().cloned());
+                let mut combined_cols: Vec<(String, String)> = target_cols.clone();
+                combined_cols.extend(using_cols.iter().cloned());
+
+                let matches = match &stmt.where_clause {
+                    Some(wc) => eval_condition_cols(&wc.condition, &combined_row, &combined_cols, self),
+                    None => true,
+                };
+                if matches {
+                    should_delete = true;
+                    break;
                 }
-            });
+            }
+            if should_delete {
+                deleted_rows.push(row);
+            } else {
+                remaining_rows.push(row);
+            }
+        }
 
-        let deleted_count = deleted_rows.len();
-
-        // Check FK constraints on deleted rows — are any referenced by child tables?
+        // Check FK constraints on deleted rows
         for (i, col) in schema.columns.iter().enumerate() {
             if col.primary_key {
                 let deleted_values: Vec<Value> = deleted_rows.iter().map(|r| r[i].clone()).collect();
@@ -326,18 +553,163 @@ impl Storage {
             }
         }
 
-        // Write remaining rows back to file
+        // Build RETURNING rows before writing
+        let returning_rows: Vec<Vec<Value>> = if let Some(ref ret_cols) = stmt.returning {
+            deleted_rows.iter()
+                .map(|row| project_returning(row, ret_cols, &schema.columns))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let deleted_count = deleted_rows.len();
+
+        // Write remaining rows back
         let data_path = self.data_path(&stmt.table_name);
         let file = fs::File::create(data_path)?;
         let mut writer = BufWriter::new(file);
         for row in &remaining_rows {
-            let row_str = serialize_row(row);
-            writeln!(writer, "{}", row_str)?;
+            writeln!(writer, "{}", serialize_row(row))?;
         }
         writer.flush()?;
 
         self.rebuild_indexes_for_table(&stmt.table_name)?;
-        Ok(deleted_count)
+        let returning = if stmt.returning.is_some() { Some(returning_rows) } else { None };
+        Ok((deleted_count, returning))
+    }
+
+    /// Truncate a table (delete all rows, keep schema)
+    pub fn truncate_table(&self, stmt: &TruncateStatement) -> Result<(), StorageError> {
+        if !self.table_exists(&stmt.table_name) {
+            return Err(StorageError::TableNotFound(stmt.table_name.clone()));
+        }
+        let data_path = self.data_path(&stmt.table_name);
+        fs::write(data_path, "")?;
+        self.rebuild_indexes_for_table(&stmt.table_name)?;
+        Ok(())
+    }
+
+    /// Execute a MERGE statement. Returns (matched_count, inserted_count).
+    pub fn execute_merge(&self, stmt: &MergeStatement) -> Result<(usize, usize), StorageError> {
+        let target_schema = self.load_schema(&stmt.target)?;
+        let target_alias = stmt.target_alias.as_deref().unwrap_or(&stmt.target);
+
+        // Materialize source rows
+        let (source_cols, source_rows): (Vec<(String, String)>, Vec<Vec<Value>>) = match &stmt.source {
+            MergeSource::Table(tbl) => {
+                let schema = self.load_schema(tbl)?;
+                let alias = stmt.source_alias.as_deref().unwrap_or(tbl.as_str());
+                let cols = schema.columns.iter().map(|c| (alias.to_string(), c.name.clone())).collect();
+                let rows = self.read_rows(tbl)?;
+                (cols, rows)
+            }
+            MergeSource::Values(rows_exprs, col_names) => {
+                let alias = stmt.source_alias.as_deref().unwrap_or("src");
+                let mat_rows: Vec<Vec<Value>> = rows_exprs.iter().map(|exprs| {
+                    exprs.iter().map(|e| {
+                        resolve_expression(e, &[], &[], self).unwrap_or(Value::Null)
+                    }).collect()
+                }).collect();
+                let ncols = mat_rows.first().map(|r| r.len()).unwrap_or(0);
+                let cols: Vec<(String, String)> = (0..ncols).map(|i| {
+                    let name = col_names.get(i).cloned().unwrap_or_else(|| format!("column{}", i + 1));
+                    (alias.to_string(), name)
+                }).collect();
+                (cols, mat_rows)
+            }
+            MergeSource::Subquery(_) => return Err(StorageError::InvalidData("MERGE with subquery source not yet supported".to_string())),
+        };
+
+        let target_cols: Vec<(String, String)> = target_schema.columns.iter()
+            .map(|c| (target_alias.to_string(), c.name.clone()))
+            .collect();
+
+        let mut target_rows = self.read_rows(&stmt.target)?;
+        let mut matched_count = 0usize;
+        let mut inserted_count = 0usize;
+
+        for src_row in &source_rows {
+            // Build combined context for ON condition evaluation
+            let mut matched_idx: Option<usize> = None;
+            for (i, tgt_row) in target_rows.iter().enumerate() {
+                let mut combined_row: Vec<Value> = tgt_row.clone();
+                combined_row.extend(src_row.iter().cloned());
+                let mut combined_cols: Vec<(String, String)> = target_cols.clone();
+                combined_cols.extend(source_cols.iter().cloned());
+                if eval_condition_cols(&stmt.on, &combined_row, &combined_cols, self) {
+                    matched_idx = Some(i);
+                    break;
+                }
+            }
+
+            if let Some(idx) = matched_idx {
+                // WHEN MATCHED
+                match &stmt.when_matched {
+                    Some(MergeAction::Update(assignments)) => {
+                        let tgt_row = &mut target_rows[idx];
+                        let mut combined_row: Vec<Value> = tgt_row.clone();
+                        combined_row.extend(src_row.iter().cloned());
+                        let mut combined_cols: Vec<(String, String)> = target_cols.clone();
+                        combined_cols.extend(source_cols.iter().cloned());
+                        for assignment in assignments {
+                            if let Some(col_idx) = target_schema.columns.iter().position(|c| c.name == assignment.column) {
+                                let new_val = resolve_expr_cols(&assignment.value, &combined_row, &combined_cols, self)
+                                    .unwrap_or(Value::Null);
+                                tgt_row[col_idx] = new_val;
+                            }
+                        }
+                        matched_count += 1;
+                    }
+                    Some(MergeAction::Delete) => {
+                        target_rows.remove(idx);
+                        matched_count += 1;
+                    }
+                    Some(MergeAction::DoNothing) | None => {}
+                    _ => {}
+                }
+            } else {
+                // WHEN NOT MATCHED
+                match &stmt.when_not_matched {
+                    Some(MergeAction::Insert(col_names, exprs)) => {
+                        let mut combined_row: Vec<Value> = vec![Value::Null; target_schema.columns.len()];
+                        combined_row.extend(src_row.iter().cloned());
+                        let mut combined_cols: Vec<(String, String)> = target_cols.clone();
+                        combined_cols.extend(source_cols.iter().cloned());
+
+                        let vals: Vec<Value> = exprs.iter()
+                            .map(|e| resolve_expr_cols(e, &combined_row, &combined_cols, self).unwrap_or(Value::Null))
+                            .collect();
+
+                        let new_row = if col_names.is_empty() {
+                            vals
+                        } else {
+                            target_schema.columns.iter().map(|col| {
+                                col_names.iter().position(|cn| cn.eq_ignore_ascii_case(&col.name))
+                                    .and_then(|i| vals.get(i).cloned())
+                                    .unwrap_or(Value::Null)
+                            }).collect()
+                        };
+
+                        target_rows.push(new_row);
+                        inserted_count += 1;
+                    }
+                    Some(MergeAction::DoNothing) | None => {}
+                    _ => {}
+                }
+            }
+        }
+
+        // Write all target rows back
+        let data_path = self.data_path(&stmt.target);
+        let file = fs::File::create(data_path)?;
+        let mut writer = BufWriter::new(file);
+        for row in &target_rows {
+            writeln!(writer, "{}", serialize_row(row))?;
+        }
+        writer.flush()?;
+        self.rebuild_indexes_for_table(&stmt.target)?;
+
+        Ok((matched_count, inserted_count))
     }
 
     /// Read specific rows by row numbers (used with index lookups)
@@ -1380,6 +1752,143 @@ fn resolve_correlated_expr_storage(
     }
 }
 
+/// Project RETURNING columns from a row using schema column names
+fn project_returning(row: &[Value], ret_cols: &[SelectColumn], schema_cols: &[ColumnDefinition]) -> Vec<Value> {
+    ret_cols.iter().map(|col| {
+        match col {
+            SelectColumn::All => row.first().cloned().unwrap_or(Value::Null),
+            SelectColumn::Column(name) => {
+                schema_cols.iter().position(|c| c.name.eq_ignore_ascii_case(name))
+                    .and_then(|i| row.get(i).cloned())
+                    .unwrap_or(Value::Null)
+            }
+            SelectColumn::Alias(inner, _) => {
+                if let SelectColumn::Column(name) = inner.as_ref() {
+                    schema_cols.iter().position(|c| c.name.eq_ignore_ascii_case(name))
+                        .and_then(|i| row.get(i).cloned())
+                        .unwrap_or(Value::Null)
+                } else { Value::Null }
+            }
+            SelectColumn::Expr(e) => resolve_expression(e, row, schema_cols, &Storage { data_dir: std::path::PathBuf::new() })
+                .unwrap_or(Value::Null),
+            _ => Value::Null,
+        }
+    }).collect()
+}
+
+/// Evaluate a condition using (table_alias, column_name) column context
+fn eval_condition_cols(condition: &Condition, row: &[Value], cols: &[(String, String)], storage: &Storage) -> bool {
+    // Convert (alias, col) context to a fake schema so we can reuse resolve_expr_cols
+    match condition {
+        Condition::And(l, r) => eval_condition_cols(l, row, cols, storage) && eval_condition_cols(r, row, cols, storage),
+        Condition::Or(l, r) => eval_condition_cols(l, row, cols, storage) || eval_condition_cols(r, row, cols, storage),
+        Condition::Not(inner) => !eval_condition_cols(inner, row, cols, storage),
+        Condition::Comparison { left, operator, right, upper_bound } => {
+            if *operator == Operator::IsNull || *operator == Operator::IsNotNull {
+                let lv = resolve_expr_cols(left, row, cols, storage);
+                let is_null = matches!(lv, Some(Value::Null) | None);
+                return if *operator == Operator::IsNull { is_null } else { !is_null };
+            }
+            if *operator == Operator::Between || *operator == Operator::NotBetween {
+                let val = resolve_expr_cols(left, row, cols, storage);
+                let low = resolve_expr_cols(right, row, cols, storage);
+                let high = upper_bound.as_ref().and_then(|e| resolve_expr_cols(e, row, cols, storage));
+                let in_range = matches!((&val, &low, &high), (Some(v), Some(l), Some(h))
+                    if compare_values(v, &Operator::GreaterThanOrEqual, l) && compare_values(v, &Operator::LessThanOrEqual, h));
+                return if *operator == Operator::Between { in_range } else { !in_range };
+            }
+            if *operator == Operator::Exists || *operator == Operator::NotExists {
+                if let Expression::Subquery(subquery) = right {
+                    // Build a fake schema from the (alias, col) context for correlated lookup
+                    let fake_schema: Vec<ColumnDefinition> = cols.iter().map(|(_, name)| {
+                        ColumnDefinition {
+                            name: name.clone(),
+                            data_type: DataType::Varchar(None),
+                            auto_increment: false, primary_key: false,
+                            not_null: false, unique: false, references: None,
+                        }
+                    }).collect();
+                    let exists = execute_correlated_scalar_subquery(subquery, storage, row, &fake_schema).is_some();
+                    return if *operator == Operator::NotExists { !exists } else { exists };
+                }
+                return false;
+            }
+            if *operator == Operator::In || *operator == Operator::NotIn {
+                let lv = resolve_expr_cols(left, row, cols, storage);
+                let contains = match right {
+                    Expression::List(exprs) => lv.map_or(false, |lv| {
+                        exprs.iter().any(|e| resolve_expr_cols(e, row, cols, storage).map_or(false, |rv| rv == lv))
+                    }),
+                    _ => false,
+                };
+                return if *operator == Operator::NotIn { !contains } else { contains };
+            }
+            let lv = resolve_expr_cols(left, row, cols, storage);
+            let rv = resolve_expr_cols(right, row, cols, storage);
+            match (lv, rv) {
+                (Some(l), Some(r)) => compare_values(&l, operator, &r),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Resolve an expression using (table_alias, column_name) column context
+fn resolve_expr_cols(expr: &Expression, row: &[Value], cols: &[(String, String)], storage: &Storage) -> Option<Value> {
+    match expr {
+        Expression::Literal(v) => Some(v.clone()),
+        Expression::Column(name) => {
+            // Match by column name (last match wins when ambiguous, but first is more typical)
+            cols.iter().position(|c| c.1.eq_ignore_ascii_case(name)).map(|i| row[i].clone())
+        }
+        Expression::QualifiedColumn(table, col) => {
+            cols.iter().position(|c| c.0.eq_ignore_ascii_case(table) && c.1.eq_ignore_ascii_case(col))
+                .map(|i| row[i].clone())
+        }
+        Expression::BinaryOp(left, op, right) => {
+            let lv = resolve_expr_cols(left, row, cols, storage)?;
+            let rv = resolve_expr_cols(right, row, cols, storage)?;
+            storage_eval_arith(&lv, op, &rv)
+        }
+        Expression::Coalesce(exprs) => {
+            exprs.iter().find_map(|e| {
+                let v = resolve_expr_cols(e, row, cols, storage);
+                match v { Some(Value::Null) | None => None, other => other }
+            })
+        }
+        Expression::Case(branches, else_expr) => {
+            for (cond, then_expr) in branches {
+                if eval_condition_cols(cond, row, cols, storage) {
+                    return resolve_expr_cols(then_expr, row, cols, storage);
+                }
+            }
+            else_expr.as_ref().and_then(|e| resolve_expr_cols(e, row, cols, storage))
+        }
+        // For all others, build a fake flat schema and delegate to resolve_expression
+        other => {
+            // Build a fake schema with columns in order
+            let fake_schema: Vec<ColumnDefinition> = cols.iter().enumerate().map(|(_, (_, name))| {
+                ColumnDefinition {
+                    name: name.clone(),
+                    data_type: crate::parser::DataType::Varchar(None),
+                    auto_increment: false,
+                    primary_key: false,
+                    not_null: false,
+                    unique: false,
+                    references: None,
+                }
+            }).collect();
+            resolve_expression(other, row, &fake_schema, storage)
+        }
+    }
+}
+
+/// Resolve expression where EXCLUDED.col refers to excluded_row values
+fn resolve_expr_with_excluded(expr: &Expression, combined_row: &[Value], combined_cols: &[(String, String)]) -> Option<Value> {
+    resolve_expr_cols(expr, combined_row, combined_cols, &Storage { data_dir: std::path::PathBuf::new() })
+}
+
 fn evaluate_condition(condition: &Condition, row: &[Value], schema: &[ColumnDefinition], storage: &Storage) -> bool {
     match condition {
         Condition::And(left, right) => {
@@ -2151,22 +2660,30 @@ mod tests {
         // Insert data
         let insert_stmt = InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![
+            source: crate::parser::InsertSource::Values(vec![vec![
                 Value::Int(1),
                 Value::String("Alice".to_string()),
                 Value::String("alice@example.com".to_string()),
-            ]),
+            ]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         };
         storage.insert_row(&insert_stmt).unwrap();
 
         // Insert more data
         let insert_stmt2 = InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![
+            source: crate::parser::InsertSource::Values(vec![vec![
                 Value::Int(2),
                 Value::String("Bob".to_string()),
                 Value::String("bob@example.com".to_string()),
-            ]),
+            ]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         };
         storage.insert_row(&insert_stmt2).unwrap();
 
@@ -2206,11 +2723,15 @@ mod tests {
 
         let insert_stmt = InsertStatement {
             table_name: "products".to_string(),
-            source: crate::parser::InsertSource::Values(vec![
+            source: crate::parser::InsertSource::Values(vec![vec![
                 Value::Int(1),
                 Value::String("Widget".to_string()),
                 Value::Null,
-            ]),
+            ]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         };
         storage.insert_row(&insert_stmt).unwrap();
 
@@ -2240,7 +2761,11 @@ mod tests {
         // Try to insert with wrong number of columns
         let insert_stmt = InsertStatement {
             table_name: "test".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(1)]), // Missing one column
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(1)]]), // Missing one column
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         };
 
         let result = storage.insert_row(&insert_stmt);
@@ -2268,10 +2793,14 @@ mod tests {
         // Try to insert string into int column
         let insert_stmt = InsertStatement {
             table_name: "test".to_string(),
-            source: crate::parser::InsertSource::Values(vec![
+            source: crate::parser::InsertSource::Values(vec![vec![
                 Value::String("not a number".to_string()),
                 Value::String("Alice".to_string()),
-            ]),
+            ]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         };
 
         let result = storage.insert_row(&insert_stmt);
@@ -2330,11 +2859,19 @@ mod tests {
 
         let insert1 = crate::parser::InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(1), Value::String("Alice".to_string())]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(1), Value::String("Alice".to_string())]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         };
         let insert2 = crate::parser::InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(2), Value::String("Bob".to_string())]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(2), Value::String("Bob".to_string())]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         };
         storage.insert_row(&insert1).unwrap();
         storage.insert_row(&insert2).unwrap();
@@ -2344,8 +2881,10 @@ mod tests {
             table_name: "users".to_string(),
             assignments: vec![Assignment {
                 column: "name".to_string(),
-                value: Value::String("Alice Updated".to_string()),
+                value: Expression::Literal(Value::String("Alice Updated".to_string())),
             }],
+            from: None,
+            returning: None,
             where_clause: Some(WhereClause {
                 condition: Condition::Comparison { upper_bound: None,
                     left: Expression::Column("id".to_string()),
@@ -2356,7 +2895,7 @@ mod tests {
         };
 
         let updated = storage.update_rows(&update_stmt).unwrap();
-        assert_eq!(updated, 1);
+        assert_eq!(updated.0, 1);
 
         let rows = storage.read_rows("users").unwrap();
         assert_eq!(rows[0][1], Value::String("Alice Updated".to_string()));
@@ -2387,7 +2926,11 @@ mod tests {
         for i in 1..=3 {
             let insert = crate::parser::InsertStatement {
                 table_name: "users".to_string(),
-                source: crate::parser::InsertSource::Values(vec![Value::Int(i), Value::Int(1)]),
+                source: crate::parser::InsertSource::Values(vec![vec![Value::Int(i), Value::Int(1)]]),
+            
+                columns: Vec::new(),
+                on_conflict: None,
+                returning: None,
             };
             storage.insert_row(&insert).unwrap();
         }
@@ -2397,8 +2940,10 @@ mod tests {
             table_name: "users".to_string(),
             assignments: vec![Assignment {
                 column: "active".to_string(),
-                value: Value::Int(0),
+                value: Expression::Literal(Value::Int(0)),
             }],
+            from: None,
+            returning: None,
             where_clause: Some(WhereClause {
                 condition: Condition::Comparison { upper_bound: None,
                     left: Expression::Column("active".to_string()),
@@ -2409,7 +2954,7 @@ mod tests {
         };
 
         let updated = storage.update_rows(&update_stmt).unwrap();
-        assert_eq!(updated, 3);
+        assert_eq!(updated.0, 3);
 
         let rows = storage.read_rows("users").unwrap();
         for row in rows {
@@ -2440,7 +2985,11 @@ mod tests {
         for i in 1..=3 {
             let insert = crate::parser::InsertStatement {
                 table_name: "users".to_string(),
-                source: crate::parser::InsertSource::Values(vec![Value::Int(i), Value::String("old".to_string())]),
+                source: crate::parser::InsertSource::Values(vec![vec![Value::Int(i), Value::String("old".to_string())]]),
+            
+                columns: Vec::new(),
+                on_conflict: None,
+                returning: None,
             };
             storage.insert_row(&insert).unwrap();
         }
@@ -2450,13 +2999,15 @@ mod tests {
             table_name: "users".to_string(),
             assignments: vec![Assignment {
                 column: "status".to_string(),
-                value: Value::String("new".to_string()),
+                value: Expression::Literal(Value::String("new".to_string())),
             }],
+            from: None,
+            returning: None,
             where_clause: None,
         };
 
         let updated = storage.update_rows(&update_stmt).unwrap();
-        assert_eq!(updated, 3);
+        assert_eq!(updated.0, 3);
 
         let rows = storage.read_rows("users").unwrap();
         for row in rows {
@@ -2485,7 +3036,11 @@ mod tests {
 
         let insert = crate::parser::InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(1)]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(1)]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         };
         storage.insert_row(&insert).unwrap();
 
@@ -2494,8 +3049,10 @@ mod tests {
             table_name: "users".to_string(),
             assignments: vec![Assignment {
                 column: "id".to_string(),
-                value: Value::Int(99),
+                value: Expression::Literal(Value::Int(99)),
             }],
+            from: None,
+            returning: None,
             where_clause: Some(WhereClause {
                 condition: Condition::Comparison { upper_bound: None,
                     left: Expression::Column("id".to_string()),
@@ -2506,7 +3063,7 @@ mod tests {
         };
 
         let updated = storage.update_rows(&update_stmt).unwrap();
-        assert_eq!(updated, 0);
+        assert_eq!(updated.0, 0);
 
         let rows = storage.read_rows("users").unwrap();
         assert_eq!(rows[0][0], Value::Int(1)); // Unchanged
@@ -2535,8 +3092,10 @@ mod tests {
             table_name: "users".to_string(),
             assignments: vec![Assignment {
                 column: "nonexistent".to_string(),
-                value: Value::Int(1),
+                value: Expression::Literal(Value::Int(1)),
             }],
+            from: None,
+            returning: None,
             where_clause: None,
         };
 
@@ -2568,8 +3127,10 @@ mod tests {
             table_name: "users".to_string(),
             assignments: vec![Assignment {
                 column: "id".to_string(),
-                value: Value::String("not a number".to_string()),
+                value: Expression::Literal(Value::String("not a number".to_string())),
             }],
+            from: None,
+            returning: None,
             where_clause: None,
         };
 
@@ -2601,7 +3162,11 @@ mod tests {
         for (id, name) in [(1, "Alice"), (2, "Bob"), (3, "Charlie")] {
             let insert = crate::parser::InsertStatement {
                 table_name: "users".to_string(),
-                source: crate::parser::InsertSource::Values(vec![Value::Int(id), Value::String(name.to_string())]),
+                source: crate::parser::InsertSource::Values(vec![vec![Value::Int(id), Value::String(name.to_string())]]),
+            
+                columns: Vec::new(),
+                on_conflict: None,
+                returning: None,
             };
             storage.insert_row(&insert).unwrap();
         }
@@ -2609,6 +3174,8 @@ mod tests {
         // Delete where id = 2
         let delete_stmt = DeleteStatement {
             table_name: "users".to_string(),
+            using: None,
+            returning: None,
             where_clause: Some(WhereClause {
                 condition: Condition::Comparison { upper_bound: None,
                     left: Expression::Column("id".to_string()),
@@ -2619,7 +3186,7 @@ mod tests {
         };
 
         let deleted = storage.delete_rows(&delete_stmt).unwrap();
-        assert_eq!(deleted, 1);
+        assert_eq!(deleted.0, 1);
 
         let rows = storage.read_rows("users").unwrap();
         assert_eq!(rows.len(), 2);
@@ -2651,7 +3218,11 @@ mod tests {
         for (id, active) in [(1, 1), (2, 0), (3, 1), (4, 0)] {
             let insert = crate::parser::InsertStatement {
                 table_name: "users".to_string(),
-                source: crate::parser::InsertSource::Values(vec![Value::Int(id), Value::Int(active)]),
+                source: crate::parser::InsertSource::Values(vec![vec![Value::Int(id), Value::Int(active)]]),
+            
+                columns: Vec::new(),
+                on_conflict: None,
+                returning: None,
             };
             storage.insert_row(&insert).unwrap();
         }
@@ -2659,6 +3230,8 @@ mod tests {
         // Delete inactive users (active = 0)
         let delete_stmt = DeleteStatement {
             table_name: "users".to_string(),
+            using: None,
+            returning: None,
             where_clause: Some(WhereClause {
                 condition: Condition::Comparison { upper_bound: None,
                     left: Expression::Column("active".to_string()),
@@ -2669,7 +3242,7 @@ mod tests {
         };
 
         let deleted = storage.delete_rows(&delete_stmt).unwrap();
-        assert_eq!(deleted, 2);
+        assert_eq!(deleted.0, 2);
 
         let rows = storage.read_rows("users").unwrap();
         assert_eq!(rows.len(), 2);
@@ -2701,7 +3274,11 @@ mod tests {
         for i in 1..=5 {
             let insert = crate::parser::InsertStatement {
                 table_name: "users".to_string(),
-                source: crate::parser::InsertSource::Values(vec![Value::Int(i)]),
+                source: crate::parser::InsertSource::Values(vec![vec![Value::Int(i)]]),
+            
+                columns: Vec::new(),
+                on_conflict: None,
+                returning: None,
             };
             storage.insert_row(&insert).unwrap();
         }
@@ -2709,11 +3286,13 @@ mod tests {
         // Delete all (no WHERE clause)
         let delete_stmt = DeleteStatement {
             table_name: "users".to_string(),
+            using: None,
+            returning: None,
             where_clause: None,
         };
 
         let deleted = storage.delete_rows(&delete_stmt).unwrap();
-        assert_eq!(deleted, 5);
+        assert_eq!(deleted.0, 5);
 
         let rows = storage.read_rows("users").unwrap();
         assert_eq!(rows.len(), 0);
@@ -2740,13 +3319,19 @@ mod tests {
 
         let insert = crate::parser::InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(1)]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(1)]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         };
         storage.insert_row(&insert).unwrap();
 
         // Delete with non-matching condition
         let delete_stmt = DeleteStatement {
             table_name: "users".to_string(),
+            using: None,
+            returning: None,
             where_clause: Some(WhereClause {
                 condition: Condition::Comparison { upper_bound: None,
                     left: Expression::Column("id".to_string()),
@@ -2757,7 +3342,7 @@ mod tests {
         };
 
         let deleted = storage.delete_rows(&delete_stmt).unwrap();
-        assert_eq!(deleted, 0);
+        assert_eq!(deleted.0, 0);
 
         let rows = storage.read_rows("users").unwrap();
         assert_eq!(rows.len(), 1);
@@ -2776,6 +3361,8 @@ mod tests {
 
         let delete_stmt = DeleteStatement {
             table_name: "nonexistent".to_string(),
+            using: None,
+            returning: None,
             where_clause: None,
         };
 
@@ -2801,7 +3388,11 @@ mod tests {
 
         let insert = InsertStatement {
             table_name: "events".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::String("launch".to_string()), Value::String("2024-03-15".to_string())]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::String("launch".to_string()), Value::String("2024-03-15".to_string())]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         };
         storage.insert_row(&insert).unwrap();
 
@@ -2812,7 +3403,11 @@ mod tests {
         // invalid date should fail
         let bad_insert = InsertStatement {
             table_name: "events".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::String("oops".to_string()), Value::String("not-a-date".to_string())]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::String("oops".to_string()), Value::String("not-a-date".to_string())]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         };
         assert!(bad_insert.values().len() == 2);
         assert!(storage.insert_row(&bad_insert).is_err());
@@ -2836,7 +3431,11 @@ mod tests {
 
         let insert = InsertStatement {
             table_name: "logs".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::String("hello".to_string()), Value::String("2024-03-15 14:30:00".to_string())]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::String("hello".to_string()), Value::String("2024-03-15 14:30:00".to_string())]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         };
         storage.insert_row(&insert).unwrap();
 
@@ -2847,7 +3446,11 @@ mod tests {
         // a completely invalid timestamp string should fail
         let bad_insert = InsertStatement {
             table_name: "logs".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::String("bad".to_string()), Value::String("not-a-timestamp".to_string())]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::String("bad".to_string()), Value::String("not-a-timestamp".to_string())]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         };
         assert!(storage.insert_row(&bad_insert).is_err());
 
@@ -2871,13 +3474,21 @@ mod tests {
         // Insert with NULL for auto_increment column
         let insert1 = InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Null, Value::String("Alice".to_string())]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Null, Value::String("Alice".to_string())]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         };
         storage.insert_row(&insert1).unwrap();
 
         let insert2 = InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Null, Value::String("Bob".to_string())]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Null, Value::String("Bob".to_string())]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         };
         storage.insert_row(&insert2).unwrap();
 
@@ -2888,7 +3499,11 @@ mod tests {
         // Can also supply an explicit value
         let insert3 = InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(10), Value::String("Charlie".to_string())]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(10), Value::String("Charlie".to_string())]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         };
         storage.insert_row(&insert3).unwrap();
 
@@ -2914,21 +3529,33 @@ mod tests {
 
         let insert1 = InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(1), Value::String("Alice".to_string())]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(1), Value::String("Alice".to_string())]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         };
         storage.insert_row(&insert1).unwrap();
 
         // Duplicate key should fail
         let insert2 = InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(1), Value::String("Bob".to_string())]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(1), Value::String("Bob".to_string())]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         };
         assert!(matches!(storage.insert_row(&insert2), Err(StorageError::DuplicateKey { .. })));
 
         // Different key should succeed
         let insert3 = InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(2), Value::String("Bob".to_string())]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(2), Value::String("Bob".to_string())]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         };
         storage.insert_row(&insert3).unwrap();
 
@@ -2952,7 +3579,11 @@ mod tests {
         // NULL primary key should fail
         let insert = InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Null, Value::String("Alice".to_string())]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Null, Value::String("Alice".to_string())]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         };
         assert!(matches!(storage.insert_row(&insert), Err(StorageError::NullConstraint { .. })));
 
@@ -2975,7 +3606,11 @@ mod tests {
         storage.create_table(&create_users).unwrap();
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(1), Value::String("Alice".to_string())]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(1), Value::String("Alice".to_string())]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         }).unwrap();
 
         // Child table with FK
@@ -2992,13 +3627,21 @@ mod tests {
         // Valid FK reference
         storage.insert_row(&InsertStatement {
             table_name: "orders".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(1), Value::Int(1)]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(1), Value::Int(1)]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         }).unwrap();
 
         // Invalid FK reference should fail
         let result = storage.insert_row(&InsertStatement {
             table_name: "orders".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(2), Value::Int(999)]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(2), Value::Int(999)]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         });
         assert!(matches!(result, Err(StorageError::ForeignKeyViolation { .. })));
 
@@ -3021,11 +3664,19 @@ mod tests {
         storage.create_table(&create_users).unwrap();
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(1), Value::String("Alice".to_string())]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(1), Value::String("Alice".to_string())]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         }).unwrap();
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(2), Value::String("Bob".to_string())]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(2), Value::String("Bob".to_string())]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         }).unwrap();
 
         // Child table with FK
@@ -3040,12 +3691,18 @@ mod tests {
         storage.create_table(&create_orders).unwrap();
         storage.insert_row(&InsertStatement {
             table_name: "orders".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(1), Value::Int(1)]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(1), Value::Int(1)]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         }).unwrap();
 
         // Deleting referenced parent should fail
         let result = storage.delete_rows(&DeleteStatement {
             table_name: "users".to_string(),
+            using: None,
+            returning: None,
             where_clause: Some(crate::parser::WhereClause {
                 condition: Condition::Comparison { upper_bound: None,
                     left: Expression::Column("id".to_string()),
@@ -3059,6 +3716,8 @@ mod tests {
         // Deleting non-referenced parent should succeed
         let result = storage.delete_rows(&DeleteStatement {
             table_name: "users".to_string(),
+            using: None,
+            returning: None,
             where_clause: Some(crate::parser::WhereClause {
                 condition: Condition::Comparison { upper_bound: None,
                     left: Expression::Column("id".to_string()),
@@ -3090,13 +3749,21 @@ mod tests {
         // Valid insert
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(1), Value::String("Alice".to_string())]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(1), Value::String("Alice".to_string())]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         }).unwrap();
 
         // NULL in NOT NULL column should fail
         let result = storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(2), Value::Null]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(2), Value::Null]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         });
         assert!(matches!(result, Err(StorageError::NullConstraint { .. })));
 
@@ -3120,24 +3787,40 @@ mod tests {
 
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(1), Value::String("a@b.com".to_string())]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(1), Value::String("a@b.com".to_string())]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         }).unwrap();
 
         // Duplicate unique value should fail
         let result = storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(2), Value::String("a@b.com".to_string())]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(2), Value::String("a@b.com".to_string())]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         });
         assert!(matches!(result, Err(StorageError::DuplicateKey { .. })));
 
         // NULL values don't violate uniqueness
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(3), Value::Null]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(3), Value::Null]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         }).unwrap();
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(4), Value::Null]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(4), Value::Null]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         }).unwrap();
 
         fs::remove_dir_all(&temp_dir).unwrap();
@@ -3159,15 +3842,27 @@ mod tests {
 
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(1), Value::String("Alice".to_string())]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(1), Value::String("Alice".to_string())]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         }).unwrap();
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(2), Value::String("Bob".to_string())]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(2), Value::String("Bob".to_string())]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         }).unwrap();
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(3), Value::String("Alice".to_string())]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(3), Value::String("Alice".to_string())]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         }).unwrap();
 
         // Create index on name column
@@ -3215,7 +3910,11 @@ mod tests {
 
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(1), Value::String("Alice".to_string())]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(1), Value::String("Alice".to_string())]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         }).unwrap();
 
         storage.create_index(&CreateIndexStatement {
@@ -3228,7 +3927,11 @@ mod tests {
         // Insert another row — index should be rebuilt
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(2), Value::String("Bob".to_string())]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(2), Value::String("Bob".to_string())]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         }).unwrap();
 
         let result = storage.lookup_index("idx_name", &Value::String("Bob".to_string())).unwrap();
@@ -3255,11 +3958,19 @@ mod tests {
 
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(1), Value::String("Alice".to_string())]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(1), Value::String("Alice".to_string())]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         }).unwrap();
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(2), Value::String("Bob".to_string())]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(2), Value::String("Bob".to_string())]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         }).unwrap();
 
         storage.create_index(&CreateIndexStatement {
@@ -3272,6 +3983,8 @@ mod tests {
         // Delete Alice
         storage.delete_rows(&DeleteStatement {
             table_name: "users".to_string(),
+            using: None,
+            returning: None,
             where_clause: Some(WhereClause {
                 condition: Condition::Comparison { upper_bound: None,
                     left: Expression::Column("name".to_string()),
@@ -3376,15 +4089,27 @@ mod tests {
 
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(1), Value::String("Alice".to_string())]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(1), Value::String("Alice".to_string())]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         }).unwrap();
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(2), Value::String("Bob".to_string())]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(2), Value::String("Bob".to_string())]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         }).unwrap();
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(3), Value::String("Charlie".to_string())]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(3), Value::String("Charlie".to_string())]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         }).unwrap();
 
         // Read only rows 0 and 2
@@ -3412,7 +4137,11 @@ mod tests {
 
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(1), Value::String("a@b.com".to_string())]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(1), Value::String("a@b.com".to_string())]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         }).unwrap();
 
         // Create unique index on email
@@ -3426,20 +4155,32 @@ mod tests {
         // Inserting a duplicate email should fail
         let result = storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(2), Value::String("a@b.com".to_string())]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(2), Value::String("a@b.com".to_string())]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         });
         assert!(matches!(result, Err(StorageError::DuplicateKey { .. })));
 
         // Inserting a different email should succeed
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(3), Value::String("c@d.com".to_string())]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(3), Value::String("c@d.com".to_string())]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         }).unwrap();
 
         // NULL should not violate unique index
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(4), Value::Null]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(4), Value::Null]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         }).unwrap();
 
         fs::remove_dir_all(&temp_dir).unwrap();
@@ -3461,11 +4202,19 @@ mod tests {
 
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(1), Value::String("Alice".to_string())]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(1), Value::String("Alice".to_string())]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         }).unwrap();
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(2), Value::String("Alice".to_string())]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(2), Value::String("Alice".to_string())]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         }).unwrap();
 
         // Creating a unique index should fail because duplicates exist
@@ -3495,7 +4244,11 @@ mod tests {
         }).unwrap();
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(1), Value::String("Alice".to_string())]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(1), Value::String("Alice".to_string())]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         }).unwrap();
 
         storage.alter_table(&AlterTableStatement {
@@ -3528,7 +4281,11 @@ mod tests {
         }).unwrap();
         storage.insert_row(&InsertStatement {
             table_name: "t".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(1)]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(1)]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         }).unwrap();
 
         let mut col = ColumnDefinition::new("required", DataType::Int);
@@ -3558,7 +4315,11 @@ mod tests {
         }).unwrap();
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(1), Value::String("Alice".to_string()), Value::Int(99)]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(1), Value::String("Alice".to_string()), Value::Int(99)]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         }).unwrap();
 
         storage.alter_table(&AlterTableStatement {
@@ -3656,7 +4417,11 @@ mod tests {
         }).unwrap();
         storage.insert_row(&InsertStatement {
             table_name: "users".to_string(),
-            source: crate::parser::InsertSource::Values(vec![Value::Int(1), Value::String("Alice".to_string())]),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(1), Value::String("Alice".to_string())]]),
+        
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
         }).unwrap();
 
         storage.alter_table(&AlterTableStatement {
@@ -3765,7 +4530,7 @@ mod tests {
         if let Ok((_, stmt)) = parse_sql(update_sql) {
             if let crate::parser::SqlStatement::Update(s) = stmt {
                 let n = storage.update_rows(&s).unwrap();
-                assert_eq!(n, 1);
+                assert_eq!(n.0, 1);
             }
         }
 

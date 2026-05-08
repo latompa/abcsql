@@ -27,7 +27,13 @@ pub fn execute(storage: &Storage, sql: &str) -> Result<String, String> {
         }
         SqlStatement::Insert(insert_stmt) => {
             storage.insert_row(&insert_stmt)
-                .map(|_| "Inserted 1 row".to_string())
+                .map(|(n, ret)| {
+                    if let Some(rows) = ret {
+                        format_returning_rows(&rows)
+                    } else {
+                        format!("Inserted {} row(s)", n)
+                    }
+                })
                 .map_err(|e| e.to_string())
         }
         SqlStatement::Select(select_stmt) => {
@@ -35,12 +41,34 @@ pub fn execute(storage: &Storage, sql: &str) -> Result<String, String> {
         }
         SqlStatement::Update(update_stmt) => {
             storage.update_rows(&update_stmt)
-                .map(|n| format!("Updated {} row(s)", n))
+                .map(|(n, ret)| {
+                    if let Some(rows) = ret {
+                        format_returning_rows(&rows)
+                    } else {
+                        format!("Updated {} row(s)", n)
+                    }
+                })
                 .map_err(|e| e.to_string())
         }
         SqlStatement::Delete(delete_stmt) => {
             storage.delete_rows(&delete_stmt)
-                .map(|n| format!("Deleted {} row(s)", n))
+                .map(|(n, ret)| {
+                    if let Some(rows) = ret {
+                        format_returning_rows(&rows)
+                    } else {
+                        format!("Deleted {} row(s)", n)
+                    }
+                })
+                .map_err(|e| e.to_string())
+        }
+        SqlStatement::Truncate(stmt) => {
+            storage.truncate_table(&stmt)
+                .map(|_| format!("Truncated table '{}'", stmt.table_name))
+                .map_err(|e| e.to_string())
+        }
+        SqlStatement::Merge(stmt) => {
+            storage.execute_merge(&stmt)
+                .map(|(matched, inserted)| format!("Merged: {} matched, {} inserted", matched, inserted))
                 .map_err(|e| e.to_string())
         }
         SqlStatement::CreateIndex(idx_stmt) => {
@@ -81,6 +109,25 @@ pub fn execute(storage: &Storage, sql: &str) -> Result<String, String> {
                 .map_err(|e| e.to_string())
         }
     }
+}
+
+/// Format RETURNING rows as a simple newline-separated value list
+fn format_returning_rows(rows: &[Vec<Value>]) -> String {
+    if rows.is_empty() {
+        return "(0 rows)".to_string();
+    }
+    let lines: Vec<String> = rows.iter().map(|row| {
+        row.iter().map(|v| match v {
+            Value::Int(n) => n.to_string(),
+            Value::Float(f) => format!("{}", f),
+            Value::Bool(b) => b.to_string(),
+            Value::String(s) => s.clone(),
+            Value::Date(d) => parser::format_date(*d),
+            Value::Timestamp(ts) => parser::format_timestamp(*ts),
+            Value::Null => "NULL".to_string(),
+        }).collect::<Vec<_>>().join(", ")
+    }).collect();
+    format!("({} rows)\n{}", rows.len(), lines.join("\n"))
 }
 
 // Column map type used throughout lib.rs: (table_alias, column_name)

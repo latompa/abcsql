@@ -160,7 +160,7 @@ fn execute_sql(sql: &str, storage: &Storage) {
             match &insert_stmt.source {
                 parser::InsertSource::Values(_) => {
                     match storage.insert_row(&insert_stmt) {
-                        Ok(_) => println!("Inserted 1 row"),
+                        Ok((n, _)) => println!("Inserted {} row(s)", n),
                         Err(e) => eprintln!("Error: {}", e),
                     }
                 }
@@ -175,13 +175,13 @@ fn execute_sql(sql: &str, storage: &Storage) {
         }
         SqlStatement::Update(update_stmt) => {
             match storage.update_rows(&update_stmt) {
-                Ok(count) => println!("Updated {} row(s)", count),
+                Ok((count, _)) => println!("Updated {} row(s)", count),
                 Err(e) => eprintln!("Error: {}", e),
             }
         }
         SqlStatement::Delete(delete_stmt) => {
             match storage.delete_rows(&delete_stmt) {
-                Ok(count) => println!("Deleted {} row(s)", count),
+                Ok((count, _)) => println!("Deleted {} row(s)", count),
                 Err(e) => eprintln!("Error: {}", e),
             }
         }
@@ -231,6 +231,19 @@ fn execute_sql(sql: &str, storage: &Storage) {
             }
             match storage.drop_view(&stmt.view_name) {
                 Ok(_) => println!("Dropped view '{}'", stmt.view_name),
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        }
+        SqlStatement::Truncate(stmt) => {
+            let name = stmt.table_name.clone();
+            match storage.truncate_table(&stmt) {
+                Ok(_) => println!("Truncated table '{}'", name),
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        }
+        SqlStatement::Merge(stmt) => {
+            match storage.execute_merge(&stmt) {
+                Ok((matched, inserted)) => println!("Merged: {} matched, {} inserted", matched, inserted),
                 Err(e) => eprintln!("Error: {}", e),
             }
         }
@@ -745,7 +758,10 @@ fn execute_insert_select(table_name: &str, select: &parser::SelectStatement, sto
         let values = project(row);
         let stmt = parser::InsertStatement {
             table_name: table_name.to_string(),
-            source: parser::InsertSource::Values(values),
+            columns: Vec::new(),
+            source: parser::InsertSource::Values(vec![values]),
+            on_conflict: None,
+            returning: None,
         };
         match storage.insert_row(&stmt) {
             Ok(_) => count += 1,

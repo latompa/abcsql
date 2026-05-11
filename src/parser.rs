@@ -142,12 +142,21 @@ impl ColumnDefinition {
 #[derive(Debug, PartialEq, Clone)]
 pub enum DataType {
     Int,
+    SmallInt,
+    BigInt,
     Float,
+    Real,                              // alias for FLOAT
     Double,
     Boolean,
     Date,
     Timestamp,
-    Varchar(Option<usize>), // VARCHAR(255) or VARCHAR
+    Varchar(Option<usize>),            // VARCHAR(255) or VARCHAR
+    Char(Option<usize>),               // CHAR(n) or CHAR
+    Text,                              // unlimited text
+    Decimal(Option<u8>, Option<u8>),   // DECIMAL(p, s) / NUMERIC
+    Uuid,
+    Json,
+    Jsonb,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -482,8 +491,10 @@ pub enum ArithOp {
     Sub,
     Mul,
     Div,
-    Mod,    // % operator
-    Concat, // || operator
+    Mod,      // % operator
+    Concat,   // || operator
+    JsonGet,  // -> returns JSON
+    JsonGetText, // ->> returns text
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -506,6 +517,7 @@ pub enum Operator {
     IsNotNull,
     Between,
     NotBetween,
+    JsonContains, // @>
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -516,6 +528,7 @@ pub enum Value {
     String(String),
     Date(i32),       // days since 1970-01-01
     Timestamp(i64),  // seconds since 1970-01-01 00:00:00 UTC
+    Json(String),    // JSON value stored as raw text
     Null,
 }
 
@@ -833,16 +846,31 @@ fn parse_references(input: &str) -> IResult<&str, ForeignKeyRef> {
     Ok((input, ForeignKeyRef { table: table.to_string(), column: column.to_string() }))
 }
 
-/// Parse data type: INT or VARCHAR or VARCHAR(n)
+/// Parse data type: INT, VARCHAR, SMALLINT, BIGINT, TEXT, DECIMAL, UUID, JSON, etc.
 fn parse_data_type(input: &str) -> IResult<&str, DataType> {
     nom::branch::alt((
-        parse_timestamp_type,
-        parse_double_type,
-        parse_float_type,
-        parse_boolean_type,
-        parse_date_type,
-        parse_int_type,
-        parse_varchar_type,
+        nom::branch::alt((
+            parse_timestamp_type,  // before DATE
+            parse_double_type,     // before generic identifiers
+            parse_smallint_type,   // before INT
+            parse_bigint_type,     // before INT
+            parse_integer_type,    // INTEGER alias for INT
+            parse_int_type,
+            parse_float_type,
+            parse_real_type,
+        )),
+        nom::branch::alt((
+            parse_boolean_type,
+            parse_date_type,
+            parse_varchar_type,
+            parse_char_type,
+            parse_text_type,
+            parse_numeric_type,    // NUMERIC before anything shorter
+            parse_decimal_type,
+            parse_uuid_type,
+            parse_jsonb_type,      // JSONB before JSON
+            parse_json_type,
+        )),
     ))(input)
 }
 
@@ -861,6 +889,21 @@ fn parse_boolean_type(input: &str) -> IResult<&str, DataType> {
     Ok((input, DataType::Boolean))
 }
 
+fn parse_smallint_type(input: &str) -> IResult<&str, DataType> {
+    let (input, _) = tag_no_case("SMALLINT")(input)?;
+    Ok((input, DataType::SmallInt))
+}
+
+fn parse_bigint_type(input: &str) -> IResult<&str, DataType> {
+    let (input, _) = tag_no_case("BIGINT")(input)?;
+    Ok((input, DataType::BigInt))
+}
+
+fn parse_integer_type(input: &str) -> IResult<&str, DataType> {
+    let (input, _) = tag_no_case("INTEGER")(input)?;
+    Ok((input, DataType::Int))
+}
+
 fn parse_int_type(input: &str) -> IResult<&str, DataType> {
     let (input, _) = tag_no_case("INT")(input)?;
     Ok((input, DataType::Int))
@@ -869,6 +912,11 @@ fn parse_int_type(input: &str) -> IResult<&str, DataType> {
 fn parse_float_type(input: &str) -> IResult<&str, DataType> {
     let (input, _) = tag_no_case("FLOAT")(input)?;
     Ok((input, DataType::Float))
+}
+
+fn parse_real_type(input: &str) -> IResult<&str, DataType> {
+    let (input, _) = tag_no_case("REAL")(input)?;
+    Ok((input, DataType::Real))
 }
 
 fn parse_double_type(input: &str) -> IResult<&str, DataType> {
@@ -883,8 +931,68 @@ fn parse_varchar_type(input: &str) -> IResult<&str, DataType> {
         nom::character::complete::u64,
         nom_char(')'),
     ))(input)?;
-    
     Ok((input, DataType::Varchar(size.map(|s| s as usize))))
+}
+
+fn parse_char_type(input: &str) -> IResult<&str, DataType> {
+    let (input, _) = tag_no_case("CHAR")(input)?;
+    let (input, size) = nom::combinator::opt(delimited(
+        nom_char('('),
+        nom::character::complete::u64,
+        nom_char(')'),
+    ))(input)?;
+    Ok((input, DataType::Char(size.map(|s| s as usize))))
+}
+
+fn parse_text_type(input: &str) -> IResult<&str, DataType> {
+    let (input, _) = tag_no_case("TEXT")(input)?;
+    Ok((input, DataType::Text))
+}
+
+/// Parse DECIMAL(p, s) / DECIMAL(p) / DECIMAL or NUMERIC variants
+fn parse_decimal_prec(input: &str) -> IResult<&str, DataType> {
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, p) = nom::character::complete::u8(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, s) = nom::combinator::opt(nom::sequence::preceded(
+        nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+        nom::character::complete::u8,
+    ))(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, DataType::Decimal(Some(p), s)))
+}
+
+fn parse_decimal_type(input: &str) -> IResult<&str, DataType> {
+    let (input, _) = tag_no_case("DECIMAL")(input)?;
+    if let Ok((rest, dt)) = parse_decimal_prec(input) {
+        return Ok((rest, dt));
+    }
+    Ok((input, DataType::Decimal(None, None)))
+}
+
+fn parse_numeric_type(input: &str) -> IResult<&str, DataType> {
+    let (input, _) = tag_no_case("NUMERIC")(input)?;
+    if let Ok((rest, dt)) = parse_decimal_prec(input) {
+        return Ok((rest, dt));
+    }
+    Ok((input, DataType::Decimal(None, None)))
+}
+
+fn parse_uuid_type(input: &str) -> IResult<&str, DataType> {
+    let (input, _) = tag_no_case("UUID")(input)?;
+    Ok((input, DataType::Uuid))
+}
+
+fn parse_jsonb_type(input: &str) -> IResult<&str, DataType> {
+    let (input, _) = tag_no_case("JSONB")(input)?;
+    Ok((input, DataType::Jsonb))
+}
+
+fn parse_json_type(input: &str) -> IResult<&str, DataType> {
+    let (input, _) = tag_no_case("JSON")(input)?;
+    Ok((input, DataType::Json))
 }
 
 /// Parse INSERT statement
@@ -2407,6 +2515,18 @@ fn parse_primary_condition(input: &str) -> IResult<&str, Condition> {
         }
     }
 
+    // Try @> (JSON contains) before generic operator parse
+    if let Ok((rest, _)) = tag::<&str, &str, nom::error::Error<&str>>("@>")(input) {
+        let (rest, _) = multispace0(rest)?;
+        let (rest, right) = parse_expression(rest)?;
+        return Ok((rest, Condition::Comparison {
+            left,
+            operator: Operator::JsonContains,
+            right,
+            upper_bound: None,
+        }));
+    }
+
     let (input, operator) = parse_operator(input)?;
     let (input, _) = multispace0(input)?;
     let (input, right) = parse_expression(input)?;
@@ -2417,9 +2537,13 @@ fn parse_primary_condition(input: &str) -> IResult<&str, Condition> {
 /// Try to parse an arithmetic operator surrounded by optional whitespace
 fn parse_arith_add_sub(input: &str) -> IResult<&str, ArithOp> {
     let (input, _) = multispace0(input)?;
+    // Use nom::combinator::not to reject -> and ->> (JSON operators)
     let (input, op) = nom::branch::alt((
         nom::combinator::map(nom_char('+'), |_| ArithOp::Add),
-        nom::combinator::map(nom_char('-'), |_| ArithOp::Sub),
+        nom::combinator::value(ArithOp::Sub, nom::sequence::preceded(
+            nom_char('-'),
+            nom::combinator::peek(nom::combinator::not(nom_char('>'))),
+        )),
     ))(input)?;
     let (input, _) = multispace0(input)?;
     Ok((input, op))
@@ -2438,16 +2562,39 @@ fn parse_arith_mul_div(input: &str) -> IResult<&str, ArithOp> {
 
 /// Parse expression with arithmetic: handles ||, +, -, *, / with precedence
 fn parse_expression(input: &str) -> IResult<&str, Expression> {
-    let (mut input, mut left) = parse_arith_expr(input)?;
-    // || has lower precedence than +/-
+    let (mut input, mut left) = parse_json_expr(input)?;
+    // || has lower precedence than -> / ->> / arithmetic
     while let Ok((remaining, _)) = nom::sequence::delimited(
         multispace0::<&str, nom::error::Error<&str>>,
         tag("||"),
         multispace0::<&str, nom::error::Error<&str>>,
     )(input) {
-        let (remaining, right) = parse_arith_expr(remaining)?;
+        let (remaining, right) = parse_json_expr(remaining)?;
         left = Expression::BinaryOp(Box::new(left), ArithOp::Concat, Box::new(right));
         input = remaining;
+    }
+    Ok((input, left))
+}
+
+/// Parse JSON field access: expr -> key  or  expr ->> key  (higher precedence than ||)
+fn parse_json_expr(input: &str) -> IResult<&str, Expression> {
+    let (mut input, mut left) = parse_arith_expr(input)?;
+    loop {
+        let trimmed = input.trim_start();
+        // ->> must be checked before -> to avoid mis-parsing
+        if let Ok((rest, _)) = tag::<&str, &str, nom::error::Error<&str>>("->>")( trimmed) {
+            let (rest, _) = multispace0(rest)?;
+            let (rest, right) = parse_arith_expr(rest)?;
+            left = Expression::BinaryOp(Box::new(left), ArithOp::JsonGetText, Box::new(right));
+            input = rest;
+        } else if let Ok((rest, _)) = tag::<&str, &str, nom::error::Error<&str>>("->")(trimmed) {
+            let (rest, _) = multispace0(rest)?;
+            let (rest, right) = parse_arith_expr(rest)?;
+            left = Expression::BinaryOp(Box::new(left), ArithOp::JsonGet, Box::new(right));
+            input = rest;
+        } else {
+            break;
+        }
     }
     Ok((input, left))
 }
@@ -3444,11 +3591,221 @@ pub fn apply_round(val: Value, places: Option<Value>) -> Option<Value> {
 }
 
 /// Evaluate CONCAT(values)
+/// Extract a nested JSON value by a dot-separated or array-index path string
+pub fn json_extract(json: &str, path: &str) -> Option<String> {
+    let mut current = json.trim().to_string();
+    for part in path.split('.') {
+        // numeric index → array access, otherwise → object key
+        if let Ok(idx) = part.parse::<usize>() {
+            current = json_array_get(&current, idx)?;
+        } else {
+            current = json_object_get(&current, part)?;
+        }
+    }
+    Some(current)
+}
+
+/// Get a field from a JSON object string; returns the raw value substring
+pub fn json_object_get(json: &str, key: &str) -> Option<String> {
+    let s = json.trim();
+    if !s.starts_with('{') { return None; }
+    let inner = &s[1..s.len().saturating_sub(1)];
+    let mut pos = 0;
+    let bytes = inner.as_bytes();
+    while pos < bytes.len() {
+        // skip whitespace
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() { pos += 1; }
+        if pos >= bytes.len() { break; }
+        // parse key string
+        if bytes[pos] != b'"' { break; }
+        let (k, key_end) = json_parse_string(inner, pos)?;
+        pos = key_end;
+        // skip whitespace and colon
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() { pos += 1; }
+        if pos >= bytes.len() || bytes[pos] != b':' { break; }
+        pos += 1;
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() { pos += 1; }
+        // parse value extent
+        let val_end = json_parse_value_extent(inner, pos)?;
+        let val_str = inner[pos..val_end].trim().to_string();
+        if k == key {
+            return Some(val_str);
+        }
+        pos = val_end;
+        // skip comma
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() { pos += 1; }
+        if pos < bytes.len() && bytes[pos] == b',' { pos += 1; }
+    }
+    None
+}
+
+/// Get the nth element (0-indexed) from a JSON array string
+pub fn json_array_get(json: &str, idx: usize) -> Option<String> {
+    let s = json.trim();
+    if !s.starts_with('[') { return None; }
+    let inner = &s[1..s.len().saturating_sub(1)];
+    let bytes = inner.as_bytes();
+    let mut pos = 0;
+    let mut count = 0;
+    while pos < bytes.len() {
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() { pos += 1; }
+        if pos >= bytes.len() { break; }
+        let val_end = json_parse_value_extent(inner, pos)?;
+        let val_str = inner[pos..val_end].trim().to_string();
+        if count == idx {
+            return Some(val_str);
+        }
+        count += 1;
+        pos = val_end;
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() { pos += 1; }
+        if pos < bytes.len() && bytes[pos] == b',' { pos += 1; }
+    }
+    None
+}
+
+/// Parse a JSON string literal starting at `pos`; returns (unescaped_content, end_pos)
+pub fn json_parse_string(s: &str, pos: usize) -> Option<(String, usize)> {
+    let bytes = s.as_bytes();
+    if bytes.get(pos) != Some(&b'"') { return None; }
+    let mut i = pos + 1;
+    let mut out = String::new();
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            i += 1;
+            out.push(match bytes[i] {
+                b'n' => '\n', b't' => '\t', b'r' => '\r',
+                b'"' => '"',  b'\\' => '\\', b'/' => '/',
+                _ => bytes[i] as char,
+            });
+        } else if bytes[i] == b'"' {
+            return Some((out, i + 1));
+        } else {
+            out.push(bytes[i] as char);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Return the end position (exclusive) of a JSON value starting at `pos`
+pub fn json_parse_value_extent(s: &str, pos: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if pos >= bytes.len() { return None; }
+    match bytes[pos] {
+        b'"' => {
+            let mut i = pos + 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' { i += 2; continue; }
+                if bytes[i] == b'"' { return Some(i + 1); }
+                i += 1;
+            }
+            None
+        }
+        b'{' | b'[' => {
+            let (open, close) = if bytes[pos] == b'{' { (b'{', b'}') } else { (b'[', b']') };
+            let mut depth = 0usize;
+            let mut i = pos;
+            while i < bytes.len() {
+                if bytes[i] == b'"' {
+                    // skip string
+                    i += 1;
+                    while i < bytes.len() {
+                        if bytes[i] == b'\\' { i += 2; continue; }
+                        if bytes[i] == b'"' { i += 1; break; }
+                        i += 1;
+                    }
+                    continue;
+                }
+                if bytes[i] == open { depth += 1; }
+                else if bytes[i] == close { depth -= 1; if depth == 0 { return Some(i + 1); } }
+                i += 1;
+            }
+            None
+        }
+        _ => {
+            // number, bool, null — read until delimiter
+            let mut i = pos;
+            while i < bytes.len() && !matches!(bytes[i], b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r') {
+                i += 1;
+            }
+            if i > pos { Some(i) } else { None }
+        }
+    }
+}
+
+/// Return true if `container` (JSON object or array) contains all key/values of `contained`
+pub fn json_contains(container: &str, contained: &str) -> bool {
+    let contained = contained.trim();
+    let container = container.trim();
+    if contained.starts_with('{') {
+        // object containment: every key/value in contained must exist in container
+        let bytes = contained.as_bytes();
+        let inner = &contained[1..contained.len().saturating_sub(1)];
+        let mut pos = 0;
+        let ibytes = inner.as_bytes();
+        while pos < ibytes.len() {
+            while pos < ibytes.len() && ibytes[pos].is_ascii_whitespace() { pos += 1; }
+            if pos >= ibytes.len() { break; }
+            if ibytes[pos] != b'"' { break; }
+            let (key, key_end) = match json_parse_string(inner, pos) { Some(x) => x, None => break };
+            pos = key_end;
+            while pos < ibytes.len() && ibytes[pos].is_ascii_whitespace() { pos += 1; }
+            if pos >= ibytes.len() || ibytes[pos] != b':' { return false; }
+            pos += 1;
+            while pos < ibytes.len() && ibytes[pos].is_ascii_whitespace() { pos += 1; }
+            let val_end = match json_parse_value_extent(inner, pos) { Some(x) => x, None => return false };
+            let needle_val = inner[pos..val_end].trim().to_string();
+            // check container has this key with equal value
+            if json_object_get(container, &key).as_deref() != Some(needle_val.as_str()) {
+                return false;
+            }
+            pos = val_end;
+            while pos < ibytes.len() && ibytes[pos].is_ascii_whitespace() { pos += 1; }
+            if pos < ibytes.len() && ibytes[pos] == b',' { pos += 1; }
+            let _ = bytes; // suppress unused warning
+        }
+        true
+    } else {
+        // scalar: exact equality
+        container == contained
+    }
+}
+
+/// Apply a JSON operator to two values; returns None if left is not JSON/String
+pub fn apply_json_op(left: &Value, op: &ArithOp, right: &Value) -> Option<Value> {
+    let json = match left {
+        Value::Json(s) | Value::String(s) => s.clone(),
+        _ => return None,
+    };
+    let key = match right {
+        Value::String(k) => k.clone(),
+        Value::Int(n) => n.to_string(),
+        _ => return None,
+    };
+    // try object key first, then array index
+    let raw = json_object_get(&json, &key)
+        .or_else(|| key.parse::<usize>().ok().and_then(|i| json_array_get(&json, i)))?;
+    match op {
+        ArithOp::JsonGet => Some(Value::Json(raw)),
+        ArithOp::JsonGetText => {
+            // strip surrounding quotes if present
+            if raw.starts_with('"') && raw.ends_with('"') && raw.len() >= 2 {
+                if let Some((s, _)) = json_parse_string(&raw, 0) {
+                    return Some(Value::String(s));
+                }
+            }
+            Some(Value::String(raw))
+        }
+        _ => None,
+    }
+}
+
 pub fn apply_concat(parts: Vec<Option<Value>>) -> Option<Value> {
     let mut result = String::new();
     for part in parts {
         match part {
             Some(Value::String(s))    => result.push_str(&s),
+            Some(Value::Json(s))      => result.push_str(&s),
             Some(Value::Int(n))       => result.push_str(&n.to_string()),
             Some(Value::Float(f))     => result.push_str(&f.to_string()),
             Some(Value::Bool(b))      => result.push_str(if b { "true" } else { "false" }),
@@ -3520,11 +3877,11 @@ pub fn apply_rpad(s: Value, len: Value, pad: Value) -> Option<Value> {
 /// Evaluate CAST(value AS type)
 pub fn apply_cast(val: Value, type_name: &str) -> Option<Value> {
     match type_name {
-        "INT" | "INTEGER" | "BIGINT" => match val {
+        "INT" | "INTEGER" | "BIGINT" | "SMALLINT" => match val {
             Value::Int(n)       => Some(Value::Int(n)),
             Value::Float(f)     => Some(Value::Int(f as i64)),
             Value::Bool(b)      => Some(Value::Int(b as i64)),
-            Value::String(s)    => s.trim().parse::<i64>().ok().map(Value::Int),
+            Value::String(s) | Value::Json(s) => s.trim().parse::<i64>().ok().map(Value::Int),
             Value::Date(d)      => Some(Value::Int(d as i64)),
             Value::Timestamp(ts)=> Some(Value::Int(ts)),
             Value::Null         => Some(Value::Null),
@@ -3532,12 +3889,12 @@ pub fn apply_cast(val: Value, type_name: &str) -> Option<Value> {
         "FLOAT" | "DOUBLE" | "REAL" | "NUMERIC" | "DECIMAL" => match val {
             Value::Float(f)  => Some(Value::Float(f)),
             Value::Int(n)    => Some(Value::Float(n as f64)),
-            Value::String(s) => s.trim().parse::<f64>().ok().map(Value::Float),
+            Value::String(s) | Value::Json(s) => s.trim().parse::<f64>().ok().map(Value::Float),
             Value::Null      => Some(Value::Null),
             _ => None,
         },
         "TEXT" | "VARCHAR" | "STRING" | "CHAR" => match val {
-            Value::String(s)    => Some(Value::String(s)),
+            Value::String(s) | Value::Json(s) => Some(Value::String(s)),
             Value::Int(n)       => Some(Value::String(n.to_string())),
             Value::Float(f)     => Some(Value::String(f.to_string())),
             Value::Bool(b)      => Some(Value::String(b.to_string())),
@@ -3545,10 +3902,15 @@ pub fn apply_cast(val: Value, type_name: &str) -> Option<Value> {
             Value::Timestamp(ts)=> Some(Value::String(format_timestamp(ts))),
             Value::Null         => Some(Value::Null),
         },
+        "JSON" | "JSONB" => match val {
+            Value::Json(s) | Value::String(s) => Some(Value::Json(s)),
+            Value::Null => Some(Value::Null),
+            _ => None,
+        },
         "BOOLEAN" | "BOOL" => match val {
             Value::Bool(b)   => Some(Value::Bool(b)),
             Value::Int(n)    => Some(Value::Bool(n != 0)),
-            Value::String(s) => match s.to_lowercase().as_str() {
+            Value::String(s) | Value::Json(s) => match s.to_lowercase().as_str() {
                 "true" | "1" | "yes" => Some(Value::Bool(true)),
                 "false" | "0" | "no" => Some(Value::Bool(false)),
                 _ => None,
@@ -3559,7 +3921,7 @@ pub fn apply_cast(val: Value, type_name: &str) -> Option<Value> {
         "DATE" => match val {
             Value::Date(d)      => Some(Value::Date(d)),
             Value::Timestamp(ts)=> Some(Value::Date((ts / 86400) as i32)),
-            Value::String(s)    => parse_date_str(&s).map(Value::Date),
+            Value::String(s) | Value::Json(s) => parse_date_str(&s).map(Value::Date),
             Value::Int(n)       => Some(Value::Date(n as i32)),
             Value::Null         => Some(Value::Null),
             _ => None,
@@ -3567,7 +3929,7 @@ pub fn apply_cast(val: Value, type_name: &str) -> Option<Value> {
         "TIMESTAMP" => match val {
             Value::Timestamp(ts)=> Some(Value::Timestamp(ts)),
             Value::Date(d)      => Some(Value::Timestamp(d as i64 * 86400)),
-            Value::String(s)    => parse_timestamp_str(&s).map(Value::Timestamp),
+            Value::String(s) | Value::Json(s) => parse_timestamp_str(&s).map(Value::Timestamp),
             Value::Int(n)       => Some(Value::Timestamp(n)),
             Value::Null         => Some(Value::Null),
             _ => None,
@@ -6474,5 +6836,165 @@ mod tests {
         // RELEASE name without SAVEPOINT keyword
         let (_, stmt) = parse_sql("RELEASE sp1").unwrap();
         assert_eq!(stmt, SqlStatement::ReleaseSavepoint("sp1".to_string()));
+    }
+
+    // --- Type system extension tests ---
+
+    #[test]
+    fn test_parse_new_data_types() {
+        // Parse all new type keywords in CREATE TABLE
+        let sql = "CREATE TABLE t (a SMALLINT, b BIGINT, c REAL, d CHAR(10), e TEXT, f DECIMAL(10,2), g UUID, h JSON, i JSONB);";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::CreateTable(ct) => {
+                assert_eq!(ct.columns[0].data_type, DataType::SmallInt);
+                assert_eq!(ct.columns[1].data_type, DataType::BigInt);
+                assert_eq!(ct.columns[2].data_type, DataType::Real);
+                assert_eq!(ct.columns[3].data_type, DataType::Char(Some(10)));
+                assert_eq!(ct.columns[4].data_type, DataType::Text);
+                assert_eq!(ct.columns[5].data_type, DataType::Decimal(Some(10), Some(2)));
+                assert_eq!(ct.columns[6].data_type, DataType::Uuid);
+                assert_eq!(ct.columns[7].data_type, DataType::Json);
+                assert_eq!(ct.columns[8].data_type, DataType::Jsonb);
+            }
+            _ => panic!("Expected CreateTable"),
+        }
+    }
+
+    #[test]
+    fn test_parse_char_no_size() {
+        let sql = "CREATE TABLE t (a CHAR);";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::CreateTable(ct) => assert_eq!(ct.columns[0].data_type, DataType::Char(None)),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_parse_decimal_no_precision() {
+        let sql = "CREATE TABLE t (a DECIMAL);";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::CreateTable(ct) => assert_eq!(ct.columns[0].data_type, DataType::Decimal(None, None)),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_parse_numeric_synonym() {
+        let sql = "CREATE TABLE t (a NUMERIC(5,2));";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::CreateTable(ct) => assert_eq!(ct.columns[0].data_type, DataType::Decimal(Some(5), Some(2))),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_parse_json_get_operator() {
+        // data -> 'key' parses as BinaryOp with JsonGet
+        let sql = "SELECT data -> 'name' FROM t;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                match &sel.columns[0] {
+                    SelectColumn::Expr(Expression::BinaryOp(_, ArithOp::JsonGet, _)) => {}
+                    other => panic!("Expected JsonGet BinaryOp, got {:?}", other),
+                }
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_parse_json_get_text_operator() {
+        // data ->> 'key' parses as BinaryOp with JsonGetText
+        let sql = "SELECT data ->> 'name' FROM t;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                match &sel.columns[0] {
+                    SelectColumn::Expr(Expression::BinaryOp(_, ArithOp::JsonGetText, _)) => {}
+                    other => panic!("Expected JsonGetText BinaryOp, got {:?}", other),
+                }
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_parse_json_contains_operator() {
+        // col @> '{}' parses as JsonContains condition
+        let sql = "SELECT * FROM t WHERE data @> '{\"active\":true}';";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                match sel.where_clause {
+                    Some(WhereClause { condition: Condition::Comparison { operator: Operator::JsonContains, .. } }) => {}
+                    _ => panic!("Expected JsonContains condition"),
+                }
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_json_object_get() {
+        let json = r#"{"name":"Alice","age":30}"#;
+        assert_eq!(json_object_get(json, "name"), Some("\"Alice\"".to_string()));
+        assert_eq!(json_object_get(json, "age"), Some("30".to_string()));
+        assert_eq!(json_object_get(json, "missing"), None);
+    }
+
+    #[test]
+    fn test_json_array_get() {
+        let json = r#"[10, 20, 30]"#;
+        assert_eq!(json_array_get(json, 0), Some("10".to_string()));
+        assert_eq!(json_array_get(json, 2), Some("30".to_string()));
+        assert_eq!(json_array_get(json, 5), None);
+    }
+
+    #[test]
+    fn test_json_contains() {
+        assert!(json_contains(r#"{"a":1,"b":2}"#, r#"{"a":1}"#));
+        assert!(!json_contains(r#"{"a":1}"#, r#"{"a":2}"#));
+        assert!(json_contains(r#"{"x":"hello"}"#, r#"{"x":"hello"}"#));
+    }
+
+    #[test]
+    fn test_apply_json_op_get() {
+        let json = Value::Json(r#"{"city":"Paris"}"#.to_string());
+        let key = Value::String("city".to_string());
+        let result = apply_json_op(&json, &ArithOp::JsonGet, &key);
+        assert_eq!(result, Some(Value::Json("\"Paris\"".to_string())));
+    }
+
+    #[test]
+    fn test_apply_json_op_get_text() {
+        let json = Value::Json(r#"{"city":"Paris"}"#.to_string());
+        let key = Value::String("city".to_string());
+        let result = apply_json_op(&json, &ArithOp::JsonGetText, &key);
+        assert_eq!(result, Some(Value::String("Paris".to_string())));
+    }
+
+    #[test]
+    fn test_apply_json_op_integer_key() {
+        let json = Value::Json(r#"[100, 200, 300]"#.to_string());
+        let idx = Value::Int(1);
+        let result = apply_json_op(&json, &ArithOp::JsonGetText, &idx);
+        assert_eq!(result, Some(Value::String("200".to_string())));
+    }
+
+    #[test]
+    fn test_apply_cast_json() {
+        assert_eq!(
+            apply_cast(Value::String(r#"{"k":1}"#.to_string()), "JSON"),
+            Some(Value::Json(r#"{"k":1}"#.to_string()))
+        );
+        assert_eq!(
+            apply_cast(Value::Json("null".to_string()), "TEXT"),
+            Some(Value::String("null".to_string()))
+        );
     }
 }

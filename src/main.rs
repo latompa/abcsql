@@ -103,13 +103,25 @@ fn handle_meta_command(cmd: &str, storage: &Storage) {
                     for (i, col) in schema.columns.iter().enumerate() {
                         let type_str = match &col.data_type {
                             parser::DataType::Int => "INT".to_string(),
+                            parser::DataType::SmallInt => "SMALLINT".to_string(),
+                            parser::DataType::BigInt => "BIGINT".to_string(),
                             parser::DataType::Float => "FLOAT".to_string(),
+                            parser::DataType::Real => "REAL".to_string(),
                             parser::DataType::Double => "DOUBLE".to_string(),
                             parser::DataType::Boolean => "BOOLEAN".to_string(),
                             parser::DataType::Date => "DATE".to_string(),
                             parser::DataType::Timestamp => "TIMESTAMP".to_string(),
                             parser::DataType::Varchar(Some(n)) => format!("VARCHAR({})", n),
                             parser::DataType::Varchar(None) => "VARCHAR".to_string(),
+                            parser::DataType::Char(Some(n)) => format!("CHAR({})", n),
+                            parser::DataType::Char(None) => "CHAR".to_string(),
+                            parser::DataType::Text => "TEXT".to_string(),
+                            parser::DataType::Decimal(Some(p), Some(s)) => format!("DECIMAL({},{})", p, s),
+                            parser::DataType::Decimal(Some(p), None) => format!("DECIMAL({})", p),
+                            parser::DataType::Decimal(None, _) => "DECIMAL".to_string(),
+                            parser::DataType::Uuid => "UUID".to_string(),
+                            parser::DataType::Json => "JSON".to_string(),
+                            parser::DataType::Jsonb => "JSONB".to_string(),
                         };
                         let nn = if col.not_null { " NOT NULL" } else { "" };
                         let uq = if col.unique { " UNIQUE" } else { "" };
@@ -2121,6 +2133,8 @@ fn format_expr(expr: &parser::Expression) -> String {
                 parser::ArithOp::Div => "/",
                 parser::ArithOp::Mod => "%",
                 parser::ArithOp::Concat => "||",
+                parser::ArithOp::JsonGet => "->",
+                parser::ArithOp::JsonGetText => "->>",
             };
             format!("{} {} {}", format_expr(l), op_str, format_expr(r))
         }
@@ -2275,7 +2289,7 @@ fn format_value(value: &Value) -> String {
             if s.contains('.') { s.to_string() } else { format!("{}.0", s) }
         }
         Value::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
-        Value::String(s) => s.clone(),
+        Value::String(s) | Value::Json(s) => s.clone(),
         Value::Date(d) => parser::format_date(*d),
         Value::Timestamp(ts) => parser::format_timestamp(*ts),
         Value::Null => "NULL".to_string(),
@@ -2987,16 +3001,21 @@ fn arith_f64(l: f64, op: &parser::ArithOp, r: f64) -> Option<Value> {
         }
         parser::ArithOp::Mod => l % r,
         parser::ArithOp::Concat => return Some(Value::String(format!("{}{}", l, r))),
+        parser::ArithOp::JsonGet | parser::ArithOp::JsonGetText => return None,
     };
     Some(Value::Float(result))
 }
 
 /// Evaluate arithmetic operation on two Values
 fn eval_arith(left: &Value, op: &parser::ArithOp, right: &Value) -> Option<Value> {
+    // JSON field access operators
+    if matches!(op, parser::ArithOp::JsonGet | parser::ArithOp::JsonGetText) {
+        return parser::apply_json_op(left, op, right);
+    }
     // Handle || concatenation across all type combinations
     if let parser::ArithOp::Concat = op {
         let ls = match left {
-            Value::String(s) => s.clone(),
+            Value::String(s) | Value::Json(s) => s.clone(),
             Value::Int(n) => n.to_string(),
             Value::Float(f) => format!("{}", f),
             Value::Null => return Some(Value::Null),
@@ -3005,7 +3024,7 @@ fn eval_arith(left: &Value, op: &parser::ArithOp, right: &Value) -> Option<Value
             Value::Timestamp(ts) => parser::format_timestamp(*ts),
         };
         let rs = match right {
-            Value::String(s) => s.clone(),
+            Value::String(s) | Value::Json(s) => s.clone(),
             Value::Int(n) => n.to_string(),
             Value::Float(f) => format!("{}", f),
             Value::Null => return Some(Value::Null),
@@ -3045,7 +3064,7 @@ fn eval_arith(left: &Value, op: &parser::ArithOp, right: &Value) -> Option<Value
                 parser::ArithOp::Mul => Some(Value::Int(l * r)),
                 parser::ArithOp::Div => { if *r == 0 { Some(Value::Null) } else { Some(Value::Int(l / r)) } }
                 parser::ArithOp::Mod => { if *r == 0 { Some(Value::Null) } else { Some(Value::Int(l % r)) } }
-                parser::ArithOp::Concat => unreachable!(),
+                parser::ArithOp::Concat | parser::ArithOp::JsonGet | parser::ArithOp::JsonGetText => unreachable!(),
             }
         }
         (Value::Float(l), Value::Float(r)) => arith_f64(*l, op, *r),

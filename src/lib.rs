@@ -139,7 +139,7 @@ fn format_returning_rows(rows: &[Vec<Value>]) -> String {
             Value::Int(n) => n.to_string(),
             Value::Float(f) => format!("{}", f),
             Value::Bool(b) => b.to_string(),
-            Value::String(s) => s.clone(),
+            Value::String(s) | Value::Json(s) => s.clone(),
             Value::Date(d) => parser::format_date(*d),
             Value::Timestamp(ts) => parser::format_timestamp(*ts),
             Value::Null => "NULL".to_string(),
@@ -1183,9 +1183,13 @@ fn lib_eval_dateadd(v: Value, n: i64, unit: &str) -> Option<Value> {
 
 /// Evaluate a binary arithmetic / concatenation operation
 fn lib_eval_arith(left: &Value, op: &parser::ArithOp, right: &Value) -> Option<Value> {
+    // JSON field access operators
+    if matches!(op, parser::ArithOp::JsonGet | parser::ArithOp::JsonGetText) {
+        return parser::apply_json_op(left, op, right);
+    }
     if let parser::ArithOp::Concat = op {
         let ls = match left {
-            Value::String(s) => s.clone(),
+            Value::String(s) | Value::Json(s) => s.clone(),
             Value::Int(n) => n.to_string(),
             Value::Float(f) => format!("{}", f),
             Value::Null => return Some(Value::Null),
@@ -1194,7 +1198,7 @@ fn lib_eval_arith(left: &Value, op: &parser::ArithOp, right: &Value) -> Option<V
             Value::Timestamp(ts) => parser::format_timestamp(*ts),
         };
         let rs = match right {
-            Value::String(s) => s.clone(),
+            Value::String(s) | Value::Json(s) => s.clone(),
             Value::Int(n) => n.to_string(),
             Value::Float(f) => format!("{}", f),
             Value::Null => return Some(Value::Null),
@@ -1212,7 +1216,7 @@ fn lib_eval_arith(left: &Value, op: &parser::ArithOp, right: &Value) -> Option<V
                 parser::ArithOp::Mul => Some(Value::Int(l * r)),
                 parser::ArithOp::Div => { if *r == 0 { Some(Value::Null) } else { Some(Value::Int(l / r)) } }
                 parser::ArithOp::Mod => { if *r == 0 { Some(Value::Null) } else { Some(Value::Int(l % r)) } }
-                parser::ArithOp::Concat => unreachable!(),
+                parser::ArithOp::Concat | parser::ArithOp::JsonGet | parser::ArithOp::JsonGetText => unreachable!(),
             }
         }
         (Value::Float(l), Value::Float(r)) => {
@@ -1222,7 +1226,7 @@ fn lib_eval_arith(left: &Value, op: &parser::ArithOp, right: &Value) -> Option<V
                 parser::ArithOp::Mul => Some(Value::Float(l * r)),
                 parser::ArithOp::Div => { if *r == 0.0 { Some(Value::Null) } else { Some(Value::Float(l / r)) } }
                 parser::ArithOp::Mod => Some(Value::Float(l % r)),
-                parser::ArithOp::Concat => unreachable!(),
+                parser::ArithOp::Concat | parser::ArithOp::JsonGet | parser::ArithOp::JsonGetText => unreachable!(),
             }
         }
         (Value::Int(l), Value::Float(r)) => {
@@ -1233,7 +1237,7 @@ fn lib_eval_arith(left: &Value, op: &parser::ArithOp, right: &Value) -> Option<V
                 parser::ArithOp::Mul => Some(Value::Float(l * r)),
                 parser::ArithOp::Div => { if *r == 0.0 { Some(Value::Null) } else { Some(Value::Float(l / r)) } }
                 parser::ArithOp::Mod => Some(Value::Float(l % r)),
-                parser::ArithOp::Concat => unreachable!(),
+                parser::ArithOp::Concat | parser::ArithOp::JsonGet | parser::ArithOp::JsonGetText => unreachable!(),
             }
         }
         (Value::Float(l), Value::Int(r)) => {
@@ -1244,7 +1248,7 @@ fn lib_eval_arith(left: &Value, op: &parser::ArithOp, right: &Value) -> Option<V
                 parser::ArithOp::Mul => Some(Value::Float(l * r)),
                 parser::ArithOp::Div => { if r == 0.0 { Some(Value::Null) } else { Some(Value::Float(l / r)) } }
                 parser::ArithOp::Mod => Some(Value::Float(l % r)),
-                parser::ArithOp::Concat => unreachable!(),
+                parser::ArithOp::Concat | parser::ArithOp::JsonGet | parser::ArithOp::JsonGetText => unreachable!(),
             }
         }
         // Date + Int / Date - Int → shift by days
@@ -1326,6 +1330,13 @@ fn compare(left: &Value, op: &parser::Operator, right: &Value) -> bool {
         (Value::String(s), Value::Timestamp(ts)) => {
             if let Some(lts) = parser::parse_timestamp_str(s) { compare_numeric(lts as f64, *ts as f64, op) } else { false }
         }
+        // JSON comparisons
+        (Value::Json(l), Value::Json(r)) | (Value::Json(l), Value::String(r)) | (Value::String(l), Value::Json(r)) => match op {
+            parser::Operator::JsonContains => parser::json_contains(l, r),
+            parser::Operator::Equals => l == r,
+            parser::Operator::NotEquals => l != r,
+            _ => false,
+        },
         _ => false,
     }
 }

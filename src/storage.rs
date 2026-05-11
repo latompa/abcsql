@@ -1661,61 +1661,86 @@ fn restore_files(images: &HashMap<PathBuf, Option<Vec<u8>>>) -> Result<(), Stora
 fn data_type_to_string(data_type: &DataType) -> String {
     match data_type {
         DataType::Int => "INT".to_string(),
+        DataType::SmallInt => "SMALLINT".to_string(),
+        DataType::BigInt => "BIGINT".to_string(),
         DataType::Float => "FLOAT".to_string(),
+        DataType::Real => "REAL".to_string(),
         DataType::Double => "DOUBLE".to_string(),
-        DataType::Varchar(Some(size)) => format!("VARCHAR({})", size),
         DataType::Boolean => "BOOLEAN".to_string(),
         DataType::Date => "DATE".to_string(),
         DataType::Timestamp => "TIMESTAMP".to_string(),
+        DataType::Varchar(Some(size)) => format!("VARCHAR({})", size),
         DataType::Varchar(None) => "VARCHAR".to_string(),
+        DataType::Char(Some(size)) => format!("CHAR({})", size),
+        DataType::Char(None) => "CHAR".to_string(),
+        DataType::Text => "TEXT".to_string(),
+        DataType::Decimal(Some(p), Some(s)) => format!("DECIMAL({},{})", p, s),
+        DataType::Decimal(Some(p), None) => format!("DECIMAL({})", p),
+        DataType::Decimal(None, _) => "DECIMAL".to_string(),
+        DataType::Uuid => "UUID".to_string(),
+        DataType::Json => "JSON".to_string(),
+        DataType::Jsonb => "JSONB".to_string(),
     }
 }
 
-/// Parse a data type from string representation
+/// Parse a data type from string representation (schema file format)
 fn parse_data_type(s: &str) -> Result<DataType, StorageError> {
-    if s == "INT" {
-        Ok(DataType::Int)
-    } else if s == "FLOAT" {
-        Ok(DataType::Float)
-    } else if s == "DOUBLE" {
-        Ok(DataType::Double)
-    } else if s == "BOOLEAN" || s == "BOOL" {
-        Ok(DataType::Boolean)
-    } else if s == "DATE" {
-        Ok(DataType::Date)
-    } else if s == "TIMESTAMP" {
-        Ok(DataType::Timestamp)
-    } else if s == "VARCHAR" {
-        Ok(DataType::Varchar(None))
-    } else if s.starts_with("VARCHAR(") && s.ends_with(')') {
+    if s == "INT" || s == "INTEGER" { return Ok(DataType::Int); }
+    if s == "SMALLINT" { return Ok(DataType::SmallInt); }
+    if s == "BIGINT" { return Ok(DataType::BigInt); }
+    if s == "FLOAT" { return Ok(DataType::Float); }
+    if s == "REAL" { return Ok(DataType::Real); }
+    if s == "DOUBLE" { return Ok(DataType::Double); }
+    if s == "BOOLEAN" || s == "BOOL" { return Ok(DataType::Boolean); }
+    if s == "DATE" { return Ok(DataType::Date); }
+    if s == "TIMESTAMP" { return Ok(DataType::Timestamp); }
+    if s == "TEXT" { return Ok(DataType::Text); }
+    if s == "UUID" { return Ok(DataType::Uuid); }
+    if s == "JSON" { return Ok(DataType::Json); }
+    if s == "JSONB" { return Ok(DataType::Jsonb); }
+    if s == "VARCHAR" { return Ok(DataType::Varchar(None)); }
+    if s.starts_with("VARCHAR(") && s.ends_with(')') {
         let size_str = &s[8..s.len()-1];
         let size = size_str.parse::<usize>()
             .map_err(|_| StorageError::InvalidSchema(format!("Invalid VARCHAR size: {}", size_str)))?;
-        Ok(DataType::Varchar(Some(size)))
-    } else {
-        Err(StorageError::InvalidSchema(format!("Unknown data type: {}", s)))
+        return Ok(DataType::Varchar(Some(size)));
     }
+    if s == "CHAR" { return Ok(DataType::Char(None)); }
+    if s.starts_with("CHAR(") && s.ends_with(')') {
+        let size_str = &s[5..s.len()-1];
+        let size = size_str.parse::<usize>()
+            .map_err(|_| StorageError::InvalidSchema(format!("Invalid CHAR size: {}", size_str)))?;
+        return Ok(DataType::Char(Some(size)));
+    }
+    if s == "DECIMAL" || s == "NUMERIC" { return Ok(DataType::Decimal(None, None)); }
+    if s.starts_with("DECIMAL(") || s.starts_with("NUMERIC(") {
+        let inner_start = s.find('(').unwrap() + 1;
+        let inner = &s[inner_start..s.len()-1];
+        let parts: Vec<&str> = inner.split(',').collect();
+        let p = parts[0].trim().parse::<u8>().ok();
+        let sc = parts.get(1).and_then(|x| x.trim().parse::<u8>().ok());
+        return Ok(DataType::Decimal(p, sc));
+    }
+    Err(StorageError::InvalidSchema(format!("Unknown data type: {}", s)))
 }
 
 /// Validate that a value matches the expected data type
 fn validate_value_type(value: &Value, data_type: &DataType, column_name: &str) -> Result<(), StorageError> {
     match (value, data_type) {
         (Value::Null, _) => Ok(()), // NULL is valid for any type
-        (Value::Int(_), DataType::Int) => Ok(()),
-        (Value::Float(_), DataType::Float) => Ok(()),
-        (Value::Float(_), DataType::Double) => Ok(()),
+        (Value::Int(_), DataType::Int | DataType::SmallInt | DataType::BigInt) => Ok(()),
+        (Value::Float(_), DataType::Float | DataType::Real | DataType::Double) => Ok(()),
+        (Value::Float(_), DataType::Decimal(_, _)) => Ok(()),
+        (Value::Int(_), DataType::Float | DataType::Real | DataType::Double) => Ok(()),
+        (Value::Int(_), DataType::Decimal(_, _)) => Ok(()),
         (Value::Bool(_), DataType::Boolean) => Ok(()),
         (Value::Date(_), DataType::Date) => Ok(()),
         (Value::Timestamp(_), DataType::Timestamp) => Ok(()),
-        (Value::String(s), DataType::Date) => {
-            validate_date_format(s, column_name)
-        }
-        (Value::String(s), DataType::Timestamp) => {
-            validate_timestamp_format(s, column_name)
-        }
-        (Value::Int(_), DataType::Float) => Ok(()),
-        (Value::Int(_), DataType::Double) => Ok(()),
-        (Value::String(_), DataType::Varchar(_)) => Ok(()),
+        (Value::String(s), DataType::Date) => validate_date_format(s, column_name),
+        (Value::String(s), DataType::Timestamp) => validate_timestamp_format(s, column_name),
+        (Value::String(_), DataType::Varchar(_) | DataType::Char(_) | DataType::Text) => Ok(()),
+        (Value::Json(_) | Value::String(_), DataType::Json | DataType::Jsonb) => Ok(()),
+        (Value::String(_), DataType::Uuid) => Ok(()), // UUID stored as string
         _ => Err(StorageError::TypeMismatch {
             column: column_name.to_string(),
             expected: format!("{:?}", data_type),
@@ -2462,6 +2487,12 @@ fn compare_values(left: &Value, op: &Operator, right: &Value) -> bool {
                 compare_numeric(lts as f64, *ts as f64, op)
             } else { false }
         }
+        (Value::Json(l), Value::Json(r)) | (Value::String(l), Value::Json(r)) | (Value::Json(l), Value::String(r)) => match op {
+            Operator::JsonContains => crate::parser::json_contains(l, r),
+            Operator::Equals => l == r,
+            Operator::NotEquals => l != r,
+            _ => false,
+        },
         (Value::Null, Value::Null) => match op {
             Operator::Equals => true,
             Operator::NotEquals => false,
@@ -2473,9 +2504,13 @@ fn compare_values(left: &Value, op: &Operator, right: &Value) -> bool {
 
 /// Evaluate a binary arithmetic / concatenation operation on two Values
 fn storage_eval_arith(left: &Value, op: &ArithOp, right: &Value) -> Option<Value> {
+    // JSON field access operators
+    if matches!(op, ArithOp::JsonGet | ArithOp::JsonGetText) {
+        return crate::parser::apply_json_op(left, op, right);
+    }
     if let ArithOp::Concat = op {
         let ls = match left {
-            Value::String(s) => s.clone(),
+            Value::String(s) | Value::Json(s) => s.clone(),
             Value::Int(n) => n.to_string(),
             Value::Float(f) => format!("{}", f),
             Value::Null => return Some(Value::Null),
@@ -2484,7 +2519,7 @@ fn storage_eval_arith(left: &Value, op: &ArithOp, right: &Value) -> Option<Value
             Value::Timestamp(ts) => crate::parser::format_timestamp(*ts),
         };
         let rs = match right {
-            Value::String(s) => s.clone(),
+            Value::String(s) | Value::Json(s) => s.clone(),
             Value::Int(n) => n.to_string(),
             Value::Float(f) => format!("{}", f),
             Value::Null => return Some(Value::Null),
@@ -2502,7 +2537,7 @@ fn storage_eval_arith(left: &Value, op: &ArithOp, right: &Value) -> Option<Value
                 ArithOp::Mul => Some(Value::Int(l * r)),
                 ArithOp::Div => { if *r == 0 { Some(Value::Null) } else { Some(Value::Int(l / r)) } }
                 ArithOp::Mod => { if *r == 0 { Some(Value::Null) } else { Some(Value::Int(l % r)) } }
-                ArithOp::Concat => unreachable!(),
+                ArithOp::Concat | ArithOp::JsonGet | ArithOp::JsonGetText => unreachable!(),
             }
         }
         (Value::Float(l), Value::Float(r)) => storage_arith_f64(*l, op, *r),
@@ -2542,6 +2577,7 @@ fn storage_arith_f64(l: f64, op: &ArithOp, r: f64) -> Option<Value> {
         ArithOp::Div => { if r == 0.0 { return Some(Value::Null); } l / r }
         ArithOp::Mod => l % r,
         ArithOp::Concat => return Some(Value::String(format!("{}{}", l, r))),
+        ArithOp::JsonGet | ArithOp::JsonGetText => return None,
     };
     Some(Value::Float(v))
 }
@@ -2587,6 +2623,12 @@ fn serialize_value(v: &Value) -> String {
                 .replace('|', "\\|")
                 .replace('\n', "\\n");
             format!("STRING:{}", escaped)
+        }
+        Value::Json(s) => {
+            let escaped = s.replace('\\', "\\\\")
+                .replace('|', "\\|")
+                .replace('\n', "\\n");
+            format!("JSON:{}", escaped)
         }
         Value::Date(d) => format!("DATE:{}", d),
         Value::Timestamp(ts) => format!("TIMESTAMP:{}", ts),
@@ -2643,12 +2685,17 @@ fn deserialize_row(s: &str) -> Result<Vec<Value>, StorageError> {
                 .map_err(|_| StorageError::InvalidData(format!("Invalid boolean: {}", bool_str)))?;
             values.push(Value::Bool(b));
         } else if let Some(string_val) = part.strip_prefix("STRING:") {
-            // Unescape special characters
             let unescaped = string_val
                 .replace("\\n", "\n")
                 .replace("\\|", "|")
                 .replace("\\\\", "\\");
             values.push(Value::String(unescaped));
+        } else if let Some(json_val) = part.strip_prefix("JSON:") {
+            let unescaped = json_val
+                .replace("\\n", "\n")
+                .replace("\\|", "|")
+                .replace("\\\\", "\\");
+            values.push(Value::Json(unescaped));
         } else if let Some(date_str) = part.strip_prefix("DATE:") {
             let d = date_str.parse::<i32>()
                 .map_err(|_| StorageError::InvalidData(format!("Invalid date epoch: {}", date_str)))?;
@@ -4921,6 +4968,78 @@ mod tests {
         storage.begin_transaction().unwrap();
         assert!(storage.begin_transaction().is_err());
         storage.rollback_transaction().unwrap();
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    // --- Type system extension tests ---
+
+    #[test]
+    fn test_serialize_deserialize_json_value() {
+        let val = Value::Json(r#"{"key":"value"}"#.to_string());
+        let s = serialize_value(&val);
+        assert!(s.starts_with("JSON:"));
+        let row = deserialize_row(&s).unwrap();
+        assert_eq!(row[0], Value::Json(r#"{"key":"value"}"#.to_string()));
+    }
+
+    #[test]
+    fn test_serialize_json_escaping() {
+        // pipes in JSON must be escaped
+        let val = Value::Json(r#"{"a|b":1}"#.to_string());
+        let s = serialize_value(&val);
+        assert!(!s.contains('|') || s.contains("\\|"));
+        let row = deserialize_row(&s).unwrap();
+        assert_eq!(row[0], Value::Json(r#"{"a|b":1}"#.to_string()));
+    }
+
+    #[test]
+    fn test_data_type_to_string_new_types() {
+        assert_eq!(data_type_to_string(&DataType::SmallInt), "SMALLINT");
+        assert_eq!(data_type_to_string(&DataType::BigInt), "BIGINT");
+        assert_eq!(data_type_to_string(&DataType::Real), "REAL");
+        assert_eq!(data_type_to_string(&DataType::Char(Some(5))), "CHAR(5)");
+        assert_eq!(data_type_to_string(&DataType::Char(None)), "CHAR");
+        assert_eq!(data_type_to_string(&DataType::Text), "TEXT");
+        assert_eq!(data_type_to_string(&DataType::Decimal(Some(10), Some(2))), "DECIMAL(10,2)");
+        assert_eq!(data_type_to_string(&DataType::Uuid), "UUID");
+        assert_eq!(data_type_to_string(&DataType::Json), "JSON");
+        assert_eq!(data_type_to_string(&DataType::Jsonb), "JSONB");
+    }
+
+    #[test]
+    fn test_parse_data_type_roundtrip() {
+        let types = [
+            "INT", "SMALLINT", "BIGINT", "FLOAT", "REAL", "DOUBLE",
+            "BOOLEAN", "DATE", "TIMESTAMP", "TEXT", "UUID", "JSON", "JSONB",
+            "VARCHAR", "VARCHAR(255)", "CHAR", "CHAR(10)",
+            "DECIMAL", "DECIMAL(10,2)",
+        ];
+        for t in &types {
+            let dt = parse_data_type(t).expect(t);
+            let back = data_type_to_string(&dt);
+            // roundtrip: re-parse should succeed
+            parse_data_type(&back).expect(&format!("roundtrip failed for {}", t));
+        }
+    }
+
+    #[test]
+    fn test_create_table_new_types() {
+        let temp_dir = std::env::temp_dir().join("abcsql_test_new_types");
+        let _ = fs::remove_dir_all(&temp_dir);
+        let storage = Storage::new(&temp_dir).unwrap();
+        let stmt = CreateTableStatement {
+            table_name: "things".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id", DataType::BigInt),
+                ColumnDefinition::new("data", DataType::Json),
+                ColumnDefinition::new("name", DataType::Text),
+            ],
+        };
+        storage.create_table(&stmt).unwrap();
+        let schema = storage.load_schema("things").unwrap();
+        assert_eq!(schema.columns[0].data_type, DataType::BigInt);
+        assert_eq!(schema.columns[1].data_type, DataType::Json);
+        assert_eq!(schema.columns[2].data_type, DataType::Text);
         fs::remove_dir_all(&temp_dir).unwrap();
     }
 }

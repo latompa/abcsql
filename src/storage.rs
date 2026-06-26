@@ -3,7 +3,7 @@ use std::io::{self, Write as IoWrite, BufWriter, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::fmt;
 use std::collections::HashMap;
-use crate::parser::{CreateTableStatement, CreateIndexStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, InsertSource, OnConflict, UpdateStatement, DeleteStatement, TruncateStatement, MergeStatement, MergeSource, MergeAction, AlterTableStatement, AlterAction, Value, Condition, Expression, Operator, ArithOp, SelectStatement, SelectColumn, FromClause, apply_scalar_func, apply_round, apply_concat, apply_substr, apply_replace, apply_lpad, apply_rpad, apply_cast, apply_greatest, apply_least, apply_power, apply_position, apply_repeat, apply_json_typeof, apply_json_array_length, apply_json_build_object, apply_json_build_array};
+use crate::parser::{CreateTableStatement, CreateIndexStatement, CreateFunctionStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, InsertSource, OnConflict, UpdateStatement, DeleteStatement, TruncateStatement, MergeStatement, MergeSource, MergeAction, AlterTableStatement, AlterAction, Value, Condition, Expression, Operator, ArithOp, SelectStatement, SelectColumn, FromClause, apply_scalar_func, apply_round, apply_concat, apply_substr, apply_replace, apply_lpad, apply_rpad, apply_cast, apply_greatest, apply_least, apply_power, apply_position, apply_repeat, apply_json_typeof, apply_json_array_length, apply_json_build_object, apply_json_build_array};
 
 /// Before-image snapshot for a single transaction
 struct TransactionState {
@@ -32,6 +32,7 @@ pub enum StorageError {
     DuplicateKey { column: String, value: String },
     NullConstraint { column: String },
     ForeignKeyViolation { column: String, ref_table: String, ref_column: String },
+    CheckConstraintViolation { column: String, reason: String },
     IndexAlreadyExists(String),
     IndexNotFound(String),
     TransactionError(String),
@@ -66,6 +67,9 @@ impl fmt::Display for StorageError {
             }
             StorageError::ForeignKeyViolation { column, ref_table, ref_column } => {
                 write!(f, "Foreign key violation: '{}' references {}.{}", column, ref_table, ref_column)
+            }
+            StorageError::CheckConstraintViolation { column, reason } => {
+                write!(f, "CHECK constraint violation on '{}': {}", column, reason)
             }
             StorageError::IndexAlreadyExists(name) => write!(f, "Index '{}' already exists", name),
             StorageError::IndexNotFound(name) => write!(f, "Index '{}' not found", name),
@@ -185,6 +189,28 @@ impl Storage {
         Ok(())
     }
 
+    /// Check if a transaction is active
+    pub fn is_in_transaction(&self) -> bool {
+        self.txn.lock().unwrap().is_some()
+    }
+
+    /// Acquire a FOR UPDATE lock on a table (requires active transaction).
+    /// In this single-user engine, we verify a transaction is active but don't need
+    /// actual concurrency locks. The lock ensures the caller has explicitly started
+    /// a transaction before attempting FOR UPDATE.
+    pub fn lock_for_update(&self, table_name: &str) -> Result<(), StorageError> {
+        if !self.is_in_transaction() {
+            return Err(StorageError::TransactionError(
+                "SELECT ... FOR UPDATE requires an active transaction (use BEGIN first)".into()
+            ));
+        }
+        // Verify the table exists
+        if !self.table_exists(table_name) {
+            return Err(StorageError::TableNotFound(table_name.to_string()));
+        }
+        Ok(())
+    }
+
     /// Create a new table by persisting its schema to disk
     pub fn create_table(&self, stmt: &CreateTableStatement) -> Result<(), StorageError> {
         let schema_path = self.schema_path(&stmt.table_name);
@@ -233,10 +259,34 @@ impl Storage {
             if col.auto_increment { parts.push(&ai); }
             if col.primary_key { parts.push(&pk); }
             if let Some(ref fk_str) = fk { parts.push(fk_str); }
+            let check_str = col.check_constraint_text.as_ref().map(|t| {
+                let escaped = t.replace('\\', "\\\\").replace(':', "\\:");
+                format!("CK={}", escaped)
+            });
+            if let Some(ref ck) = check_str { parts.push(ck); }
             writeln!(file, "{}", parts.join(":"))?;
         }
         Ok(())
     }
+
+/// Decode a CHECK constraint text that was escaped for schema file storage.
+fn decode_check_text(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some(':') => result.push(':'),
+                Some('\\') => result.push('\\'),
+                Some(other) => { result.push('\\'); result.push(other); }
+                None => result.push('\\'),
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
 
     /// Insert row(s) into a table. Returns (rows_inserted, returning_rows).
     pub fn insert_row(&self, stmt: &InsertStatement) -> Result<(usize, Option<Vec<Vec<Value>>>), StorageError> {
@@ -394,6 +444,18 @@ impl Storage {
             if let Some(ref fk) = col_def.references {
                 if final_values[i] != Value::Null {
                     self.validate_foreign_key(&final_values[i], fk, &col_def.name)?;
+                }
+            }
+        }
+
+        // Enforce CHECK constraints
+        for (_i, col_def) in schema.columns.iter().enumerate() {
+            if let Some(ref check) = col_def.check_constraint {
+                if !evaluate_condition(check, &final_values, &schema.columns, self) {
+                    return Err(StorageError::CheckConstraintViolation {
+                        column: col_def.name.clone(),
+                        reason: format!("CHECK constraint failed: {:?}", check),
+                    });
                 }
             }
         }
@@ -589,6 +651,19 @@ impl Storage {
                     row[col_idx] = new_val;
                 }
             }
+
+            // Enforce CHECK constraints after applying updates
+            for (_i, col_def) in schema.columns.iter().enumerate() {
+                if let Some(ref check) = col_def.check_constraint {
+                    if !evaluate_condition(check, row, &schema.columns, self) {
+                        return Err(StorageError::CheckConstraintViolation {
+                            column: col_def.name.clone(),
+                            reason: format!("CHECK constraint failed: {:?}", check),
+                        });
+                    }
+                }
+            }
+
             if stmt.returning.is_some() {
                 let ret_row = project_returning(row, stmt.returning.as_ref().unwrap(), &schema.columns);
                 returning_rows.push(ret_row);
@@ -765,58 +840,84 @@ impl Storage {
             }
 
             if let Some(idx) = matched_idx {
-                // WHEN MATCHED
-                match &stmt.when_matched {
-                    Some(MergeAction::Update(assignments)) => {
-                        let tgt_row = &mut target_rows[idx];
+                // WHEN MATCHED – try clauses in order
+                let tgt_row = &mut target_rows[idx];
+                for clause in &stmt.when_clauses {
+                    if !clause.is_matched { continue; }
+                    if let Some(ref cond) = clause.condition {
                         let mut combined_row: Vec<Value> = tgt_row.clone();
                         combined_row.extend(src_row.iter().cloned());
                         let mut combined_cols: Vec<(String, String)> = target_cols.clone();
                         combined_cols.extend(source_cols.iter().cloned());
-                        for assignment in assignments {
-                            if let Some(col_idx) = target_schema.columns.iter().position(|c| c.name == assignment.column) {
-                                let new_val = resolve_expr_cols(&assignment.value, &combined_row, &combined_cols, self)
-                                    .unwrap_or(Value::Null);
-                                tgt_row[col_idx] = new_val;
-                            }
+                        if !eval_condition_cols(cond, &combined_row, &combined_cols, self) {
+                            continue;
                         }
-                        matched_count += 1;
                     }
-                    Some(MergeAction::Delete) => {
-                        target_rows.remove(idx);
-                        matched_count += 1;
+                    match &clause.action {
+                        MergeAction::Update(assignments) => {
+                            let mut combined_row: Vec<Value> = tgt_row.clone();
+                            combined_row.extend(src_row.iter().cloned());
+                            let mut combined_cols: Vec<(String, String)> = target_cols.clone();
+                            combined_cols.extend(source_cols.iter().cloned());
+                            for assignment in assignments {
+                                if let Some(col_idx) = target_schema.columns.iter().position(|c| c.name == assignment.column) {
+                                    let new_val = resolve_expr_cols(&assignment.value, &combined_row, &combined_cols, self)
+                                        .unwrap_or(Value::Null);
+                                    tgt_row[col_idx] = new_val;
+                                }
+                            }
+                            matched_count += 1;
+                        }
+                        MergeAction::Delete => {
+                            target_rows.remove(idx);
+                            matched_count += 1;
+                        }
+                        MergeAction::DoNothing => {}
+                        _ => {}
                     }
-                    Some(MergeAction::DoNothing) | None => {}
-                    _ => {}
+                    break; // first matching clause executed
                 }
             } else {
-                // WHEN NOT MATCHED
-                match &stmt.when_not_matched {
-                    Some(MergeAction::Insert(col_names, exprs)) => {
+                // WHEN NOT MATCHED – try clauses in order
+                for clause in &stmt.when_clauses {
+                    if clause.is_matched { continue; }
+                    if let Some(ref cond) = clause.condition {
                         let mut combined_row: Vec<Value> = vec![Value::Null; target_schema.columns.len()];
                         combined_row.extend(src_row.iter().cloned());
                         let mut combined_cols: Vec<(String, String)> = target_cols.clone();
                         combined_cols.extend(source_cols.iter().cloned());
-
-                        let vals: Vec<Value> = exprs.iter()
-                            .map(|e| resolve_expr_cols(e, &combined_row, &combined_cols, self).unwrap_or(Value::Null))
-                            .collect();
-
-                        let new_row = if col_names.is_empty() {
-                            vals
-                        } else {
-                            target_schema.columns.iter().map(|col| {
-                                col_names.iter().position(|cn| cn.eq_ignore_ascii_case(&col.name))
-                                    .and_then(|i| vals.get(i).cloned())
-                                    .unwrap_or(Value::Null)
-                            }).collect()
-                        };
-
-                        target_rows.push(new_row);
-                        inserted_count += 1;
+                        if !eval_condition_cols(cond, &combined_row, &combined_cols, self) {
+                            continue;
+                        }
                     }
-                    Some(MergeAction::DoNothing) | None => {}
-                    _ => {}
+                    match &clause.action {
+                        MergeAction::Insert(col_names, exprs) => {
+                            let mut combined_row: Vec<Value> = vec![Value::Null; target_schema.columns.len()];
+                            combined_row.extend(src_row.iter().cloned());
+                            let mut combined_cols: Vec<(String, String)> = target_cols.clone();
+                            combined_cols.extend(source_cols.iter().cloned());
+
+                            let vals: Vec<Value> = exprs.iter()
+                                .map(|e| resolve_expr_cols(e, &combined_row, &combined_cols, self).unwrap_or(Value::Null))
+                                .collect();
+
+                            let new_row = if col_names.is_empty() {
+                                vals
+                            } else {
+                                target_schema.columns.iter().map(|col| {
+                                    col_names.iter().position(|cn| cn.eq_ignore_ascii_case(&col.name))
+                                        .and_then(|i| vals.get(i).cloned())
+                                        .unwrap_or(Value::Null)
+                                }).collect()
+                            };
+
+                            target_rows.push(new_row);
+                            inserted_count += 1;
+                        }
+                        MergeAction::DoNothing => {}
+                        _ => {}
+                    }
+                    break; // first matching clause executed
                 }
             }
         }
@@ -943,6 +1044,21 @@ impl Storage {
                     ForeignKeyRef { table: fk[..dot].to_string(), column: fk[dot+1..].to_string() }
                 });
 
+            let check_text = flags.iter()
+                .find(|f| f.starts_with("CK="))
+                .map(|f| Self::decode_check_text(&f[3..]));
+            let check_constraint = match &check_text {
+                Some(text) => {
+                    match crate::parser::parse_condition(text.trim()) {
+                        Ok(("", cond)) => Some(cond),
+                        _ => return Err(StorageError::InvalidSchema(
+                            format!("Invalid CHECK constraint: {}", text)
+                        )),
+                    }
+                }
+                None => None,
+            };
+
             columns.push(ColumnDefinition {
                 name: col_name,
                 data_type,
@@ -951,7 +1067,9 @@ impl Storage {
                 not_null,
                 unique,
                 references,
-            });
+                check_constraint,
+                check_constraint_text: check_text,
+        });
         }
 
         Ok(CreateTableStatement {
@@ -1382,6 +1500,80 @@ impl Storage {
 
     pub fn view_exists(&self, view_name: &str) -> bool {
         self.view_path(view_name).exists()
+    }
+
+    // ---- User-defined functions ----
+
+    fn function_path(&self, name: &str) -> PathBuf {
+        self.data_dir.join(format!("{}.func", name))
+    }
+
+    /// Create a user-defined function by persisting its SQL definition to disk
+    pub fn create_function(&self, stmt: &CreateFunctionStatement) -> Result<(), StorageError> {
+        let path = self.function_path(&stmt.name);
+        if path.exists() {
+            return Err(StorageError::InvalidSchema(format!("Function '{}' already exists", stmt.name)));
+        }
+        self.snapshot_before_write(&path);
+        // Serialize as: name|param1:type1,param2:type2|return_type|body_expression_sql
+        let params_str = stmt.params.iter()
+            .map(|(n, t)| format!("{}:{}", n, t))
+            .collect::<Vec<_>>()
+            .join(",");
+        let return_str = stmt.return_type.as_deref().unwrap_or("");
+        let serialized = format!("{}\n{}\n{}\n", params_str, return_str, stmt.name);
+        fs::write(&path, serialized).map_err(StorageError::IoError)
+    }
+
+    /// Load a user-defined function definition from disk
+    pub fn load_function(&self, name: &str) -> Result<Option<CreateFunctionStatement>, StorageError> {
+        let path = self.function_path(name);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let data = fs::read_to_string(&path).map_err(StorageError::IoError)?;
+        let mut lines = data.lines();
+        let params_str = lines.next().unwrap_or("");
+        let return_str = lines.next().unwrap_or("");
+        let body_sql = lines.next().unwrap_or("");
+        let params: Vec<(String, String)> = if params_str.is_empty() {
+            Vec::new()
+        } else {
+            params_str.split(',')
+                .map(|p| {
+                    let mut parts = p.splitn(2, ':');
+                    let pname = parts.next().unwrap_or("").to_string();
+                    let ptype = parts.next().unwrap_or("").to_string();
+                    (pname, ptype)
+                })
+                .collect()
+        };
+        let return_type = if return_str.is_empty() { None } else { Some(return_str.to_string()) };
+        let (_, body) = crate::parser::parse_expression(body_sql)
+            .map_err(|e| StorageError::InvalidSchema(format!("Invalid function body: {:?}", e)))?;
+        Ok(Some(CreateFunctionStatement {
+            name: name.to_string(),
+            params,
+            return_type,
+            body: Box::new(body),
+        }))
+    }
+
+    /// Drop a function
+    pub fn drop_function(&self, name: &str, if_exists: bool) -> Result<(), StorageError> {
+        let path = self.function_path(name);
+        if !path.exists() {
+            if if_exists {
+                return Ok(());
+            }
+            return Err(StorageError::TableNotFound(format!("Function '{}' not found", name)));
+        }
+        self.snapshot_before_write(&path);
+        fs::remove_file(&path).map_err(StorageError::IoError)
+    }
+
+    pub fn function_exists(&self, name: &str) -> bool {
+        self.function_path(name).exists()
     }
 
     /// Read and increment the auto_increment counter
@@ -1972,6 +2164,7 @@ fn eval_condition_cols(condition: &Condition, row: &[Value], cols: &[(String, St
                             data_type: DataType::Varchar(None),
                             auto_increment: false, primary_key: false,
                             not_null: false, unique: false, references: None,
+                            check_constraint: None, check_constraint_text: None,
                         }
                     }).collect();
                     let exists = execute_correlated_scalar_subquery(subquery, storage, row, &fake_schema).is_some();
@@ -2043,6 +2236,7 @@ fn resolve_expr_cols(expr: &Expression, row: &[Value], cols: &[(String, String)]
                     not_null: false,
                     unique: false,
                     references: None,
+                    check_constraint: None, check_constraint_text: None,
                 }
             }).collect();
             resolve_expression(other, row, &fake_schema, storage)
@@ -2280,6 +2474,44 @@ fn resolve_expression(expr: &Expression, row: &[Value], schema: &[ColumnDefiniti
                 .filter_map(|v| resolve_expression(v, row, schema, storage))
                 .collect();
             apply_json_build_array(&resolved)
+        }
+        Expression::UserFunc(name, args) => {
+            let func_def = match storage.load_function(name) {
+                Ok(Some(f)) => f,
+                _ => return None,
+            };
+            if func_def.params.len() != args.len() {
+                return None;
+            }
+            let arg_vals: Vec<Value> = args.iter()
+                .filter_map(|a| resolve_expression(a, row, schema, storage))
+                .collect();
+            if arg_vals.len() != args.len() {
+                return None;
+            }
+            let func_schema: Vec<ColumnDefinition> = func_def.params.iter()
+                .map(|(n, t)| {
+                    let dt = match t.to_uppercase().as_str() {
+                        "INT" | "INTEGER" => DataType::Int,
+                        "TEXT" | "VARCHAR" => DataType::Varchar(None),
+                        "FLOAT" | "DOUBLE" => DataType::Double,
+                        "BOOLEAN" => DataType::Boolean,
+                        _ => DataType::Text,
+                    };
+                    ColumnDefinition {
+                        name: n.clone(),
+                        data_type: dt,
+                        auto_increment: false,
+                        primary_key: false,
+                        not_null: false,
+                        unique: false,
+                        references: None,
+                        check_constraint: None,
+                        check_constraint_text: None,
+                    }
+                })
+                .collect();
+            resolve_expression(&func_def.body, &arg_vals, &func_schema, storage)
         }
     }
 }
@@ -3677,7 +3909,7 @@ mod tests {
         let create = CreateTableStatement {
             table_name: "users".to_string(),
             columns: vec![
-                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: true, primary_key: false, not_null: false, unique: false, references: None },
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: true, primary_key: false, not_null: false, unique: false, references: None , check_constraint: None, check_constraint_text: None },
                 ColumnDefinition::new("name", DataType::Varchar(None)),
             ],
         };
@@ -3733,7 +3965,7 @@ mod tests {
         let create = CreateTableStatement {
             table_name: "users".to_string(),
             columns: vec![
-                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, unique: false, references: None },
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, unique: false, references: None , check_constraint: None, check_constraint_text: None },
                 ColumnDefinition::new("name", DataType::Varchar(None)),
             ],
         };
@@ -3782,7 +4014,7 @@ mod tests {
         let create = CreateTableStatement {
             table_name: "users".to_string(),
             columns: vec![
-                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, unique: false, references: None },
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, unique: false, references: None , check_constraint: None, check_constraint_text: None },
                 ColumnDefinition::new("name", DataType::Varchar(None)),
             ],
         };
@@ -3811,7 +4043,7 @@ mod tests {
         let create_users = CreateTableStatement {
             table_name: "users".to_string(),
             columns: vec![
-                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, unique: false, references: None },
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, unique: false, references: None , check_constraint: None, check_constraint_text: None },
                 ColumnDefinition::new("name", DataType::Varchar(None)),
             ],
         };
@@ -3831,7 +4063,7 @@ mod tests {
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition { name: "user_id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: false, not_null: false, unique: false,
-                    references: Some(ForeignKeyRef { table: "users".to_string(), column: "id".to_string() }) },
+                    references: Some(ForeignKeyRef { table: "users".to_string(), column: "id".to_string() }), check_constraint: None, check_constraint_text: None },
             ],
         };
         storage.create_table(&create_orders).unwrap();
@@ -3869,7 +4101,7 @@ mod tests {
         let create_users = CreateTableStatement {
             table_name: "users".to_string(),
             columns: vec![
-                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, unique: false, references: None },
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, unique: false, references: None , check_constraint: None, check_constraint_text: None },
                 ColumnDefinition::new("name", DataType::Varchar(None)),
             ],
         };
@@ -3897,7 +4129,7 @@ mod tests {
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition { name: "user_id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: false, not_null: false, unique: false,
-                    references: Some(ForeignKeyRef { table: "users".to_string(), column: "id".to_string() }) },
+                    references: Some(ForeignKeyRef { table: "users".to_string(), column: "id".to_string() }), check_constraint: None, check_constraint_text: None },
             ],
         };
         storage.create_table(&create_orders).unwrap();
@@ -3953,7 +4185,7 @@ mod tests {
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition { name: "name".to_string(), data_type: DataType::Varchar(None),
-                    auto_increment: false, primary_key: false, not_null: true, unique: false, references: None },
+                    auto_increment: false, primary_key: false, not_null: true, unique: false, references: None , check_constraint: None, check_constraint_text: None },
             ],
         };
         storage.create_table(&create).unwrap();
@@ -3992,7 +4224,7 @@ mod tests {
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition { name: "email".to_string(), data_type: DataType::Varchar(None),
-                    auto_increment: false, primary_key: false, not_null: false, unique: true, references: None },
+                    auto_increment: false, primary_key: false, not_null: false, unique: true, references: None , check_constraint: None, check_constraint_text: None },
             ],
         };
         storage.create_table(&create).unwrap();
@@ -5044,4 +5276,158 @@ mod tests {
         assert_eq!(schema.columns[2].data_type, DataType::Text);
         fs::remove_dir_all(&temp_dir).unwrap();
     }
+    #[test]
+    fn test_check_constraint_insert_valid() {
+        let temp_dir = std::env::temp_dir().join("abcsql_test_check_insert_valid");
+        let _ = fs::remove_dir_all(&temp_dir);
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        // Create table with a CHECK constraint
+        let create = CreateTableStatement {
+            table_name: "products".to_string(),
+            columns: vec![
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "price".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: Some(crate::parser::parse_condition("price > 0").unwrap().1), check_constraint_text: Some("price > 0".to_string()) },
+            ],
+        };
+        storage.create_table(&create).unwrap();
+
+        // Valid insert should succeed
+        storage.insert_row(&InsertStatement {
+            table_name: "products".to_string(),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(1), Value::Int(100)]]),
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
+        }).unwrap();
+
+        // Read back
+        let rows = storage.read_rows("products").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][1], Value::Int(100));
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_check_constraint_insert_invalid() {
+        let temp_dir = std::env::temp_dir().join("abcsql_test_check_insert_invalid");
+        let _ = fs::remove_dir_all(&temp_dir);
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        let create = CreateTableStatement {
+            table_name: "products".to_string(),
+            columns: vec![
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "price".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: Some(crate::parser::parse_condition("price > 0").unwrap().1), check_constraint_text: Some("price > 0".to_string()) },
+            ],
+        };
+        storage.create_table(&create).unwrap();
+
+        // Invalid insert (price <= 0) should fail
+        let err = storage.insert_row(&InsertStatement {
+            table_name: "products".to_string(),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(1), Value::Int(0)]]),
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
+        }).unwrap_err();
+        match err {
+            StorageError::CheckConstraintViolation { column, .. } => {
+                assert_eq!(column, "price");
+            }
+            _ => panic!("Expected CheckConstraintViolation, got: {:?}", err),
+        }
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_check_constraint_update_invalid() {
+        let temp_dir = std::env::temp_dir().join("abcsql_test_check_update_invalid");
+        let _ = fs::remove_dir_all(&temp_dir);
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        let create = CreateTableStatement {
+            table_name: "products".to_string(),
+            columns: vec![
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "price".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: Some(crate::parser::parse_condition("price > 0").unwrap().1), check_constraint_text: Some("price > 0".to_string()) },
+            ],
+        };
+        storage.create_table(&create).unwrap();
+
+        // Insert a valid row
+        storage.insert_row(&InsertStatement {
+            table_name: "products".to_string(),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(1), Value::Int(100)]]),
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
+        }).unwrap();
+
+        // Update to invalid value should fail
+        let err = storage.update_rows(&UpdateStatement {
+            table_name: "products".to_string(),
+            assignments: vec![crate::parser::Assignment { column: "price".to_string(), value: Expression::Literal(Value::Int(-5)) }],
+            where_clause: None,
+            from: None,
+            returning: None,
+        }).unwrap_err();
+        match err {
+            StorageError::CheckConstraintViolation { column, .. } => {
+                assert_eq!(column, "price");
+            }
+            _ => panic!("Expected CheckConstraintViolation, got: {:?}", err),
+        }
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_check_constraint_schema_roundtrip() {
+        let temp_dir = std::env::temp_dir().join("abcsql_test_check_schema_rt");
+        let _ = fs::remove_dir_all(&temp_dir);
+        let storage = Storage::new(&temp_dir).unwrap();
+
+        let create = CreateTableStatement {
+            table_name: "items".to_string(),
+            columns: vec![
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "qty".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: Some(crate::parser::parse_condition("qty >= 0 AND qty < 1000").unwrap().1), check_constraint_text: Some("qty >= 0 AND qty < 1000".to_string()) },
+                ColumnDefinition { name: "status".to_string(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: Some(crate::parser::parse_condition("status IN ('active', 'inactive')").unwrap().1), check_constraint_text: Some("status IN ('active', 'inactive')".to_string()) },
+            ],
+        };
+        storage.create_table(&create).unwrap();
+
+        // Load schema back and verify CHECK constraints survived
+        let loaded = storage.load_schema("items").unwrap();
+        assert_eq!(loaded.columns[1].check_constraint.is_some(), true);
+        assert_eq!(loaded.columns[1].check_constraint_text.as_deref(), Some("qty >= 0 AND qty < 1000"));
+        assert_eq!(loaded.columns[2].check_constraint.is_some(), true);
+        assert_eq!(loaded.columns[2].check_constraint_text.as_deref(), Some("status IN ('active', 'inactive')"));
+
+        // Verify constraints are enforced after reload
+        storage.insert_row(&InsertStatement {
+            table_name: "items".to_string(),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(1), Value::Int(50), Value::String("active".to_string())]]),
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
+        }).unwrap();
+
+        // Violation after reload
+        let err = storage.insert_row(&InsertStatement {
+            table_name: "items".to_string(),
+            source: crate::parser::InsertSource::Values(vec![vec![Value::Int(2), Value::Int(9999), Value::String("active".to_string())]]),
+            columns: Vec::new(),
+            on_conflict: None,
+            returning: None,
+        }).unwrap_err();
+        match err {
+            StorageError::CheckConstraintViolation { column, .. } => {
+                assert_eq!(column, "qty");
+            }
+            _ => panic!("Expected CheckConstraintViolation, got: {:?}", err),
+        }
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
 }

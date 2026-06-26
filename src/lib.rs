@@ -108,6 +108,20 @@ pub fn execute(storage: &Storage, sql: &str) -> Result<String, String> {
                 .map(|_| format!("Dropped view '{}'", stmt.view_name))
                 .map_err(|e| e.to_string())
         }
+        SqlStatement::CreateFunction(stmt) => {
+            let name = stmt.name.clone();
+            storage.create_function(&stmt)
+                .map(|_| format!("Created function '{}'", name))
+                .map_err(|e| e.to_string())
+        }
+        SqlStatement::DropFunction(stmt) => {
+            if stmt.if_exists && !storage.function_exists(&stmt.name) {
+                return Ok(format!("Function '{}' does not exist", stmt.name));
+            }
+            storage.drop_function(&stmt.name, false)
+                .map(|_| format!("Dropped function '{}'", stmt.name))
+                .map_err(|e| e.to_string())
+        }
         SqlStatement::Begin => {
             storage.begin_transaction().map(|_| "BEGIN".to_string()).map_err(|e| e.to_string())
         }
@@ -467,6 +481,13 @@ fn execute_select_to_string(
     stmt: &parser::SelectStatement,
     storage: &Storage,
 ) -> Result<String, String> {
+    // Handle FOR UPDATE: acquire lock (requires active transaction)
+    if stmt.for_update {
+        let table_name = stmt.from.table_name()
+            .ok_or_else(|| "FOR UPDATE requires a table reference".to_string())?;
+        storage.lock_for_update(table_name).map_err(|e| e.to_string())?;
+    }
+
     // If there are CTEs, materialize them first (including recursive)
     if !stmt.ctes.is_empty() {
         let mut cte_map: LibCteMap = std::collections::HashMap::new();
@@ -1116,6 +1137,25 @@ fn resolve_expr(expr: &parser::Expression, row: &[Value], cols: &[(String, Strin
                 .filter_map(|v| resolve_expr(v, row, cols, storage))
                 .collect();
             parser::apply_json_build_array(&resolved)
+        }
+        parser::Expression::UserFunc(name, args) => {
+            let func_def = match storage.load_function(name) {
+                Ok(Some(f)) => f,
+                _ => return None,
+            };
+            if func_def.params.len() != args.len() {
+                return None;
+            }
+            let arg_vals: Vec<Value> = args.iter()
+                .filter_map(|a| resolve_expr(a, row, cols, storage))
+                .collect();
+            if arg_vals.len() != args.len() {
+                return None;
+            }
+            let func_cols: Vec<(String, String)> = func_def.params.iter()
+                .map(|(n, _)| ("".to_string(), n.clone()))
+                .collect();
+            resolve_expr(&func_def.body, &arg_vals, &func_cols, storage)
         }
     }
 }

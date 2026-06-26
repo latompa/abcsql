@@ -1706,3 +1706,37 @@ fn test_json_index_create_and_use() {
     let r = execute(&db.storage, "SELECT id FROM t WHERE data = '{\"k\":\"v1\"}'").unwrap();
     assert!(r.contains("1 rows"), "expected 1 row with JSON match, got: {}", r);
 }
+
+// ---------------------------------------------------------------------------
+// CREATE / DROP FUNCTION
+// ---------------------------------------------------------------------------
+#[test]
+fn test_create_and_drop_function() {
+    let db = TestDb::new();
+    let r = execute(&db.storage, "CREATE FUNCTION add(x INT, y INT) RETURNS INT AS x + y").unwrap();
+    assert!(r.contains("Created function"), "expected created function, got: {}", r);
+    let r = execute(&db.storage, "DROP FUNCTION add").unwrap();
+    assert!(r.contains("Dropped function"), "expected dropped function, got: {}", r);
+}
+
+#[test]
+fn test_drop_function_if_exists() {
+    let db = TestDb::new();
+    let r = execute(&db.storage, "DROP FUNCTION IF EXISTS nonexistent").unwrap();
+    assert!(r.contains("does not exist"), "expected does-not-exist message, got: {}", r);
+}
+
+#[test]
+fn test_create_function_no_params() {
+    let db = TestDb::new();
+    let r = execute(&db.storage, "CREATE FUNCTION one() AS 1").unwrap();
+    assert!(r.contains("Created function"), "expected created function, got: {}", r);
+}
+
+#[test]
+fn test_create_function_twice_fails() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE FUNCTION f(x INT) RETURNS INT AS x").unwrap();
+    let r = execute(&db.storage, "CREATE FUNCTION f(x INT) RETURNS INT AS x");
+    assert!(r.is_err(), "expected error creating duplicate function");
+}

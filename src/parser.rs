@@ -14,9 +14,11 @@ pub enum SqlStatement {
     CreateTable(CreateTableStatement),
     CreateIndex(CreateIndexStatement),
     CreateView(CreateViewStatement),
+    CreateFunction(CreateFunctionStatement),
     DropIndex(DropIndexStatement),
     DropTable(DropTableStatement),
     DropView(DropViewStatement),
+    DropFunction(DropFunctionStatement),
     AlterTable(AlterTableStatement),
     Insert(InsertStatement),
     Select(SelectStatement),
@@ -44,8 +46,14 @@ pub struct MergeStatement {
     pub source: MergeSource,
     pub source_alias: Option<String>,
     pub on: Condition,
-    pub when_matched: Option<MergeAction>,
-    pub when_not_matched: Option<MergeAction>,
+    pub when_clauses: Vec<WhenClause>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct WhenClause {
+    pub is_matched: bool,
+    pub condition: Option<Condition>,
+    pub action: MergeAction,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -102,6 +110,20 @@ pub struct DropViewStatement {
 }
 
 #[derive(Debug, PartialEq, Clone)]
+pub struct CreateFunctionStatement {
+    pub name: String,
+    pub params: Vec<(String, String)>,  // (param_name, param_type)
+    pub return_type: Option<String>,
+    pub body: Box<Expression>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct DropFunctionStatement {
+    pub name: String,
+    pub if_exists: bool,
+}
+
+#[derive(Debug, PartialEq, Clone)]
 pub struct AlterTableStatement {
     pub table_name: String,
     pub action: AlterAction,
@@ -124,6 +146,10 @@ pub struct ColumnDefinition {
     pub not_null: bool,
     pub unique: bool,
     pub references: Option<ForeignKeyRef>,
+    pub check_constraint: Option<Condition>,
+    /// Raw SQL text of the CHECK condition (without CHECK(...) wrapper), preserved for
+    /// round-trip serialization to/from the schema file.
+    pub check_constraint_text: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -135,7 +161,7 @@ pub struct ForeignKeyRef {
 #[cfg(test)]
 impl ColumnDefinition {
     pub fn new(name: &str, data_type: DataType) -> Self {
-        Self { name: name.to_string(), data_type, auto_increment: false, primary_key: false, not_null: false, unique: false, references: None }
+        Self { name: name.to_string(), data_type, auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None }
     }
 }
 
@@ -235,6 +261,7 @@ pub struct SelectStatement {
     pub limit: Option<u64>,
     pub offset: Option<u64>,
     pub union: Option<(UnionType, Box<SelectStatement>)>,
+    pub for_update: bool,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -487,7 +514,8 @@ pub enum Expression {
     JsonTypeOf(Box<Expression>),                           // JSON_TYPEOF(expr)
     JsonArrayLength(Box<Expression>),                      // JSON_ARRAY_LENGTH(expr)
     JsonBuildObject(Vec<(Expression, Expression)>),      // JSON_BUILD_OBJECT(key, val, ...)
-    JsonBuildArray(Vec<Expression>),                     // JSON_BUILD_ARRAY(val, ...)
+    JsonBuildArray(Vec<Expression>),
+    UserFunc(String, Vec<Expression>),
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -700,11 +728,55 @@ pub fn parse_create(input: &str) -> IResult<&str, SqlStatement> {
     let (input, _) = tag_no_case("CREATE")(input)?;
     let (input, _) = multispace1(input)?;
     nom::branch::alt((
+        parse_create_function_inner,
         parse_create_view_inner,
         parse_create_table_inner,
         parse_create_unique_index_inner,
         parse_create_index_inner,
     ))(input)
+}
+
+fn parse_create_function_inner(input: &str) -> IResult<&str, SqlStatement> {
+    let (input, _) = tag_no_case("FUNCTION")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, name) = parse_identifier(input)?;
+    let (input, _) = multispace0(input)?;
+    // Parse parameter list: (param1 type1, param2 type2, ...)
+    let (input, _) = nom_char('(')(input)?;
+    let (input, params) = separated_list0(
+        delimited(multispace0, nom_char(','), multispace0),
+        |i| {
+            let (i, _) = multispace0(i)?;
+            let (i, pname) = parse_identifier(i)?;
+            let (i, _) = multispace1(i)?;
+            let (i, ptype) = parse_identifier(i)?;
+            Ok((i, (pname.to_string(), ptype.to_string())))
+        },
+    )(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    // Consume whitespace before optional RETURNS / AS
+    let (input, _) = multispace0(input)?;
+    // Try RETURNS type (if present), then require AS
+    let (input, return_type) = if input.trim_start().to_uppercase().starts_with("RETURNS") {
+        let (input, _) = tag_no_case("RETURNS")(input)?;
+        let (input, _) = multispace1(input)?;
+        let (input, rt) = parse_identifier(input)?;
+        let (input, _) = multispace1(input)?;
+        (input, Some(rt.to_string()))
+    } else {
+        (input, None)
+    };
+    let (input, _) = tag_no_case("AS")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, body) = parse_expression(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
+    Ok((input, SqlStatement::CreateFunction(CreateFunctionStatement {
+        name: name.to_string(),
+        params: params.into_iter().map(|(n, t)| (n.to_string(), t.to_string())).collect(),
+        return_type: return_type.map(|s| s.to_string()),
+        body: Box::new(body),
+    })))
 }
 
 fn parse_create_view_inner(input: &str) -> IResult<&str, SqlStatement> {
@@ -814,6 +886,13 @@ fn parse_column_definition(input: &str) -> IResult<&str, ColumnDefinition> {
     let (input, _) = multispace0(input)?;
     let (input, fk_ref) = nom::combinator::opt(parse_references)(input)?;
     let (input, _) = multispace0(input)?;
+    let (input, check) = nom::combinator::opt(parse_check_constraint)(input)?;
+    let (input, _) = multispace0(input)?;
+
+    let (check_cond, check_text) = match check {
+        Some((cond, text)) => (Some(cond), Some(text)),
+        None => (None, None),
+    };
 
     Ok((input, ColumnDefinition {
         name: name.to_string(),
@@ -823,6 +902,8 @@ fn parse_column_definition(input: &str) -> IResult<&str, ColumnDefinition> {
         not_null: nn.is_some(),
         unique: uniq.is_some(),
         references: fk_ref,
+        check_constraint: check_cond,
+        check_constraint_text: check_text,
     }))
 }
 
@@ -835,6 +916,25 @@ fn parse_references(input: &str) -> IResult<&str, ForeignKeyRef> {
     let (input, column) = parse_identifier(input)?;
     let (input, _) = nom_char(')')(input)?;
     Ok((input, ForeignKeyRef { table: table.to_string(), column: column.to_string() }))
+}
+
+/// Parse CHECK (condition) — returns the parsed Condition and the raw inner SQL text.
+fn parse_check_constraint(input: &str) -> IResult<&str, (Condition, String)> {
+    let start = input;
+    let (input, _) = tag_no_case("CHECK")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, cond) = parse_condition(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    // Extract the raw inner condition text (the SQL between CHECK and (...))
+    let consumed = &start[..start.len() - input.len()];
+    // Strip 'CHECK (' prefix and trailing ')'
+    let inner = consumed.trim().strip_prefix("CHECK").unwrap_or(consumed).trim();
+    let inner = inner.strip_prefix('(').unwrap_or(inner).trim();
+    let inner = inner.strip_suffix(')').unwrap_or(inner).trim();
+    Ok((input, (cond, inner.to_string())))
 }
 
 /// Parse data type: INT, VARCHAR, SMALLINT, BIGINT, TEXT, DECIMAL, UUID, JSON, etc.
@@ -1246,8 +1346,8 @@ pub fn parse_merge(input: &str) -> IResult<&str, SqlStatement> {
     let (input, _) = multispace1(input)?;
     let (input, on) = parse_condition(input)?;
 
-    // Parse WHEN MATCHED / WHEN NOT MATCHED clauses (at most one of each)
-    let (input, (when_matched, when_not_matched)) = parse_merge_when_clauses(input)?;
+    // Parse WHEN MATCHED / WHEN NOT MATCHED clauses
+    let (input, when_clauses) = parse_merge_when_clauses(input)?;
 
     let (input, _) = multispace0(input)?;
     let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
@@ -1258,40 +1358,33 @@ pub fn parse_merge(input: &str) -> IResult<&str, SqlStatement> {
         source,
         source_alias,
         on,
-        when_matched,
-        when_not_matched,
+        when_clauses,
     })))
 }
 
-/// Parse WHEN MATCHED / WHEN NOT MATCHED clauses for MERGE
-fn parse_merge_when_clauses(input: &str) -> IResult<&str, (Option<MergeAction>, Option<MergeAction>)> {
+/// Parse all WHEN MATCHED / WHEN NOT MATCHED clauses for MERGE
+fn parse_merge_when_clauses(input: &str) -> IResult<&str, Vec<WhenClause>> {
     let mut input = input;
-    let mut when_matched: Option<MergeAction> = None;
-    let mut when_not_matched: Option<MergeAction> = None;
+    let mut clauses = Vec::new();
 
-    // Try parsing up to 2 WHEN clauses
-    for _ in 0..4 {
+    loop {
         let trimmed = input.trim_start();
         if !trimmed.to_uppercase().starts_with("WHEN") {
             break;
         }
         match parse_merge_when_clause(trimmed) {
-            Ok((rest, (is_matched, action))) => {
-                if is_matched && when_matched.is_none() {
-                    when_matched = Some(action);
-                } else if !is_matched && when_not_matched.is_none() {
-                    when_not_matched = Some(action);
-                }
+            Ok((rest, clause)) => {
+                clauses.push(clause);
                 input = rest;
             }
             Err(_) => break,
         }
     }
-    Ok((input, (when_matched, when_not_matched)))
+    Ok((input, clauses))
 }
 
-/// Parse a single WHEN clause — returns (is_matched, action)
-fn parse_merge_when_clause(input: &str) -> IResult<&str, (bool, MergeAction)> {
+/// Parse a single WHEN clause
+fn parse_merge_when_clause(input: &str) -> IResult<&str, WhenClause> {
     let (input, _) = multispace0(input)?;
     let (input, _) = tag_no_case("WHEN")(input)?;
     let (input, _) = multispace1(input)?;
@@ -1301,13 +1394,22 @@ fn parse_merge_when_clause(input: &str) -> IResult<&str, (bool, MergeAction)> {
         multispace1,
     ))(input)?;
     let (input, _) = tag_no_case("MATCHED")(input)?;
+    let is_matched = is_not.is_none();
+
+    // Parse optional AND <condition>
+    let (input, condition) = nom::combinator::opt(nom::sequence::pair(
+        nom::sequence::preceded(multispace1, tag_no_case("AND")),
+        nom::sequence::preceded(multispace0, parse_condition),
+    ))(input).map(|(i, opt)| {
+        (i, opt.map(|(_, cond)| cond))
+    })?;
+
     let (input, _) = multispace1(input)?;
     let (input, _) = tag_no_case("THEN")(input)?;
     let (input, _) = multispace1(input)?;
-    let is_matched = is_not.is_none();
 
     // Parse the action: UPDATE SET ..., DELETE, INSERT ..., or DO NOTHING
-    let action = if let Ok((input, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("UPDATE")(input) {
+    let (input, action) = if let Ok((input, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("UPDATE")(input) {
         let (input, _) = multispace1(input)?;
         let (input, _) = tag_no_case("SET")(input)?;
         let (input, _) = multispace1(input)?;
@@ -1315,9 +1417,9 @@ fn parse_merge_when_clause(input: &str) -> IResult<&str, (bool, MergeAction)> {
             nom::sequence::delimited(multispace0, nom_char(','), multispace0),
             parse_assignment,
         )(input)?;
-        return Ok((input, (is_matched, MergeAction::Update(assignments))));
+        (input, MergeAction::Update(assignments))
     } else if let Ok((input, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("DELETE")(input) {
-        return Ok((input, (is_matched, MergeAction::Delete)));
+        (input, MergeAction::Delete)
     } else if let Ok((input, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("INSERT")(input) {
         let (input, _) = multispace0(input)?;
         // Optional column list
@@ -1343,16 +1445,17 @@ fn parse_merge_when_clause(input: &str) -> IResult<&str, (bool, MergeAction)> {
         )(input)?;
         let (input, _) = multispace0(input)?;
         let (input, _) = nom_char(')')(input)?;
-        return Ok((input, (is_matched, MergeAction::Insert(cols.unwrap_or_default(), exprs))));
+        (input, MergeAction::Insert(cols.unwrap_or_default(), exprs))
     } else {
         // DO NOTHING (if someone writes it)
-        let _ = nom::combinator::opt(nom::sequence::pair(
+        let (input, _) = nom::combinator::opt(nom::sequence::pair(
             tag_no_case::<&str, &str, nom::error::Error<&str>>("DO"),
             nom::sequence::preceded(multispace1, tag_no_case("NOTHING")),
-        ))(input);
-        MergeAction::DoNothing
+        ))(input)?;
+        (input, MergeAction::DoNothing)
     };
-    Ok((input, (is_matched, action)))
+
+    Ok((input, WhenClause { is_matched, condition, action }))
 }
 
 // DROP INDEX name; / DROP TABLE [IF EXISTS] name;
@@ -1420,7 +1523,22 @@ pub fn parse_release(input: &str) -> IResult<&str, SqlStatement> {
 pub fn parse_drop(input: &str) -> IResult<&str, SqlStatement> {
     let (input, _) = tag_no_case("DROP")(input)?;
     let (input, _) = multispace1(input)?;
-    nom::branch::alt((parse_drop_view_inner, parse_drop_index_inner, parse_drop_table_inner))(input)
+    nom::branch::alt((parse_drop_function_inner, parse_drop_view_inner, parse_drop_index_inner, parse_drop_table_inner))(input)
+}
+
+fn parse_drop_function_inner(input: &str) -> IResult<&str, SqlStatement> {
+    let (input, _) = tag_no_case("FUNCTION")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, if_exists) = nom::combinator::opt(
+        nom::sequence::terminated(tag_no_case("IF EXISTS"), multispace1)
+    )(input)?;
+    let (input, name) = parse_identifier(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
+    Ok((input, SqlStatement::DropFunction(DropFunctionStatement {
+        name: name.to_string(),
+        if_exists: if_exists.is_some(),
+    })))
 }
 
 fn parse_drop_view_inner(input: &str) -> IResult<&str, SqlStatement> {
@@ -1687,6 +1805,29 @@ pub fn parse_select_statement(input: &str) -> IResult<&str, SelectStatement> {
         }
     };
 
+    // Parse FOR UPDATE [NOWAIT | SKIP LOCKED]
+    let (input, for_update) = {
+        let saved = input;
+        match nom::combinator::opt::<_, _, nom::error::Error<&str>, _>(nom::sequence::preceded(
+            multispace1,
+            tag_no_case("FOR UPDATE"),
+        ))(input) {
+            Ok((after_fu, Some(_))) => {
+                // Consume optional NOWAIT or SKIP LOCKED (accepted but not enforced)
+                let (after_fu, _) = nom::combinator::opt::<_, _, nom::error::Error<&str>, _>(nom::sequence::preceded(
+                    multispace1,
+                    nom::branch::alt((
+                        tag_no_case("NOWAIT"),
+                        tag_no_case("SKIP LOCKED"),
+                    )),
+                ))(after_fu).unwrap_or((after_fu, None));
+                (after_fu, true)
+            }
+            Ok((_, None)) => (saved, false),
+            Err(_) => (saved, false),
+        }
+    };
+
     Ok((input, SelectStatement {
         ctes: Vec::new(),
         columns,
@@ -1703,6 +1844,7 @@ pub fn parse_select_statement(input: &str) -> IResult<&str, SelectStatement> {
         limit,
         offset,
         union,
+        for_update,
     }))
 }
 
@@ -2587,7 +2729,7 @@ fn parse_arith_mul_div(input: &str) -> IResult<&str, ArithOp> {
 }
 
 /// Parse expression with arithmetic: handles ||, +, -, *, / with precedence
-fn parse_expression(input: &str) -> IResult<&str, Expression> {
+pub fn parse_expression(input: &str) -> IResult<&str, Expression> {
     let (mut input, mut left) = parse_json_expr(input)?;
     // || has lower precedence than -> / ->> / arithmetic
     while let Ok((remaining, _)) = nom::sequence::delimited(
@@ -2694,9 +2836,30 @@ fn parse_atom(input: &str) -> IResult<&str, Expression> {
             parse_expression_aggregate,
             parse_expression_qualified_column,
             parse_expression_literal,
+            parse_expression_user_func,
             parse_expression_simple_column,
         )),
     ))(input)
+}
+
+// Parse a user-defined function call: name(expr, expr, ...)
+fn parse_expression_user_func(input: &str) -> IResult<&str, Expression> {
+    let (input, name) = parse_identifier(input)?;
+    let (input, _) = multispace0(input)?;
+    // Use try to peek at '(' without consuming — if no '(' it's not a function call
+    let (input, _) = nom::combinator::peek(nom_char('('))(input)?;
+    // Now parse the full function call
+    let (input, _) = nom_char('(')(input)?;
+    let (input, args) = nom::multi::separated_list0(
+        nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+        |i| {
+            let (i, _) = multispace0(i)?;
+            parse_expression(i)
+        },
+    )(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, Expression::UserFunc(name.to_string(), args)))
 }
 
 // ── Helper: parse FUNC(expr) ──
@@ -7305,6 +7468,87 @@ mod tests {
                 }
             }
             _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_parse_merge_simple() {
+        // Basic WHEN MATCHED without condition (unqualified column names)
+        let sql = "MERGE INTO t1 USING s1 ON t1.id = s1.id WHEN MATCHED THEN UPDATE SET val = s1.val";
+        let (rest, stmt) = parse_sql(sql).unwrap();
+        assert!(rest.trim().is_empty(), "unparsed: '{}'", rest);
+        match stmt {
+            SqlStatement::Merge(ms) => {
+                assert_eq!(ms.when_clauses.len(), 1);
+                assert!(ms.when_clauses[0].is_matched);
+                assert!(ms.when_clauses[0].condition.is_none());
+            }
+            _ => panic!("Expected Merge"),
+        }
+    }
+
+    #[test]
+    fn test_parse_merge_with_condition() {
+        // WHEN MATCHED with AND condition
+        let sql = "MERGE INTO t1 USING s1 ON t1.id = s1.id WHEN MATCHED AND s1.val > 500 THEN UPDATE SET val = s1.val";
+        let (rest, stmt) = parse_sql(sql).unwrap();
+        assert!(rest.trim().is_empty(), "unparsed: '{}'", rest);
+        match stmt {
+            SqlStatement::Merge(ms) => {
+                assert_eq!(ms.when_clauses.len(), 1);
+                assert!(ms.when_clauses[0].condition.is_some());
+            }
+            _ => panic!("Expected Merge"),
+        }
+    }
+
+    #[test]
+    fn test_parse_merge_multiple_when() {
+        // Multiple WHEN clauses
+        let sql = "MERGE INTO t1 USING s1 ON t1.id = s1.id WHEN MATCHED AND s1.val > 500 THEN UPDATE SET val = s1.val WHEN MATCHED THEN DELETE WHEN NOT MATCHED THEN INSERT (id, val) VALUES (s1.id, s1.val)";
+        let (rest, stmt) = parse_sql(sql).unwrap();
+        assert!(rest.trim().is_empty(), "unparsed: '{}'", rest);
+        match stmt {
+            SqlStatement::Merge(ms) => {
+                assert_eq!(ms.when_clauses.len(), 3);
+                assert!(ms.when_clauses[0].is_matched);
+                assert!(ms.when_clauses[0].condition.is_some());
+                assert!(ms.when_clauses[1].is_matched);
+                assert!(ms.when_clauses[1].condition.is_none());
+                assert!(!ms.when_clauses[2].is_matched);
+                assert!(ms.when_clauses[2].condition.is_none());
+            }
+            _ => panic!("Expected Merge"),
+        }
+    }
+
+    #[test]
+    fn test_parse_merge_not_matched() {
+        // WHEN NOT MATCHED
+        let sql = "MERGE INTO t1 USING s1 ON t1.id = s1.id WHEN NOT MATCHED THEN INSERT (id, val) VALUES (s1.id, s1.val)";
+        let (rest, stmt) = parse_sql(sql).unwrap();
+        assert!(rest.trim().is_empty(), "unparsed: '{}'", rest);
+        match stmt {
+            SqlStatement::Merge(ms) => {
+                assert_eq!(ms.when_clauses.len(), 1);
+                assert!(!ms.when_clauses[0].is_matched);
+            }
+            _ => panic!("Expected Merge"),
+        }
+    }
+
+    #[test]
+    fn test_parse_merge_do_nothing() {
+        // WHEN MATCHED THEN DO NOTHING
+        let sql = "MERGE INTO t1 USING s1 ON t1.id = s1.id WHEN MATCHED THEN DO NOTHING";
+        let (rest, stmt) = parse_sql(sql).unwrap();
+        assert!(rest.trim().is_empty(), "unparsed: '{}'", rest);
+        match stmt {
+            SqlStatement::Merge(ms) => {
+                assert_eq!(ms.when_clauses.len(), 1);
+                assert_eq!(ms.when_clauses[0].action, MergeAction::DoNothing);
+            }
+            _ => panic!("Expected Merge"),
         }
     }
 }

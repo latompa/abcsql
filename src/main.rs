@@ -246,6 +246,23 @@ fn execute_sql(sql: &str, storage: &Storage) {
                 Err(e) => eprintln!("Error: {}", e),
             }
         }
+        SqlStatement::CreateFunction(stmt) => {
+            let name = stmt.name.clone();
+            match storage.create_function(&stmt) {
+                Ok(_) => println!("Created function '{}'", name),
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        }
+        SqlStatement::DropFunction(stmt) => {
+            if stmt.if_exists && !storage.function_exists(&stmt.name) {
+                println!("Function '{}' does not exist", stmt.name);
+                return;
+            }
+            match storage.drop_function(&stmt.name, false) {
+                Ok(_) => println!("Dropped function '{}'", stmt.name),
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        }
         SqlStatement::Truncate(stmt) => {
             let name = stmt.table_name.clone();
             match storage.truncate_table(&stmt) {
@@ -1145,26 +1162,188 @@ fn materialize_window_functions(
 }
 
 /// Compute frame bounds [start, end] (inclusive) for a given position in a sorted partition.
-/// Default (no frame spec) = whole partition: (0, n-1).
-fn compute_frame_bounds(spec: &parser::WindowSpec, pos: usize, n: usize) -> (usize, usize) {
-    if let Some(ref frame) = spec.frame {
-        let fs = match &frame.start {
-            parser::FrameBound::UnboundedPreceding => 0,
-            parser::FrameBound::Preceding(k) => pos.saturating_sub(*k as usize),
-            parser::FrameBound::CurrentRow => pos,
-            parser::FrameBound::Following(k) => (pos + *k as usize).min(n.saturating_sub(1)),
-            parser::FrameBound::UnboundedFollowing => n.saturating_sub(1),
-        };
-        let fe = match &frame.end {
-            parser::FrameBound::UnboundedPreceding => 0,
-            parser::FrameBound::Preceding(k) => pos.saturating_sub(*k as usize),
-            parser::FrameBound::CurrentRow => pos,
-            parser::FrameBound::Following(k) => (pos + *k as usize).min(n.saturating_sub(1)),
-            parser::FrameBound::UnboundedFollowing => n.saturating_sub(1),
-        };
-        (fs, fe)
-    } else {
-        (0, n.saturating_sub(1)) // default: whole partition
+/// `sorted` is the sorted array of row indices. `pos` is the index into `sorted` (0-based).
+/// Default (no frame spec) = whole partition: (0, sorted.len()-1).
+#[allow(dead_code)]
+fn compute_frame_bounds(
+    spec: &parser::WindowSpec,
+    pos: usize,
+    sorted: &[usize],
+    rows: &[Vec<Value>],
+    cols: &[ResultColumn],
+    _storage: &Storage,
+) -> (usize, usize) {
+    let n = sorted.len();
+    let default = || (0, n.saturating_sub(1));
+
+    let frame = match spec.frame {
+        Some(ref f) => f,
+        None => return default(),
+    };
+
+    // Helper: get the ORDER BY value for a given row index (or indices for multi-column ORDER BY).
+    // Returns a Vec so that multi-column ORDER BY can be compared element-wise.
+    let get_order_values = |row_idx: usize| -> Vec<Value> {
+        spec.order_by.iter()
+            .filter_map(|ob| resolve_column_index(&ob.column, cols).map(|i| rows[row_idx][i].clone()))
+            .collect()
+    };
+
+    // Helper: check if `a` is within `k` units of `b` (for the first ORDER BY column only).
+    // For numeric types, uses subtraction. For other types, falls back to equality.
+    let within_range = |a: &Value, b: &Value, k: u64| -> bool {
+        let k = k as f64;
+        match (a, b) {
+            (Value::Int(ai), Value::Int(bi)) => (*ai as f64 - *bi as f64).abs() <= k,
+            (Value::Int(ai), Value::Float(bf)) => (*ai as f64 - *bf).abs() <= k,
+            (Value::Float(af), Value::Int(bi)) => (*af - *bi as f64).abs() <= k,
+            (Value::Float(af), Value::Float(bf)) => (*af - *bf).abs() <= k,
+            _ => a == b,
+        }
+    };
+
+    match frame.mode {
+        parser::FrameMode::Rows => {
+            let fs = match &frame.start {
+                parser::FrameBound::UnboundedPreceding => 0,
+                parser::FrameBound::Preceding(k) => pos.saturating_sub(*k as usize),
+                parser::FrameBound::CurrentRow => pos,
+                parser::FrameBound::Following(k) => (pos + *k as usize).min(n.saturating_sub(1)),
+                parser::FrameBound::UnboundedFollowing => n.saturating_sub(1),
+            };
+            let fe = match &frame.end {
+                parser::FrameBound::UnboundedPreceding => 0,
+                parser::FrameBound::Preceding(k) => pos.saturating_sub(*k as usize),
+                parser::FrameBound::CurrentRow => pos,
+                parser::FrameBound::Following(k) => (pos + *k as usize).min(n.saturating_sub(1)),
+                parser::FrameBound::UnboundedFollowing => n.saturating_sub(1),
+            };
+            (fs, fe)
+        }
+        parser::FrameMode::Range => {
+            let current_vals = get_order_values(sorted[pos]);
+            // For RANGE, PRECEDING/FOLLOWING offset applies to the ORDER BY value,
+            // not to the row position. Compare by the first ORDER BY column.
+            let fs = match &frame.start {
+                parser::FrameBound::UnboundedPreceding => 0,
+                parser::FrameBound::Preceding(k) => {
+                    let mut start = pos;
+                    while start > 0 {
+                        let candidate = get_order_values(sorted[start - 1]);
+                        let in_range = current_vals.iter().zip(candidate.iter()).all(|(c, cand)| {
+                            within_range(cand, c, *k)
+                        });
+                        if in_range {
+                            start -= 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    start
+                }
+                parser::FrameBound::CurrentRow => pos,
+                parser::FrameBound::Following(k) => {
+                    let mut start = pos;
+                    while start > 0 {
+                        let candidate = get_order_values(sorted[start - 1]);
+                        let in_range = current_vals.iter().zip(candidate.iter()).all(|(c, cand)| {
+                            within_range(cand, c, *k)
+                        });
+                        if in_range {
+                            start -= 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    start
+                }
+                parser::FrameBound::UnboundedFollowing => n.saturating_sub(1),
+            };
+            let fe = match &frame.end {
+                parser::FrameBound::UnboundedPreceding => 0,
+                parser::FrameBound::Preceding(k) => {
+                    let mut end = pos;
+                    while end + 1 < n {
+                        let candidate = get_order_values(sorted[end + 1]);
+                        let in_range = current_vals.iter().zip(candidate.iter()).all(|(c, cand)| {
+                            within_range(cand, c, *k)
+                        });
+                        if in_range {
+                            end += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    end
+                }
+                parser::FrameBound::CurrentRow => pos,
+                parser::FrameBound::Following(k) => {
+                    let mut end = pos;
+                    while end + 1 < n {
+                        let candidate = get_order_values(sorted[end + 1]);
+                        let in_range = current_vals.iter().zip(candidate.iter()).all(|(c, cand)| {
+                            within_range(cand, c, *k)
+                        });
+                        if in_range {
+                            end += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    end
+                }
+                parser::FrameBound::UnboundedFollowing => n.saturating_sub(1),
+            };
+            (fs, fe)
+        }
+        parser::FrameMode::Groups => {
+            // Build peer group boundaries: a list of (start, end) indices into `sorted`.
+            let mut groups: Vec<(usize, usize)> = Vec::new();
+            if n > 0 {
+                let mut g_start = 0;
+                for i in 1..=n {
+                    if i == n || get_order_values(sorted[i]) != get_order_values(sorted[i - 1]) {
+                        groups.push((g_start, i - 1));
+                        g_start = i;
+                    }
+                }
+            }
+            // Find which group the current row belongs to
+            let current_group = groups.iter().position(|&(s, e)| s <= pos && pos <= e);
+            let group_idx = match current_group {
+                Some(idx) => idx,
+                None => return default(),
+            };
+            let n_groups = groups.len();
+
+            let gs = match &frame.start {
+                parser::FrameBound::UnboundedPreceding => 0,
+                parser::FrameBound::Preceding(k) => {
+                    let g = group_idx.saturating_sub(*k as usize);
+                    groups[g].0
+                }
+                parser::FrameBound::CurrentRow => groups[group_idx].0,
+                parser::FrameBound::Following(k) => {
+                    let g = (group_idx + *k as usize).min(n_groups.saturating_sub(1));
+                    groups[g].0
+                }
+                parser::FrameBound::UnboundedFollowing => groups[n_groups - 1].0,
+            };
+            let ge = match &frame.end {
+                parser::FrameBound::UnboundedPreceding => 0,
+                parser::FrameBound::Preceding(k) => {
+                    let g = group_idx.saturating_sub(*k as usize);
+                    groups[g].1
+                }
+                parser::FrameBound::CurrentRow => groups[group_idx].1,
+                parser::FrameBound::Following(k) => {
+                    let g = (group_idx + *k as usize).min(n_groups.saturating_sub(1));
+                    groups[g].1
+                }
+                parser::FrameBound::UnboundedFollowing => groups[n_groups - 1].1,
+            };
+            (gs, ge)
+        }
     }
 }
 
@@ -1273,9 +1452,8 @@ fn compute_window_values(
                 }
             }
             parser::WindowFunc::Agg(agg_func, inner_col) => {
-                let n = sorted.len();
                 for (pos, &orig_idx) in sorted.iter().enumerate() {
-                    let (frame_start, frame_end) = compute_frame_bounds(spec, pos, n);
+                    let (frame_start, frame_end) = compute_frame_bounds(spec, pos, &sorted, rows, cols, storage);
                     let frame_rows: Vec<Vec<Value>> = sorted[frame_start..=frame_end]
                         .iter().map(|&i| rows[i].clone()).collect();
                     let agg_str = compute_aggregate(agg_func, inner_col, &frame_rows, cols);
@@ -1338,18 +1516,16 @@ fn compute_window_values(
                 }
             }
             parser::WindowFunc::FirstValue(expr) => {
-                let n = sorted.len();
                 for (pos, &orig_idx) in sorted.iter().enumerate() {
-                    let (frame_start, _) = compute_frame_bounds(spec, pos, n);
+                    let (frame_start, _) = compute_frame_bounds(spec, pos, &sorted, rows, cols, storage);
                     let src_idx = sorted[frame_start];
                     result[orig_idx] = resolve_join_expression(expr, &rows[src_idx], cols, storage)
                         .unwrap_or(Value::Null);
                 }
             }
             parser::WindowFunc::LastValue(expr) => {
-                let n = sorted.len();
                 for (pos, &orig_idx) in sorted.iter().enumerate() {
-                    let (_, frame_end) = compute_frame_bounds(spec, pos, n);
+                    let (_, frame_end) = compute_frame_bounds(spec, pos, &sorted, rows, cols, storage);
                     let src_idx = sorted[frame_end];
                     result[orig_idx] = resolve_join_expression(expr, &rows[src_idx], cols, storage)
                         .unwrap_or(Value::Null);
@@ -1359,9 +1535,8 @@ fn compute_window_values(
                 let n = resolve_join_expression(n_expr, &rows[sorted[0]], cols, storage)
                     .and_then(|v| if let Value::Int(n) = v { Some((n - 1).max(0) as usize) } else { None })
                     .unwrap_or(0);
-                let total = sorted.len();
                 for (pos, &orig_idx) in sorted.iter().enumerate() {
-                    let (frame_start, frame_end) = compute_frame_bounds(spec, pos, total);
+                    let (frame_start, frame_end) = compute_frame_bounds(spec, pos, &sorted, rows, cols, storage);
                     let frame_len = frame_end - frame_start + 1;
                     let val = if n < frame_len {
                         let src_idx = sorted[frame_start + n];
@@ -1379,6 +1554,19 @@ fn compute_window_values(
 }
 
 fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) -> (Vec<String>, Vec<Vec<String>>) {
+    // Handle FOR UPDATE: acquire lock (requires active transaction)
+    if stmt.for_update {
+        if let Some(table_name) = stmt.from.table_name() {
+            if let Err(e) = storage.lock_for_update(table_name) {
+                eprintln!("Error: {}", e);
+                return (Vec::new(), Vec::new());
+            }
+        } else {
+            eprintln!("Error: FOR UPDATE requires a table reference");
+            return (Vec::new(), Vec::new());
+        }
+    }
+
     // Materialize CTEs
     let mut cte_map: HashMap<String, CteData> = HashMap::new();
     for cte in &stmt.ctes {
@@ -2292,6 +2480,10 @@ fn format_expr(expr: &parser::Expression) -> String {
             let args: Vec<String> = vals.iter().map(format_expr).collect();
             format!("json_build_array({})", args.join(", "))
         }
+        parser::Expression::UserFunc(name, args) => {
+            let args_str: Vec<String> = args.iter().map(format_expr).collect();
+            format!("{}({})", name, args_str.join(", "))
+        }
         parser::Expression::Case(_, _) => "case".to_string(),
         parser::Expression::Aggregate(func, inner) => {
             let func_name = match func {
@@ -3044,6 +3236,25 @@ fn resolve_join_expression(
                 .filter_map(|v| resolve_join_expression(v, row, cols, storage))
                 .collect();
             parser::apply_json_build_array(&resolved)
+        }
+        parser::Expression::UserFunc(name, args) => {
+            let func_def = match storage.load_function(name) {
+                Ok(Some(f)) => f,
+                _ => return None,
+            };
+            if func_def.params.len() != args.len() {
+                return None;
+            }
+            let arg_vals: Vec<Value> = args.iter()
+                .filter_map(|a| resolve_join_expression(a, row, cols, storage))
+                .collect();
+            if arg_vals.len() != args.len() {
+                return None;
+            }
+            let func_cols: Vec<ResultColumn> = func_def.params.iter()
+                .map(|(n, _)| ResultColumn { table: String::new(), name: n.clone() })
+                .collect();
+            resolve_join_expression(&func_def.body, &arg_vals, &func_cols, storage)
         }
     }
 }

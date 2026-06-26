@@ -1587,6 +1587,7 @@ fn parse_extra_from_table(input: &str) -> IResult<&str, (String, Option<String>)
 pub fn parse_select_statement(input: &str) -> IResult<&str, SelectStatement> {
     let (input, _) = tag_no_case("SELECT")(input)?;
     let (input, _) = multispace1(input)?;
+    let (input, _all) = nom::combinator::opt(nom::sequence::terminated(tag_no_case("ALL"), multispace1))(input)?;
     let (input, distinct) = nom::combinator::opt(nom::sequence::terminated(tag_no_case("DISTINCT"), multispace1))(input)?;
     let distinct = distinct.is_some();
     let (input, columns) = separated_list0(
@@ -2016,10 +2017,17 @@ fn parse_group_by_clause(input: &str) -> IResult<&str, (Vec<SelectColumn>, Optio
                 let primary = sets.first().cloned().unwrap_or_default();
                 return Ok((input, (primary, Some(sets))));
             }
-            // Regular GROUP BY
+            // Regular GROUP BY (with ordinal support)
             let (input, cols) = separated_list0(
                 delimited(multispace0, nom_char(','), multispace0),
-                nom::branch::alt((parse_qualified_column, parse_simple_column)),
+                nom::branch::alt((
+                    nom::combinator::map(
+                        nom::character::complete::u64,
+                        |n| SelectColumn::Expr(Expression::Literal(Value::Int(n as i64))),
+                    ),
+                    parse_qualified_column,
+                    parse_simple_column,
+                )),
             )(input)?;
             Ok((input, (cols, None)))
         }
@@ -2061,10 +2069,21 @@ fn parse_order_by_clause(input: &str) -> IResult<&str, Vec<OrderByClause>> {
 /// Parse a single ORDER BY item: column [ASC|DESC] [NULLS FIRST|LAST]
 fn parse_order_by_item(input: &str) -> IResult<&str, OrderByClause> {
     let (input, _) = multispace0(input)?;
-    let (input, column) = nom::branch::alt((
-        parse_qualified_column,
-        parse_simple_column,
-    ))(input)?;
+    let (input, column) = {
+        // Try expression first, then fall back to simple/qualified column
+        if let Ok((rest, expr)) = parse_expression(input) {
+            match expr {
+                Expression::Column(name) => (rest, SelectColumn::Column(name)),
+                Expression::QualifiedColumn(table, col) => (rest, SelectColumn::QualifiedColumn(table, col)),
+                other => (rest, SelectColumn::Expr(other)),
+            }
+        } else {
+            nom::branch::alt((
+                parse_qualified_column,
+                parse_simple_column,
+            ))(input)?
+        }
+    };
     let (input, _) = multispace0(input)?;
     let (input, dir) = nom::combinator::opt(nom::branch::alt((
         tag_no_case("ASC"),
@@ -2088,25 +2107,39 @@ fn parse_order_by_item(input: &str) -> IResult<&str, OrderByClause> {
 /// Parse LIMIT clause (returns None if not present)
 fn parse_limit_offset_clause(input: &str) -> IResult<&str, (Option<u64>, Option<u64>)> {
     let (input, _) = multispace0(input)?;
-    let result = tag_no_case::<&str, &str, nom::error::Error<&str>>("LIMIT")(input);
-    match result {
-        Ok((input, _)) => {
-            let (input, _) = multispace1(input)?;
-            let (input, n) = nom::character::complete::u64(input)?;
-            // Parse optional OFFSET
-            let (input, _) = multispace0(input)?;
-            let offset_result = tag_no_case::<&str, &str, nom::error::Error<&str>>("OFFSET")(input);
-            match offset_result {
-                Ok((input, _)) => {
-                    let (input, _) = multispace1(input)?;
-                    let (input, off) = nom::character::complete::u64(input)?;
-                    Ok((input, (Some(n), Some(off))))
-                }
-                Err(_) => Ok((input, (Some(n), None))),
+    // Try LIMIT n [OFFSET m] first
+    let limit_res = tag_no_case::<&str, &str, nom::error::Error<&str>>("LIMIT")(input);
+    if let Ok((after_limit, _)) = limit_res {
+        let (after_limit, _) = multispace1(after_limit)?;
+        let (after_limit, n) = nom::character::complete::u64(after_limit)?;
+        let (after_limit, _) = multispace0(after_limit)?;
+        let offset_res = tag_no_case::<&str, &str, nom::error::Error<&str>>("OFFSET")(after_limit);
+        return match offset_res {
+            Ok((after_offset, _)) => {
+                let (after_offset, _) = multispace1(after_offset)?;
+                let (after_offset, off) = nom::character::complete::u64(after_offset)?;
+                Ok((after_offset, (Some(n), Some(off))))
             }
-        }
-        Err(_) => Ok((input, (None, None))),
+            Err(_) => Ok((after_limit, (Some(n), None))),
+        };
     }
+    // Try OFFSET m [LIMIT n]
+    let offset_res = tag_no_case::<&str, &str, nom::error::Error<&str>>("OFFSET")(input);
+    if let Ok((after_offset, _)) = offset_res {
+        let (after_offset, _) = multispace1(after_offset)?;
+        let (after_offset, off) = nom::character::complete::u64(after_offset)?;
+        let (after_offset, _) = multispace0(after_offset)?;
+        let limit_res = tag_no_case::<&str, &str, nom::error::Error<&str>>("LIMIT")(after_offset);
+        return match limit_res {
+            Ok((after_limit, _)) => {
+                let (after_limit, _) = multispace1(after_limit)?;
+                let (after_limit, n) = nom::character::complete::u64(after_limit)?;
+                Ok((after_limit, (Some(n), Some(off))))
+            }
+            Err(_) => Ok((after_offset, (None, Some(off)))),
+        };
+    }
+    Ok((input, (None, None)))
 }
 
 /// Check if identifier is a reserved keyword that can't be used as an alias

@@ -1407,7 +1407,7 @@ fn execute_select(stmt: &parser::SelectStatement, storage: &Storage) -> (Vec<Str
             collect_aggregate_rows(&stmt_columns, &filtered_rows, &combined_cols, &stmt.group_by, stmt.having.as_ref(), &stmt.order_by, stmt.limit, stmt.offset, stmt.distinct, storage)
         }
     } else {
-        collect_normal_rows(&stmt_columns, filtered_rows, &combined_cols, &stmt.order_by, stmt.limit, stmt.offset, stmt.distinct)
+        collect_normal_rows(&stmt_columns, filtered_rows, &combined_cols, &stmt.order_by, stmt.limit, stmt.offset, stmt.distinct, storage)
     };
 
     // Handle UNION / UNION ALL / INTERSECT / EXCEPT
@@ -1708,9 +1708,20 @@ fn collect_aggregate_rows(
         // No GROUP BY: all rows are one group
         vec![rows.iter().collect()]
     } else {
-        // Resolve GROUP BY column indices
+        // Resolve GROUP BY column indices (with ordinal support: GROUP BY 1, 2, ...)
         let group_indices: Vec<usize> = group_by.iter()
-            .filter_map(|c| resolve_column_index(c, combined_cols))
+            .filter_map(|c| {
+                if let parser::SelectColumn::Expr(parser::Expression::Literal(parser::Value::Int(n))) = c {
+                    if *n >= 1 {
+                        let ord = (*n - 1) as usize;
+                        return columns.iter()
+                            .filter(|sc| !matches!(sc, parser::SelectColumn::All))
+                            .nth(ord)
+                            .and_then(|inner| resolve_column_index(inner, combined_cols));
+                    }
+                }
+                resolve_column_index(c, combined_cols)
+            })
             .collect();
         // Build groups preserving insertion order
         let mut group_keys: Vec<Vec<Value>> = Vec::new();
@@ -1926,6 +1937,7 @@ fn collect_normal_rows(
     limit: Option<u64>,
     offset: Option<u64>,
     distinct: bool,
+    storage: &Storage,
 ) -> (Vec<String>, Vec<Vec<String>>) {
     // Build alias map: alias name -> index in the projected output (for ORDER BY alias)
     let alias_map: std::collections::HashMap<String, usize> = columns.iter().enumerate()
@@ -1938,7 +1950,7 @@ fn collect_normal_rows(
         })
         .collect();
 
-    // Apply ORDER BY — first try raw column index, then alias map on projected rows
+    // Apply ORDER BY — first try raw column index, then alias map on projected rows, then expression eval
     if !order_by.is_empty() {
         // Project rows once for alias-based ordering
         let projected: Vec<Vec<Value>> = rows.iter().map(|row| {
@@ -1959,23 +1971,34 @@ fn collect_normal_rows(
         let mut sorted_indices = indices;
         sorted_indices.sort_by(|&ai, &bi| {
             for ob in order_by {
-                // Try raw column first, then alias on projected output
-                let (av, bv) = if let Some(idx) = resolve_column_index(&ob.column, combined_cols) {
-                    (rows[ai][idx].clone(), rows[bi][idx].clone())
-                } else if let parser::SelectColumn::Column(name) = &ob.column {
+                // Try raw column index
+                if let Some(idx) = resolve_column_index(&ob.column, combined_cols) {
+                    let av = rows[ai][idx].clone();
+                    let bv = rows[bi][idx].clone();
+                    let ord = cmp_values_nulls(&av, &bv, ob.nulls_first, ob.descending);
+                    let ord = if ob.descending { ord.reverse() } else { ord };
+                    if ord != std::cmp::Ordering::Equal { return ord; }
+                    continue;
+                }
+                // Try alias match on projected output
+                if let parser::SelectColumn::Column(name) = &ob.column {
                     let key = name.to_lowercase();
                     if let Some(&pidx) = alias_map.get(&key) {
-                        (projected[ai][pidx].clone(), projected[bi][pidx].clone())
-                    } else {
+                        let av = projected[ai][pidx].clone();
+                        let bv = projected[bi][pidx].clone();
+                        let ord = cmp_values_nulls(&av, &bv, ob.nulls_first, ob.descending);
+                        let ord = if ob.descending { ord.reverse() } else { ord };
+                        if ord != std::cmp::Ordering::Equal { return ord; }
                         continue;
                     }
-                } else {
-                    continue;
-                };
-                let ord = cmp_values_nulls(&av, &bv, ob.nulls_first, ob.descending);
-                let ord = if ob.descending { ord.reverse() } else { ord };
-                if ord != std::cmp::Ordering::Equal {
-                    return ord;
+                }
+                // Try expression evaluation
+                if let parser::SelectColumn::Expr(expr) = &ob.column {
+                    let av = resolve_join_expression(expr, &rows[ai], combined_cols, storage).unwrap_or(Value::Null);
+                    let bv = resolve_join_expression(expr, &rows[bi], combined_cols, storage).unwrap_or(Value::Null);
+                    let ord = cmp_values_nulls(&av, &bv, ob.nulls_first, ob.descending);
+                    let ord = if ob.descending { ord.reverse() } else { ord };
+                    if ord != std::cmp::Ordering::Equal { return ord; }
                 }
             }
             std::cmp::Ordering::Equal

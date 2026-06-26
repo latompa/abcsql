@@ -1599,3 +1599,110 @@ fn test_lateral_inner_join_execute() {
     ).unwrap();
     assert!(r.contains("1 row"), "expected 1 row (only customer with orders), got: {}", r);
 }
+
+// ---------------------------------------------------------------------------
+// JSON Support — integration tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_json_column_create_and_insert() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (id INT, data JSON)").unwrap();
+    execute(&db.storage, "INSERT INTO t VALUES (1, '{\"key\":\"val\"}')").unwrap();
+    // String should be auto-coerced to JSON
+    let rows = db.storage.read_rows("t").unwrap();
+    assert_eq!(rows.len(), 1);
+    match &rows[0][1] {
+        abcsql::parser::Value::Json(s) => assert_eq!(s, r#"{"key":"val"}"#),
+        other => panic!("Expected Value::Json, got {:?}", other),
+    }
+}
+
+
+
+#[test]
+fn test_json_literal_select() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE dummy (x INT)").unwrap();
+    execute(&db.storage, "INSERT INTO dummy VALUES (1)").unwrap();
+    let r = execute(&db.storage, "SELECT JSON '{\"a\":1}' FROM dummy").unwrap();
+    assert!(r.contains("1 rows"), "expected 1 row, got: {}", r);
+}
+
+#[test]
+fn test_json_arrow_operator_select() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (data JSON)").unwrap();
+    execute(&db.storage, "INSERT INTO t VALUES ('{\"city\":\"Paris\"}')").unwrap();
+    let r = execute(&db.storage, "SELECT data -> 'city' FROM t").unwrap();
+    assert!(r.contains("1 rows"), "expected 1 row, got: {}", r);
+}
+
+#[test]
+fn test_json_arrow_text_operator_select() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (data JSON)").unwrap();
+    execute(&db.storage, "INSERT INTO t VALUES ('{\"city\":\"Paris\"}')").unwrap();
+    let r = execute(&db.storage, "SELECT data ->> 'city' FROM t").unwrap();
+    assert!(r.contains("1 rows"), "expected 1 row, got: {}", r);
+}
+
+#[test]
+fn test_json_contains_where() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (data JSON)").unwrap();
+    execute(&db.storage, "INSERT INTO t VALUES ('{\"a\":1,\"b\":2}')").unwrap();
+    execute(&db.storage, "INSERT INTO t VALUES ('{\"a\":3,\"b\":4}')").unwrap();
+    let r = execute(&db.storage, "SELECT data FROM t WHERE data @> '{\"a\":1}'").unwrap();
+    assert!(r.contains("1 rows"), "expected 1 row, got: {}", r);
+}
+
+#[test]
+fn test_json_typeof_in_select() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (data JSON)").unwrap();
+    execute(&db.storage, "INSERT INTO t VALUES ('\"hello\"')").unwrap();
+    execute(&db.storage, "INSERT INTO t VALUES ('42')").unwrap();
+    let r = execute(&db.storage, "SELECT JSON_TYPEOF(data) FROM t").unwrap();
+    assert!(r.contains("2 rows"), "expected 2 rows, got: {}", r);
+}
+
+#[test]
+fn test_json_array_length_in_select() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (data JSON)").unwrap();
+    execute(&db.storage, "INSERT INTO t VALUES ('[1,2,3]')").unwrap();
+    let r = execute(&db.storage, "SELECT JSON_ARRAY_LENGTH(data) FROM t").unwrap();
+    assert!(r.contains("1 rows"), "expected 1 row, got: {}", r);
+}
+
+#[test]
+fn test_json_build_object_select() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (x INT)").unwrap();
+    execute(&db.storage, "INSERT INTO t VALUES (1)").unwrap();
+    let r = execute(&db.storage, "SELECT JSON_BUILD_OBJECT('a', 1, 'b', 'two') FROM t").unwrap();
+    assert!(r.contains("1 rows"), "expected 1 row, got: {}", r);
+}
+
+#[test]
+fn test_json_build_array_select() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (x INT)").unwrap();
+    execute(&db.storage, "INSERT INTO t VALUES (1)").unwrap();
+    let r = execute(&db.storage, "SELECT JSON_BUILD_ARRAY(1, 'two', true) FROM t").unwrap();
+    assert!(r.contains("1 rows"), "expected 1 row, got: {}", r);
+}
+
+#[test]
+fn test_json_index_create_and_use() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (id INT, data JSON)").unwrap();
+    execute(&db.storage, "INSERT INTO t VALUES (1, '{\"k\":\"v1\"}')").unwrap();
+    execute(&db.storage, "INSERT INTO t VALUES (2, '{\"k\":\"v2\"}')").unwrap();
+    // Create index on JSON column (full-value hash index)
+    execute(&db.storage, "CREATE INDEX idx_data ON t(data)").unwrap();
+    // Query using JSON equality — index could be used
+    let r = execute(&db.storage, "SELECT id FROM t WHERE data = '{\"k\":\"v1\"}'").unwrap();
+    assert!(r.contains("1 rows"), "expected 1 row with JSON match, got: {}", r);
+}

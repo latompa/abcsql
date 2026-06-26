@@ -552,7 +552,7 @@ fn execute_select_to_string(
         if let Some(lateral_query) = &join.lateral {
             let lateral_alias = join.alias.as_deref().unwrap_or("lateral");
             // Determine lateral output column names from a dry run on the first outer row
-            let lat_col_names: Vec<String> = if let Some(outer_row) = combined_rows.first() {
+            let lat_col_names: Vec<String> = if let Some(_outer_row) = combined_rows.first() {
                 let table_name = lateral_query.from.table_name().unwrap_or("__unknown__");
                 let schema = storage.load_schema(table_name).ok();
                 let inner_cols: Vec<(String, String)> = schema.as_ref()
@@ -1092,6 +1092,30 @@ fn resolve_expr(expr: &parser::Expression, row: &[Value], cols: &[(String, Strin
         parser::Expression::DateAdd(date_expr, n, unit) => {
             let v = resolve_expr(date_expr, row, cols, storage)?;
             lib_eval_dateadd(v, *n, unit)
+        }
+        parser::Expression::JsonTypeOf(inner) => {
+            let v = resolve_expr(inner, row, cols, storage)?;
+            parser::apply_json_typeof(&v)
+        }
+        parser::Expression::JsonArrayLength(inner) => {
+            let v = resolve_expr(inner, row, cols, storage)?;
+            parser::apply_json_array_length(&v)
+        }
+        parser::Expression::JsonBuildObject(pairs) => {
+            let resolved: Vec<(Value, Value)> = pairs.iter()
+                .filter_map(|(k, v)| {
+                    let kv = resolve_expr(k, row, cols, storage)?;
+                    let vv = resolve_expr(v, row, cols, storage)?;
+                    Some((kv, vv))
+                })
+                .collect();
+            parser::apply_json_build_object(&resolved)
+        }
+        parser::Expression::JsonBuildArray(vals) => {
+            let resolved: Vec<Value> = vals.iter()
+                .filter_map(|v| resolve_expr(v, row, cols, storage))
+                .collect();
+            parser::apply_json_build_array(&resolved)
         }
     }
 }

@@ -563,7 +563,7 @@ fn materialize_recursive_cte(
 /// Handle "SELECT expr, expr, ..." with no FROM clause — produces exactly one row.
 fn materialize_no_from_select(
     query: &parser::SelectStatement,
-    storage: &Storage,
+    _storage: &Storage,
     _existing_ctes: &HashMap<String, CteData>,
 ) -> CteData {
     let empty_row: Vec<Value> = Vec::new();
@@ -2257,6 +2257,18 @@ fn format_expr(expr: &parser::Expression) -> String {
         parser::Expression::DateTrunc(field, expr) => format!("DATE_TRUNC('{}', {})", field.to_lowercase(), format_expr(expr)),
         parser::Expression::DateDiff(unit, e1, e2) => format!("DATEDIFF({}, {}, {})", unit.to_lowercase(), format_expr(e1), format_expr(e2)),
         parser::Expression::DateAdd(expr, n, unit) => format!("DATEADD({}, {}, {})", unit.to_lowercase(), n, format_expr(expr)),
+        parser::Expression::JsonTypeOf(inner) => format!("json_typeof({})", format_expr(inner)),
+        parser::Expression::JsonArrayLength(inner) => format!("json_array_length({})", format_expr(inner)),
+        parser::Expression::JsonBuildObject(pairs) => {
+            let args: Vec<String> = pairs.iter()
+                .flat_map(|(k, v)| vec![format_expr(k), format_expr(v)])
+                .collect();
+            format!("json_build_object({})", args.join(", "))
+        }
+        parser::Expression::JsonBuildArray(vals) => {
+            let args: Vec<String> = vals.iter().map(format_expr).collect();
+            format!("json_build_array({})", args.join(", "))
+        }
         parser::Expression::Case(_, _) => "case".to_string(),
         parser::Expression::Aggregate(func, inner) => {
             let func_name = match func {
@@ -2986,6 +2998,30 @@ fn resolve_join_expression(
             let v = resolve_join_expression(date_expr, row, cols, storage)?;
             eval_dateadd(v, *n, unit)
         }
+        parser::Expression::JsonTypeOf(inner) => {
+            let v = resolve_join_expression(inner, row, cols, storage)?;
+            parser::apply_json_typeof(&v)
+        }
+        parser::Expression::JsonArrayLength(inner) => {
+            let v = resolve_join_expression(inner, row, cols, storage)?;
+            parser::apply_json_array_length(&v)
+        }
+        parser::Expression::JsonBuildObject(pairs) => {
+            let resolved: Vec<(Value, Value)> = pairs.iter()
+                .filter_map(|(k, v)| {
+                    let kv = resolve_join_expression(k, row, cols, storage)?;
+                    let vv = resolve_join_expression(v, row, cols, storage)?;
+                    Some((kv, vv))
+                })
+                .collect();
+            parser::apply_json_build_object(&resolved)
+        }
+        parser::Expression::JsonBuildArray(vals) => {
+            let resolved: Vec<Value> = vals.iter()
+                .filter_map(|v| resolve_join_expression(v, row, cols, storage))
+                .collect();
+            parser::apply_json_build_array(&resolved)
+        }
     }
 }
 
@@ -3071,19 +3107,6 @@ fn eval_arith(left: &Value, op: &parser::ArithOp, right: &Value) -> Option<Value
         (Value::Int(l), Value::Float(r)) => arith_f64(*l as f64, op, *r),
         (Value::Float(l), Value::Int(r)) => arith_f64(*l, op, *r as f64),
         _ => Some(Value::Null),
-    }
-}
-
-/// Compare two numeric values as f64
-fn compare_numeric(l: f64, r: f64, op: &parser::Operator) -> bool {
-    match op {
-        parser::Operator::Equals => l == r,
-        parser::Operator::NotEquals => l != r,
-        parser::Operator::GreaterThan => l > r,
-        parser::Operator::LessThan => l < r,
-        parser::Operator::GreaterThanOrEqual => l >= r,
-        parser::Operator::LessThanOrEqual => l <= r,
-        _ => false,
     }
 }
 

@@ -3,7 +3,7 @@ use std::io::{self, Write as IoWrite, BufWriter, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::fmt;
 use std::collections::HashMap;
-use crate::parser::{CreateTableStatement, CreateIndexStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, InsertSource, OnConflict, UpdateStatement, DeleteStatement, TruncateStatement, MergeStatement, MergeSource, MergeAction, AlterTableStatement, AlterAction, Value, Condition, Expression, Operator, ArithOp, SelectStatement, SelectColumn, FromClause, apply_scalar_func, apply_round, apply_concat, apply_substr, apply_replace, apply_lpad, apply_rpad, apply_cast, apply_greatest, apply_least, apply_power, apply_position, apply_repeat};
+use crate::parser::{CreateTableStatement, CreateIndexStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, InsertSource, OnConflict, UpdateStatement, DeleteStatement, TruncateStatement, MergeStatement, MergeSource, MergeAction, AlterTableStatement, AlterAction, Value, Condition, Expression, Operator, ArithOp, SelectStatement, SelectColumn, FromClause, apply_scalar_func, apply_round, apply_concat, apply_substr, apply_replace, apply_lpad, apply_rpad, apply_cast, apply_greatest, apply_least, apply_power, apply_position, apply_repeat, apply_json_typeof, apply_json_array_length, apply_json_build_object, apply_json_build_array};
 
 /// Before-image snapshot for a single transaction
 struct TransactionState {
@@ -325,6 +325,11 @@ impl Storage {
                 (Value::String(s), DataType::Timestamp) => {
                     if let Some(secs) = crate::parser::parse_timestamp_str(s) {
                         final_values[i] = Value::Timestamp(secs);
+                    }
+                }
+                (Value::String(s), DataType::Json | DataType::Jsonb) => {
+                    if serde_json::from_str::<serde_json::Value>(s).is_ok() {
+                        final_values[i] = Value::Json(s.clone());
                     }
                 }
                 _ => {}
@@ -1591,33 +1596,6 @@ impl Storage {
             .map(|(name, _, _, _)| name.clone()))
     }
 
-    // Check unique index constraints for a table before inserting a value
-    fn check_unique_indexes(&self, table_name: &str, values: &[Value]) -> Result<(), StorageError> {
-        let meta = self.load_index_meta()?;
-        let schema = self.load_schema(table_name)?;
-        for (idx_name, t, col_name, unique) in &meta {
-            if !unique || t != table_name {
-                continue;
-            }
-            let col_idx = schema.columns.iter()
-                .position(|c| &c.name == col_name)
-                .ok_or_else(|| StorageError::ColumnNotFound(col_name.clone()))?;
-            let val = &values[col_idx];
-            if *val == Value::Null {
-                continue; // NULL doesn't violate uniqueness
-            }
-            if let Some(row_nums) = self.lookup_index(idx_name, val)? {
-                if !row_nums.is_empty() {
-                    return Err(StorageError::DuplicateKey {
-                        column: col_name.clone(),
-                        value: format!("{:?}", val),
-                    });
-                }
-            }
-        }
-        Ok(())
-    }
-
     /// Rebuild all indexes for a table (called after insert/update/delete)
     fn rebuild_indexes_for_table(&self, table_name: &str) -> Result<(), StorageError> {
         let meta = self.load_index_meta()?;
@@ -2278,6 +2256,30 @@ fn resolve_expression(expr: &Expression, row: &[Value], schema: &[ColumnDefiniti
         Expression::DateAdd(inner, n, unit) => {
             let v = resolve_expression(inner, row, schema, storage)?;
             storage_eval_dateadd(v, *n, unit)
+        }
+        Expression::JsonTypeOf(inner) => {
+            let v = resolve_expression(inner, row, schema, storage)?;
+            apply_json_typeof(&v)
+        }
+        Expression::JsonArrayLength(inner) => {
+            let v = resolve_expression(inner, row, schema, storage)?;
+            apply_json_array_length(&v)
+        }
+        Expression::JsonBuildObject(pairs) => {
+            let resolved: Vec<(Value, Value)> = pairs.iter()
+                .filter_map(|(k, v)| {
+                    let kv = resolve_expression(k, row, schema, storage)?;
+                    let vv = resolve_expression(v, row, schema, storage)?;
+                    Some((kv, vv))
+                })
+                .collect();
+            apply_json_build_object(&resolved)
+        }
+        Expression::JsonBuildArray(vals) => {
+            let resolved: Vec<Value> = vals.iter()
+                .filter_map(|v| resolve_expression(v, row, schema, storage))
+                .collect();
+            apply_json_build_array(&resolved)
         }
     }
 }

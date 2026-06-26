@@ -483,6 +483,11 @@ pub enum Expression {
     DateDiff(String, Box<Expression>, Box<Expression>),
     // DATEADD(unit, n, date) → shifted date/timestamp
     DateAdd(Box<Expression>, i64, String),
+    // JSON functions
+    JsonTypeOf(Box<Expression>),                           // JSON_TYPEOF(expr)
+    JsonArrayLength(Box<Expression>),                      // JSON_ARRAY_LENGTH(expr)
+    JsonBuildObject(Vec<(Expression, Expression)>),      // JSON_BUILD_OBJECT(key, val, ...)
+    JsonBuildArray(Vec<Expression>),                     // JSON_BUILD_ARRAY(val, ...)
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -532,20 +537,6 @@ pub enum Value {
     Null,
 }
 
-/// Calendar math helpers — no external dependencies needed
-
-pub fn is_leap_year(year: i32) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
-}
-
-pub fn days_in_month(year: i32, month: i32) -> i32 {
-    match month {
-        1|3|5|7|8|10|12 => 31,
-        4|6|9|11 => 30,
-        2 => if is_leap_year(year) { 29 } else { 28 },
-        _ => 0,
-    }
-}
 
 /// Days since 1970-01-01 (civil calendar algorithm)
 pub fn date_to_epoch_days(y: i32, m: i32, d: i32) -> i32 {
@@ -1807,7 +1798,9 @@ fn parse_arith_select_column(input: &str) -> IResult<&str, SelectColumn> {
         | Expression::Literal(_) | Expression::Subquery(_)
         | Expression::CurrentDate | Expression::CurrentTimestamp
         | Expression::Extract(_, _) | Expression::DateTrunc(_, _)
-        | Expression::DateDiff(_, _, _) | Expression::DateAdd(_, _, _) => Ok((new_input, SelectColumn::Expr(expr))),
+        | Expression::DateDiff(_, _, _) | Expression::DateAdd(_, _, _)
+        | Expression::JsonTypeOf(_) | Expression::JsonArrayLength(_)
+        | Expression::JsonBuildObject(_) | Expression::JsonBuildArray(_) => Ok((new_input, SelectColumn::Expr(expr))),
         _ => Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag))),
     }
 }
@@ -2638,6 +2631,8 @@ fn parse_atom(input: &str) -> IResult<&str, Expression> {
             parse_expression_round,
             parse_expression_concat,
             parse_expression_substr,
+            parse_expression_json_build_object,
+            parse_expression_json_build_array,
         )),
         nom::branch::alt((
             parse_expression_cast,
@@ -2654,9 +2649,13 @@ fn parse_atom(input: &str) -> IResult<&str, Expression> {
             parse_expression_date_part,
             parse_expression_interval,
             parse_expression_date_literal,
+            parse_expression_timestamp_literal,
+            // JSON expressions
+            parse_expression_json_literal,
+            parse_expression_json_typeof,
+            parse_expression_json_array_length,
         )),
         nom::branch::alt((
-            parse_expression_timestamp_literal,
             parse_expression_window,
             parse_expression_scalar_func,
             parse_expression_aggregate,
@@ -2667,8 +2666,25 @@ fn parse_atom(input: &str) -> IResult<&str, Expression> {
     ))(input)
 }
 
-fn parse_expression_coalesce(input: &str) -> IResult<&str, Expression> {
-    let (input, _) = tag_no_case("COALESCE")(input)?;
+// ── Helper: parse FUNC(expr) ──
+fn parse_single_arg_fn<'a>(input: &'a str, name: &str,
+    ctor: impl Fn(Expression) -> Expression,
+) -> IResult<&'a str, Expression> {
+    let (input, _) = tag_no_case(name)(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, expr) = parse_expression(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, ctor(expr)))
+}
+
+// ── Helper: parse FUNC(expr, expr, ...) with separated_list1 ──
+fn parse_vararg_fn1<'a>(input: &'a str, name: &str,
+    ctor: fn(Vec<Expression>) -> Expression,
+) -> IResult<&'a str, Expression> {
+    let (input, _) = tag_no_case(name)(input)?;
     let (input, _) = multispace0(input)?;
     let (input, _) = nom_char('(')(input)?;
     let (input, _) = multispace0(input)?;
@@ -2678,7 +2694,28 @@ fn parse_expression_coalesce(input: &str) -> IResult<&str, Expression> {
     )(input)?;
     let (input, _) = multispace0(input)?;
     let (input, _) = nom_char(')')(input)?;
-    Ok((input, Expression::Coalesce(exprs)))
+    Ok((input, ctor(exprs)))
+}
+
+// ── Helper: parse KEYWORD 'string' literal ──
+fn parse_keyword_literal<'a>(input: &'a str, keyword: &str,
+    validate: fn(&str) -> Option<Value>,
+) -> IResult<&'a str, Expression> {
+    let (input, _) = tag_no_case(keyword)(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, val) = parse_string_value(input)?;
+    if let Value::String(s) = val {
+        match validate(&s) {
+            Some(v) => Ok((input, Expression::Literal(v))),
+            None => Err(nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Verify))),
+        }
+    } else {
+        Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)))
+    }
+}
+
+fn parse_expression_coalesce(input: &str) -> IResult<&str, Expression> {
+    parse_vararg_fn1(input, "COALESCE", Expression::Coalesce)
 }
 
 fn parse_expression_nullif(input: &str) -> IResult<&str, Expression> {
@@ -2777,17 +2814,7 @@ fn parse_expression_round(input: &str) -> IResult<&str, Expression> {
 }
 
 fn parse_expression_concat(input: &str) -> IResult<&str, Expression> {
-    let (input, _) = tag_no_case("CONCAT")(input)?;
-    let (input, _) = multispace0(input)?;
-    let (input, _) = nom_char('(')(input)?;
-    let (input, _) = multispace0(input)?;
-    let (input, exprs) = nom::multi::separated_list1(
-        nom::sequence::delimited(multispace0, nom_char(','), multispace0),
-        parse_expression,
-    )(input)?;
-    let (input, _) = multispace0(input)?;
-    let (input, _) = nom_char(')')(input)?;
-    Ok((input, Expression::Concat(exprs)))
+    parse_vararg_fn1(input, "CONCAT", Expression::Concat)
 }
 
 fn parse_expression_substr(input: &str) -> IResult<&str, Expression> {
@@ -2872,31 +2899,11 @@ fn parse_expression_rpad(input: &str) -> IResult<&str, Expression> {
 }
 
 fn parse_expression_greatest(input: &str) -> IResult<&str, Expression> {
-    let (input, _) = tag_no_case("GREATEST")(input)?;
-    let (input, _) = multispace0(input)?;
-    let (input, _) = nom_char('(')(input)?;
-    let (input, _) = multispace0(input)?;
-    let (input, exprs) = nom::multi::separated_list1(
-        nom::sequence::delimited(multispace0, nom_char(','), multispace0),
-        parse_expression,
-    )(input)?;
-    let (input, _) = multispace0(input)?;
-    let (input, _) = nom_char(')')(input)?;
-    Ok((input, Expression::Greatest(exprs)))
+    parse_vararg_fn1(input, "GREATEST", Expression::Greatest)
 }
 
 fn parse_expression_least(input: &str) -> IResult<&str, Expression> {
-    let (input, _) = tag_no_case("LEAST")(input)?;
-    let (input, _) = multispace0(input)?;
-    let (input, _) = nom_char('(')(input)?;
-    let (input, _) = multispace0(input)?;
-    let (input, exprs) = nom::multi::separated_list1(
-        nom::sequence::delimited(multispace0, nom_char(','), multispace0),
-        parse_expression,
-    )(input)?;
-    let (input, _) = multispace0(input)?;
-    let (input, _) = nom_char(')')(input)?;
-    Ok((input, Expression::Least(exprs)))
+    parse_vararg_fn1(input, "LEAST", Expression::Least)
 }
 
 fn parse_expression_power(input: &str) -> IResult<&str, Expression> {
@@ -2972,32 +2979,65 @@ fn parse_expression_current_timestamp(input: &str) -> IResult<&str, Expression> 
 
 /// Parse DATE 'YYYY-MM-DD' literal
 fn parse_expression_date_literal(input: &str) -> IResult<&str, Expression> {
-    let (input, _) = tag_no_case("DATE")(input)?;
-    let (input, _) = multispace1(input)?;
-    let (input, val) = parse_string_value(input)?;
-    if let Value::String(s) = val {
-        match parse_date_str(&s) {
-            Some(d) => Ok((input, Expression::Literal(Value::Date(d)))),
-            None => Err(nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Verify))),
-        }
-    } else {
-        Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)))
-    }
+    parse_keyword_literal(input, "DATE", |s| parse_date_str(s).map(Value::Date))
 }
 
 /// Parse TIMESTAMP 'YYYY-MM-DD HH:MM:SS' literal
 fn parse_expression_timestamp_literal(input: &str) -> IResult<&str, Expression> {
-    let (input, _) = tag_no_case("TIMESTAMP")(input)?;
-    let (input, _) = multispace1(input)?;
-    let (input, val) = parse_string_value(input)?;
-    if let Value::String(s) = val {
-        match parse_timestamp_str(&s) {
-            Some(ts) => Ok((input, Expression::Literal(Value::Timestamp(ts)))),
-            None => Err(nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Verify))),
-        }
-    } else {
-        Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)))
+    parse_keyword_literal(input, "TIMESTAMP", |s| parse_timestamp_str(s).map(Value::Timestamp))
+}
+
+/// Parse JSON 'string' literal
+fn parse_expression_json_literal(input: &str) -> IResult<&str, Expression> {
+    parse_keyword_literal(input, "JSON", |s| {
+        serde_json::from_str::<serde_json::Value>(s).ok().map(|_| Value::Json(s.to_string()))
+    })
+}
+
+/// Parse JSON_TYPEOF(expr)
+fn parse_expression_json_typeof(input: &str) -> IResult<&str, Expression> {
+    parse_single_arg_fn(input, "JSON_TYPEOF", |e| Expression::JsonTypeOf(Box::new(e)))
+}
+
+fn parse_expression_json_array_length(input: &str) -> IResult<&str, Expression> {
+    parse_single_arg_fn(input, "JSON_ARRAY_LENGTH", |e| Expression::JsonArrayLength(Box::new(e)))
+}
+
+/// Parse JSON_BUILD_OBJECT(key, val, ...)
+fn parse_expression_json_build_object(input: &str) -> IResult<&str, Expression> {
+    let (input, _) = tag_no_case("JSON_BUILD_OBJECT")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, args) = nom::multi::separated_list1(
+        nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+        parse_expression,
+    )(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    // Pair up consecutive args: k1, v1, k2, v2, ...
+    if args.len() % 2 != 0 {
+        return Err(nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Verify)));
     }
+    let mut pairs = Vec::new();
+    for chunk in args.chunks(2) {
+        pairs.push((chunk[0].clone(), chunk[1].clone()));
+    }
+    Ok((input, Expression::JsonBuildObject(pairs)))
+}
+
+fn parse_expression_json_build_array(input: &str) -> IResult<&str, Expression> {
+    let (input, _) = tag_no_case("JSON_BUILD_ARRAY")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, args) = nom::multi::separated_list0(
+        nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+        parse_expression,
+    )(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, Expression::JsonBuildArray(args)))
 }
 
 /// Parse EXTRACT(field FROM expr)
@@ -3590,21 +3630,6 @@ pub fn apply_round(val: Value, places: Option<Value>) -> Option<Value> {
     }
 }
 
-/// Evaluate CONCAT(values)
-/// Extract a nested JSON value by a dot-separated or array-index path string
-pub fn json_extract(json: &str, path: &str) -> Option<String> {
-    let mut current = json.trim().to_string();
-    for part in path.split('.') {
-        // numeric index → array access, otherwise → object key
-        if let Ok(idx) = part.parse::<usize>() {
-            current = json_array_get(&current, idx)?;
-        } else {
-            current = json_object_get(&current, part)?;
-        }
-    }
-    Some(current)
-}
-
 /// Get a field from a JSON object string; returns the raw value substring
 pub fn json_object_get(json: &str, key: &str) -> Option<String> {
     let s = json.trim();
@@ -3798,6 +3823,74 @@ pub fn apply_json_op(left: &Value, op: &ArithOp, right: &Value) -> Option<Value>
         }
         _ => None,
     }
+}
+
+/// Helper: convert a Value into a serde_json::Value
+fn value_to_json(val: &Value) -> Option<serde_json::Value> {
+    match val {
+        Value::Null => Some(serde_json::Value::Null),
+        Value::Int(n) => Some(serde_json::Value::Number(serde_json::Number::from(*n))),
+        Value::Float(f) => serde_json::Number::from_f64(*f).map(serde_json::Value::Number),
+        Value::Bool(b) => Some(serde_json::Value::Bool(*b)),
+        Value::String(s) => Some(serde_json::Value::String(s.clone())),
+        Value::Json(s) => Some(serde_json::from_str(s).unwrap_or(serde_json::Value::String(s.clone()))),
+        Value::Date(d) => Some(serde_json::Value::String(format_date(*d))),
+        Value::Timestamp(ts) => Some(serde_json::Value::String(format_timestamp(*ts))),
+    }
+}
+
+/// Determine the JSON type name of a value
+pub fn apply_json_typeof(val: &Value) -> Option<Value> {
+    let json_str = match val {
+        Value::Json(s) => s.clone(),
+        Value::String(s) => s.clone(),
+        Value::Null => return Some(Value::String("null".to_string())),
+        Value::Bool(_) => return Some(Value::String("boolean".to_string())),
+        Value::Int(_) | Value::Float(_) => return Some(Value::String("number".to_string())),
+        Value::Date(_) => return Some(Value::String("date".to_string())),
+        Value::Timestamp(_) => return Some(Value::String("timestamp".to_string())),
+    };
+    let v: serde_json::Value = serde_json::from_str(&json_str).ok()?;
+    Some(Value::String(match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }.to_string()))
+}
+
+/// Return the length of a JSON array
+pub fn apply_json_array_length(val: &Value) -> Option<Value> {
+    let s = match val {
+        Value::Json(s) | Value::String(s) => s,
+        _ => return None,
+    };
+    let v: serde_json::Value = serde_json::from_str(s).ok()?;
+    match v {
+        serde_json::Value::Array(arr) => Some(Value::Int(arr.len() as i64)),
+        _ => None,
+    }
+}
+
+/// Build a JSON object from key-value pairs
+pub fn apply_json_build_object(pairs: &[(Value, Value)]) -> Option<Value> {
+    let mut map = serde_json::Map::new();
+    for (k, v) in pairs {
+        let key = match k {
+            Value::String(s) => s.clone(),
+            _ => return None,
+        };
+        map.insert(key, value_to_json(v)?);
+    }
+    Some(Value::Json(serde_json::Value::Object(map).to_string()))
+}
+
+/// Build a JSON array from values
+pub fn apply_json_build_array(vals: &[Value]) -> Option<Value> {
+    let arr: Vec<serde_json::Value> = vals.iter().filter_map(|v| value_to_json(v)).collect();
+    Some(Value::Json(serde_json::Value::Array(arr).to_string()))
 }
 
 pub fn apply_concat(parts: Vec<Option<Value>>) -> Option<Value> {
@@ -6996,5 +7089,189 @@ mod tests {
             apply_cast(Value::Json("null".to_string()), "TEXT"),
             Some(Value::String("null".to_string()))
         );
+    }
+
+    #[test]
+    fn test_parse_json_literal() {
+        let sql = "SELECT JSON '{\"key\": \"val\"}' FROM t;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                match &sel.columns[0] {
+                    SelectColumn::Expr(Expression::Literal(Value::Json(s))) => {
+                        assert_eq!(s, r#"{"key": "val"}"#);
+                    }
+                    other => panic!("Expected Json literal, got {:?}", other),
+                }
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_parse_json_typeof() {
+        let sql = "SELECT JSON_TYPEOF(data) FROM t;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                match &sel.columns[0] {
+                    SelectColumn::Expr(Expression::JsonTypeOf(_)) => {}
+                    other => panic!("Expected JsonTypeOf, got {:?}", other),
+                }
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_parse_json_array_length() {
+        let sql = "SELECT JSON_ARRAY_LENGTH(data) FROM t;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                match &sel.columns[0] {
+                    SelectColumn::Expr(Expression::JsonArrayLength(_)) => {}
+                    other => panic!("Expected JsonArrayLength, got {:?}", other),
+                }
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_parse_json_build_object() {
+        let sql = "SELECT JSON_BUILD_OBJECT('name', 'Alice', 'age', 30) FROM t;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                match &sel.columns[0] {
+                    SelectColumn::Expr(Expression::JsonBuildObject(pairs)) => {
+                        assert_eq!(pairs.len(), 2);
+                    }
+                    other => panic!("Expected JsonBuildObject, got {:?}", other),
+                }
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_parse_json_build_array() {
+        let sql = "SELECT JSON_BUILD_ARRAY(1, 'two', true) FROM t;";
+        let (_, stmt) = parse_sql(sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                match &sel.columns[0] {
+                    SelectColumn::Expr(Expression::JsonBuildArray(vals)) => {
+                        assert_eq!(vals.len(), 3);
+                    }
+                    other => panic!("Expected JsonBuildArray, got {:?}", other),
+                }
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_apply_json_typeof() {
+        assert_eq!(
+            apply_json_typeof(&Value::Json(r#""hello""#.to_string())),
+            Some(Value::String("string".to_string()))
+        );
+        assert_eq!(
+            apply_json_typeof(&Value::Json("42".to_string())),
+            Some(Value::String("number".to_string()))
+        );
+        assert_eq!(
+            apply_json_typeof(&Value::Json("true".to_string())),
+            Some(Value::String("boolean".to_string()))
+        );
+        assert_eq!(
+            apply_json_typeof(&Value::Json("[1,2,3]".to_string())),
+            Some(Value::String("array".to_string()))
+        );
+        assert_eq!(
+            apply_json_typeof(&Value::Json(r#"{"a":1}"#.to_string())),
+            Some(Value::String("object".to_string()))
+        );
+        assert_eq!(
+            apply_json_typeof(&Value::Json("null".to_string())),
+            Some(Value::String("null".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_apply_json_array_length() {
+        assert_eq!(
+            apply_json_array_length(&Value::Json("[1, 2, 3]".to_string())),
+            Some(Value::Int(3))
+        );
+        assert_eq!(
+            apply_json_array_length(&Value::Json("[]".to_string())),
+            Some(Value::Int(0))
+        );
+        assert_eq!(
+            apply_json_array_length(&Value::Json(r#"{"a":1}"#.to_string())),
+            None
+        );
+    }
+
+    #[test]
+    fn test_apply_json_build_object() {
+        let pairs = vec![
+            (Value::String("name".to_string()), Value::String("Alice".to_string())),
+            (Value::String("age".to_string()), Value::Int(30)),
+        ];
+        let result = apply_json_build_object(&pairs);
+        assert!(result.is_some());
+        if let Some(Value::Json(s)) = result {
+            let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+            assert_eq!(v["name"], "Alice");
+            assert_eq!(v["age"], 30);
+        } else {
+            panic!("Expected Json value");
+        }
+    }
+
+    #[test]
+    fn test_apply_json_build_array() {
+        let vals = vec![
+            Value::Int(1),
+            Value::String("two".to_string()),
+            Value::Bool(true),
+        ];
+        let result = apply_json_build_array(&vals);
+        assert!(result.is_some());
+        if let Some(Value::Json(s)) = result {
+            let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+            assert_eq!(v[0], 1);
+            assert_eq!(v[1], "two");
+            assert_eq!(v[2], true);
+        } else {
+            panic!("Expected Json value");
+        }
+    }
+
+    #[test]
+    fn test_json_literal_parse_and_roundtrip() {
+        // Verify that JSON '...' produces a valid Value::Json that round-trips
+        let json_str = r#"{"items":[1,2,3],"active":true}"#;
+        let sql = format!("SELECT JSON '{}' FROM t;", json_str);
+        let (_, stmt) = parse_sql(&sql).unwrap();
+        match stmt {
+            SqlStatement::Select(sel) => {
+                match &sel.columns[0] {
+                    SelectColumn::Expr(Expression::Literal(Value::Json(s))) => {
+                        assert_eq!(s, json_str);
+                        // Re-parse to confirm valid JSON
+                        let v: serde_json::Value = serde_json::from_str(s).unwrap();
+                        assert_eq!(v["items"][0], 1);
+                        assert!(v["active"].as_bool().unwrap());
+                    }
+                    other => panic!("Expected Json literal, got {:?}", other),
+                }
+            }
+            _ => panic!(),
+        }
     }
 }

@@ -3,6 +3,7 @@ use std::io::{self, Write as IoWrite, BufWriter, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::fmt;
 use std::collections::HashMap;
+use regex::Regex;
 use crate::parser::{CreateTableStatement, CreateIndexStatement, CreateFunctionStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, InsertSource, OnConflict, UpdateStatement, DeleteStatement, TruncateStatement, MergeStatement, MergeSource, MergeAction, AlterTableStatement, AlterAction, Value, Condition, Expression, Operator, ArithOp, SelectStatement, SelectColumn, FromClause, apply_scalar_func, apply_round, apply_concat, apply_substr, apply_replace, apply_lpad, apply_rpad, apply_cast, apply_greatest, apply_least, apply_power, apply_position, apply_repeat, apply_json_typeof, apply_json_array_length, apply_json_build_object, apply_json_build_array};
 
 /// Before-image snapshot for a single transaction
@@ -2060,6 +2061,18 @@ fn evaluate_correlated_condition_storage(
                     if compare_values(v, &Operator::GreaterThanOrEqual, l) && compare_values(v, &Operator::LessThanOrEqual, h));
                 return if *operator == Operator::Between { in_range } else { !in_range };
             }
+            if *operator == Operator::Similar || *operator == Operator::NotSimilar {
+                let escape = upper_bound.as_ref().and_then(|e| resolve_correlated_expr_storage(e, row, schema, storage, outer_row, outer_schema));
+                let similar = match (&lv, &rv) {
+                    (Some(Value::String(s)), Some(Value::String(p))) => {
+                        let escape_char = escape.and_then(|v| if let Value::String(c) = v { c.chars().next() } else { None });
+                        let pattern = similar_to_regex(p, escape_char);
+                        Regex::new(&format!("^(?:{})$", pattern)).map_or(false, |re| re.is_match(s))
+                    }
+                    _ => false,
+                };
+                return if *operator == Operator::Similar { similar } else { !similar };
+            }
             match (&lv, &rv) {
                 (Some(l), Some(r)) => compare_values(l, operator, r),
                 _ => false,
@@ -2079,6 +2092,7 @@ fn evaluate_correlated_condition_storage(
                 None => true,
             }
         }
+        Condition::Unique(_) | Condition::NotUnique(_) | Condition::Overlaps(..) => false,
     }
 }
 
@@ -2182,12 +2196,35 @@ fn eval_condition_cols(condition: &Condition, row: &[Value], cols: &[(String, St
                 };
                 return if *operator == Operator::NotIn { !contains } else { contains };
             }
+            if *operator == Operator::Similar || *operator == Operator::NotSimilar {
+                let lv = resolve_expr_cols(left, row, cols, storage);
+                let rv = resolve_expr_cols(right, row, cols, storage);
+                let escape = upper_bound.as_ref().and_then(|e| resolve_expr_cols(e, row, cols, storage));
+                let similar = match (&lv, &rv) {
+                    (Some(Value::String(s)), Some(Value::String(p))) => {
+                        let escape_char = escape.and_then(|v| if let Value::String(c) = v { c.chars().next() } else { None });
+                        let pattern = similar_to_regex(p, escape_char);
+                        Regex::new(&format!("^(?:{})$", pattern)).map_or(false, |re| re.is_match(s))
+                    }
+                    _ => false,
+                };
+                return if *operator == Operator::Similar { similar } else { !similar };
+            }
             let lv = resolve_expr_cols(left, row, cols, storage);
             let rv = resolve_expr_cols(right, row, cols, storage);
             match (lv, rv) {
                 (Some(l), Some(r)) => compare_values(&l, operator, &r),
                 _ => false,
             }
+        }
+        Condition::Unique(subquery) => {
+            is_unique_subquery(subquery, storage, row, cols)
+        }
+        Condition::NotUnique(subquery) => {
+            !is_unique_subquery(subquery, storage, row, cols)
+        }
+        Condition::Overlaps(a, b, c, d) => {
+            eval_overlaps_cols(a, b, c, d, row, cols, storage)
         }
         _ => false,
     }
@@ -2299,12 +2336,36 @@ fn evaluate_condition(condition: &Condition, row: &[Value], schema: &[ColumnDefi
                 return if *operator == Operator::In { contains } else { !contains };
             }
 
+            if *operator == Operator::Similar || *operator == Operator::NotSimilar {
+                let lv = resolve_expression(left, row, schema, storage);
+                let rv = resolve_expression(right, row, schema, storage);
+                let escape = upper_bound.as_ref().and_then(|e| resolve_expression(e, row, schema, storage));
+                let similar = match (&lv, &rv) {
+                    (Some(Value::String(s)), Some(Value::String(p))) => {
+                        let escape_char = escape.and_then(|v| if let Value::String(c) = v { c.chars().next() } else { None });
+                        let pattern = similar_to_regex(p, escape_char);
+                        Regex::new(&format!("^(?:{})$", pattern)).map_or(false, |re| re.is_match(s))
+                    }
+                    _ => false,
+                };
+                return if *operator == Operator::Similar { similar } else { !similar };
+            }
+
             let left_val = resolve_expression(left, row, schema, storage);
             let right_val = resolve_expression(right, row, schema, storage);
             match (&left_val, &right_val) {
                 (Some(l), Some(r)) => compare_values(l, operator, r),
                 _ => false,
             }
+        }
+        Condition::Unique(subquery) => {
+            is_unique_subquery_expr(subquery, storage, row, schema)
+        }
+        Condition::NotUnique(subquery) => {
+            !is_unique_subquery_expr(subquery, storage, row, schema)
+        }
+        Condition::Overlaps(a, b, c, d) => {
+            eval_overlaps_expr(a, b, c, d, row, schema, storage)
         }
         Condition::AnyComparison { left, op, subquery } => {
             let lv = match resolve_expression(left, row, schema, storage) { Some(v) => v, None => return false };
@@ -2320,6 +2381,154 @@ fn evaluate_condition(condition: &Condition, row: &[Value], schema: &[ColumnDefi
                 None => true,
             }
         }
+    }
+}
+
+// ── Helpers for UNIQUE predicate: check if subquery returns all distinct rows ──
+
+/// Execute a correlated subquery and collect all matching rows (for UNIQUE predicate)
+fn collect_correlated_rows(
+    subquery: &SelectStatement,
+    storage: &Storage,
+    outer_row: &[Value],
+    outer_schema: &[ColumnDefinition],
+) -> Vec<Vec<Value>> {
+    let table_name = match &subquery.from {
+        crate::parser::FromClause::Table(name) => name.clone(),
+        _ => return vec![],
+    };
+    let create_stmt = match storage.load_schema(&table_name) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    let all_rows = match storage.read_rows(&table_name) {
+        Ok(rows) => rows,
+        Err(_) => return vec![],
+    };
+    let mut result = vec![];
+    for row in &all_rows {
+        if let Some(ref wc) = subquery.where_clause {
+            if !evaluate_correlated_condition_storage(&wc.condition, row, &create_stmt.columns, storage, outer_row, outer_schema) {
+                continue;
+            }
+        }
+        let projected = match &subquery.columns[..] {
+            [SelectColumn::All] => row.clone(),
+            [SelectColumn::StarFromTable(_)] => row.clone(),
+            _ => {
+                let mut vals = Vec::new();
+                for col in &subquery.columns {
+                    let name = match col {
+                        SelectColumn::Column(n) => n,
+                        SelectColumn::QualifiedColumn(_, n) => n,
+                        _ => continue,
+                    };
+                    if let Some(pos) = create_stmt.columns.iter().position(|c| c.name == *name) {
+                        vals.push(row[pos].clone());
+                    }
+                }
+                vals
+            }
+        };
+        result.push(projected);
+    }
+    result
+}
+
+/// Check if all rows from a subquery are distinct (cols context)
+fn is_unique_subquery(
+    subquery: &SelectStatement,
+    storage: &Storage,
+    outer_row: &[Value],
+    outer_cols: &[(String, String)],
+) -> bool {
+    let fake_schema: Vec<ColumnDefinition> = outer_cols.iter().map(|(_, name)| {
+        ColumnDefinition {
+            name: name.clone(),
+            data_type: DataType::Varchar(None),
+            auto_increment: false, primary_key: false,
+            not_null: false, unique: false, references: None,
+            check_constraint: None, check_constraint_text: None,
+        }
+    }).collect();
+    let rows = collect_correlated_rows(subquery, storage, outer_row, &fake_schema);
+    for i in 0..rows.len() {
+        for j in (i + 1)..rows.len() {
+            if rows[i].len() == rows[j].len() && rows[i].iter().zip(rows[j].iter()).all(|(a, b)| a == b) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Check if all rows from a subquery are distinct (schema context)
+fn is_unique_subquery_expr(
+    subquery: &SelectStatement,
+    storage: &Storage,
+    outer_row: &[Value],
+    outer_schema: &[ColumnDefinition],
+) -> bool {
+    let rows = collect_correlated_rows(subquery, storage, outer_row, outer_schema);
+    for i in 0..rows.len() {
+        for j in (i + 1)..rows.len() {
+            if rows[i].len() == rows[j].len() && rows[i].iter().zip(rows[j].iter()).all(|(a, b)| a == b) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+// ── Helpers for OVERLAPS predicate ──
+
+/// Evaluate OVERLAPS using (table_alias, column_name) context
+fn eval_overlaps_cols(
+    a: &Expression, b: &Expression, c: &Expression, d: &Expression,
+    row: &[Value], cols: &[(String, String)], storage: &Storage,
+) -> bool {
+    let va = resolve_expr_cols(a, row, cols, storage);
+    let vb = resolve_expr_cols(b, row, cols, storage);
+    let vc = resolve_expr_cols(c, row, cols, storage);
+    let vd = resolve_expr_cols(d, row, cols, storage);
+    eval_overlaps_values(&va, &vb, &vc, &vd)
+}
+
+/// Evaluate OVERLAPS using ColumnDefinition schema
+fn eval_overlaps_expr(
+    a: &Expression, b: &Expression, c: &Expression, d: &Expression,
+    row: &[Value], schema: &[ColumnDefinition], storage: &Storage,
+) -> bool {
+    let va = resolve_expression(a, row, schema, storage);
+    let vb = resolve_expression(b, row, schema, storage);
+    let vc = resolve_expression(c, row, schema, storage);
+    let vd = resolve_expression(d, row, schema, storage);
+    eval_overlaps_values(&va, &vb, &vc, &vd)
+}
+
+/// Core OVERLAPS logic: two periods overlap if s1 < e2 AND s2 < e1
+fn eval_overlaps_values(s1: &Option<Value>, e1: &Option<Value>, s2: &Option<Value>, e2: &Option<Value>) -> bool {
+    match (s1, e1, s2, e2) {
+        (Some(s1), Some(e1), Some(s2), Some(e2)) => {
+            // Convert non-temporal types to numeric f64 for comparison
+            let to_num = |v: &Value| -> Option<f64> {
+                match v {
+                    Value::Int(n) => Some(*n as f64),
+                    Value::Float(f) => Some(*f),
+                    Value::Date(d) => Some(*d as f64),
+                    Value::Timestamp(ts) => Some(*ts as f64),
+                    _ => None,
+                }
+            };
+            match (to_num(s1), to_num(e1), to_num(s2), to_num(e2)) {
+                (Some(s1), Some(e1), Some(s2), Some(e2)) => {
+                    compare_values(&Value::Float(s1), &Operator::LessThan, &Value::Float(e2)) &&
+                    compare_values(&Value::Float(s2), &Operator::LessThan, &Value::Float(e1))
+                }
+                _ => false,
+            }
+        }
+        _ => false,
     }
 }
 
@@ -2671,8 +2880,60 @@ fn compare_numeric(l: f64, r: f64, op: &Operator) -> bool {
     }
 }
 
+/// Convert a SQL SIMILAR TO pattern to a Rust regex pattern.
+/// SIMILAR TO uses: % (any sequence), _ (any char), |, *, +, (), []
+pub fn similar_to_regex(pattern: &str, escape_char: Option<char>) -> String {
+    let mut re = String::new();
+    let mut chars = pattern.chars();
+    let escape = escape_char.unwrap_or('\\');
+    let mut prev_was_escape = false;
+
+    while let Some(c) = chars.next() {
+        if prev_was_escape {
+            re.push_str(&regex::escape(&c.to_string()));
+            prev_was_escape = false;
+            continue;
+        }
+        if c == escape {
+            prev_was_escape = true;
+            continue;
+        }
+        match c {
+            '%' => re.push_str(".*"),
+            '_' => re.push('.'),
+            // These are special in both SIMILAR TO and regex — keep as-is
+            '|' | '*' | '+' | '(' | ')' | '[' | ']' | '{' | '}' => re.push(c),
+            // '.' is literal in SIMILAR TO — escape it
+            '.' => re.push_str("\\."),
+            // These regex special chars are literal in SIMILAR TO
+            '^' => re.push_str("\\^"),
+            '$' => re.push_str("\\$"),
+            '?' => re.push_str("\\?"),
+            '-' => re.push_str("\\-"),
+            '\\' => re.push_str("\\\\"),
+            // '?' is special in regex but not in SIMILAR TO
+            _ => re.push(c),
+        }
+    }
+    // If pattern ends with escape char, treat it literally
+    if prev_was_escape {
+        re.push_str(&regex::escape(&escape.to_string()));
+    }
+    re
+}
+
 /// Compare two values using the given operator
 fn compare_values(left: &Value, op: &Operator, right: &Value) -> bool {
+    // IS DISTINCT FROM / IS NOT DISTINCT FROM: NULL is comparable
+    if *op == Operator::IsDistinctFrom || *op == Operator::IsNotDistinctFrom {
+        let distinct = match (left, right) {
+            (Value::Null, Value::Null) => false,
+            (Value::Null, _) | (_, Value::Null) => true,
+            _ => compare_values(left, &Operator::NotEquals, right),
+        };
+        return if *op == Operator::IsDistinctFrom { distinct } else { !distinct };
+    }
+
     match (left, right) {
         (Value::Int(l), Value::Int(r)) => compare_numeric(*l as f64, *r as f64, op),
         (Value::Float(l), Value::Float(r)) => compare_numeric(*l, *r, op),

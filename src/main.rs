@@ -2578,6 +2578,21 @@ fn evaluate_join_condition(
                 return if *operator == parser::Operator::NotIn { !contains } else { contains };
             }
 
+            if *operator == parser::Operator::Similar || *operator == parser::Operator::NotSimilar {
+                let lv = resolve_join_expression(left, row, cols, storage);
+                let rv = resolve_join_expression(right, row, cols, storage);
+                let escape = upper_bound.as_ref().and_then(|e| resolve_join_expression(e, row, cols, storage));
+                let similar = match (&lv, &rv) {
+                    (Some(Value::String(s)), Some(Value::String(p))) => {
+                        let escape_char = escape.and_then(|v| if let Value::String(c) = v { c.chars().next() } else { None });
+                        let pattern = crate::storage::similar_to_regex(p, escape_char);
+                        regex::Regex::new(&format!("^(?:{})$", pattern)).map_or(false, |re| re.is_match(s))
+                    }
+                    _ => false,
+                };
+                return if *operator == parser::Operator::Similar { similar } else { !similar };
+            }
+
             let left_val = resolve_join_expression(left, row, cols, storage);
             let right_val = resolve_join_expression(right, row, cols, storage);
             match (&left_val, &right_val) {
@@ -2585,6 +2600,7 @@ fn evaluate_join_condition(
                 _ => false,
             }
         }
+        parser::Condition::Unique(_) | parser::Condition::NotUnique(_) | parser::Condition::Overlaps(..) => false,
         parser::Condition::AnyComparison { left, op, subquery } => {
             let lv = match resolve_join_expression(left, row, cols, storage) { Some(v) => v, None => return false };
             let vals = execute_subquery(subquery, storage);
@@ -2639,6 +2655,7 @@ fn evaluate_having_condition(
                 _ => false,
             }
         }
+        parser::Condition::Unique(_) | parser::Condition::NotUnique(_) | parser::Condition::Overlaps(..) => false,
         parser::Condition::AnyComparison { left, op, subquery } => {
             let lv = match resolve_having_expression(left, group, cols, storage) { Some(v) => v, None => return false };
             let vals = execute_subquery(subquery, storage);
@@ -2913,11 +2930,24 @@ fn evaluate_correlated_condition(
                     if compare_values(v, &parser::Operator::GreaterThanOrEqual, l) && compare_values(v, &parser::Operator::LessThanOrEqual, h));
                 return if *operator == parser::Operator::Between { in_range } else { !in_range };
             }
+            if *operator == parser::Operator::Similar || *operator == parser::Operator::NotSimilar {
+                let escape = upper_bound.as_ref().and_then(|e| resolve_correlated_expr(e, row, cols, storage, outer_row, outer_cols));
+                let similar = match (&lv, &rv) {
+                    (Some(Value::String(s)), Some(Value::String(p))) => {
+                        let escape_char = escape.and_then(|v| if let Value::String(c) = v { c.chars().next() } else { None });
+                        let pattern = crate::storage::similar_to_regex(p, escape_char);
+                        regex::Regex::new(&format!("^(?:{})$", pattern)).map_or(false, |re| re.is_match(s))
+                    }
+                    _ => false,
+                };
+                return if *operator == parser::Operator::Similar { similar } else { !similar };
+            }
             match (&lv, &rv) {
                 (Some(l), Some(r)) => compare_values(l, operator, r),
                 _ => false,
             }
         }
+        parser::Condition::Unique(_) | parser::Condition::NotUnique(_) | parser::Condition::Overlaps(..) => false,
         parser::Condition::AnyComparison { left, op, subquery } => {
             let lv = match resolve_correlated_expr(left, row, cols, storage, outer_row, outer_cols) { Some(v) => v, None => return false };
             let vals = execute_subquery(subquery, storage);
@@ -3345,6 +3375,16 @@ fn eval_arith(left: &Value, op: &parser::ArithOp, right: &Value) -> Option<Value
 }
 
 fn compare_values(left: &Value, op: &parser::Operator, right: &Value) -> bool {
+    // IS DISTINCT FROM / IS NOT DISTINCT FROM: NULL is comparable
+    if *op == parser::Operator::IsDistinctFrom || *op == parser::Operator::IsNotDistinctFrom {
+        let distinct = match (left, right) {
+            (Value::Null, Value::Null) => false,
+            (Value::Null, _) | (_, Value::Null) => true,
+            _ => compare_values(left, &parser::Operator::NotEquals, right),
+        };
+        return if *op == parser::Operator::IsDistinctFrom { distinct } else { !distinct };
+    }
+
     // Use cmp_values for ordering-based comparisons between comparable types
     let ordering = cmp_values(left, right);
     // For types that have natural ordering, use cmp_values

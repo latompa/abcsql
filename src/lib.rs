@@ -876,6 +876,20 @@ fn eval_correlated_condition(
                 }
                 return false;
             }
+            if *operator == parser::Operator::Similar || *operator == parser::Operator::NotSimilar {
+                let lv = resolve_correlated_expr(left, row, cols, storage, outer_row, outer_cols);
+                let rv = resolve_correlated_expr(right, row, cols, storage, outer_row, outer_cols);
+                let escape = upper_bound.as_ref().and_then(|e| resolve_correlated_expr(e, row, cols, storage, outer_row, outer_cols));
+                let similar = match (&lv, &rv) {
+                    (Some(parser::Value::String(s)), Some(parser::Value::String(p))) => {
+                        let escape_char = escape.and_then(|v| if let parser::Value::String(c) = v { c.chars().next() } else { None });
+                        let pattern = crate::storage::similar_to_regex(p, escape_char);
+                        regex::Regex::new(&format!("^(?:{})$", pattern)).map_or(false, |re| re.is_match(s))
+                    }
+                    _ => false,
+                };
+                return if *operator == parser::Operator::Similar { similar } else { !similar };
+            }
             let lv = resolve_correlated_expr(left, row, cols, storage, outer_row, outer_cols);
             let rv = resolve_correlated_expr(right, row, cols, storage, outer_row, outer_cols);
             match (lv, rv) {
@@ -883,6 +897,7 @@ fn eval_correlated_condition(
                 _ => false,
             }
         }
+        parser::Condition::Unique(_) | parser::Condition::NotUnique(_) | parser::Condition::Overlaps(..) => false,
         parser::Condition::AnyComparison { left, op, subquery } => {
             let lv = match resolve_correlated_expr(left, row, cols, storage, outer_row, outer_cols) { Some(v) => v, None => return false };
             let values = lib_execute_subquery_all_values(subquery, storage);
@@ -971,6 +986,20 @@ fn eval_condition(cond: &parser::Condition, row: &[Value], cols: &[(String, Stri
                 }
                 return false;
             }
+            if *operator == parser::Operator::Similar || *operator == parser::Operator::NotSimilar {
+                let lv = resolve_expr(left, row, cols, storage);
+                let rv = resolve_expr(right, row, cols, storage);
+                let escape = upper_bound.as_ref().and_then(|e| resolve_expr(e, row, cols, storage));
+                let similar = match (&lv, &rv) {
+                    (Some(parser::Value::String(s)), Some(parser::Value::String(p))) => {
+                        let escape_char = escape.and_then(|v| if let parser::Value::String(c) = v { c.chars().next() } else { None });
+                        let pattern = crate::storage::similar_to_regex(p, escape_char);
+                        regex::Regex::new(&format!("^(?:{})$", pattern)).map_or(false, |re| re.is_match(s))
+                    }
+                    _ => false,
+                };
+                return if *operator == parser::Operator::Similar { similar } else { !similar };
+            }
             let lv = resolve_expr(left, row, cols, storage);
             let rv = resolve_expr(right, row, cols, storage);
             match (lv, rv) {
@@ -978,6 +1007,7 @@ fn eval_condition(cond: &parser::Condition, row: &[Value], cols: &[(String, Stri
                 _ => false,
             }
         }
+        parser::Condition::Unique(_) | parser::Condition::NotUnique(_) | parser::Condition::Overlaps(..) => false,
         parser::Condition::AnyComparison { left, op, subquery } => {
             let lv = match resolve_expr(left, row, cols, storage) { Some(v) => v, None => return false };
             let values = lib_execute_subquery_all_values(subquery, storage);
@@ -1354,6 +1384,16 @@ fn compare_numeric(l: f64, r: f64, op: &parser::Operator) -> bool {
 }
 
 fn compare(left: &Value, op: &parser::Operator, right: &Value) -> bool {
+    // IS DISTINCT FROM / IS NOT DISTINCT FROM: NULL is comparable
+    if *op == parser::Operator::IsDistinctFrom || *op == parser::Operator::IsNotDistinctFrom {
+        let distinct = match (left, right) {
+            (Value::Null, Value::Null) => false,
+            (Value::Null, _) | (_, Value::Null) => true,
+            _ => compare(left, &parser::Operator::NotEquals, right),
+        };
+        return if *op == parser::Operator::IsDistinctFrom { distinct } else { !distinct };
+    }
+
     match (left, right) {
         (Value::Int(l), Value::Int(r)) => compare_numeric(*l as f64, *r as f64, op),
         (Value::Float(l), Value::Float(r)) => compare_numeric(*l, *r, op),

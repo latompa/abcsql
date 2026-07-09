@@ -106,6 +106,11 @@ impl Storage {
         Ok(Storage { data_dir, txn: std::sync::Mutex::new(None) })
     }
 
+    /// Return a reference to the data directory path
+    pub fn data_dir(&self) -> &PathBuf {
+        &self.data_dir
+    }
+
     /// Capture the before-image of a file once per transaction (idempotent)
     fn snapshot_before_write(&self, path: &Path) {
         let mut guard = self.txn.lock().unwrap();
@@ -1503,6 +1508,29 @@ fn decode_check_text(text: &str) -> String {
         self.view_path(view_name).exists()
     }
 
+    /// List all views in the database
+    pub fn list_views(&self) -> io::Result<Vec<String>> {
+        let mut views = Vec::new();
+        if !self.data_dir.exists() {
+            return Ok(views);
+        }
+        for entry in fs::read_dir(&self.data_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if let Some(extension) = path.extension() {
+                if extension == "view" {
+                    if let Some(stem) = path.file_stem() {
+                        if let Some(name) = stem.to_str() {
+                            views.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        views.sort();
+        Ok(views)
+    }
+
     // ---- User-defined functions ----
 
     fn function_path(&self, name: &str) -> PathBuf {
@@ -1575,6 +1603,29 @@ fn decode_check_text(text: &str) -> String {
 
     pub fn function_exists(&self, name: &str) -> bool {
         self.function_path(name).exists()
+    }
+
+    /// List all user-defined functions
+    pub fn list_functions(&self) -> io::Result<Vec<String>> {
+        let mut funcs = Vec::new();
+        if !self.data_dir.exists() {
+            return Ok(funcs);
+        }
+        for entry in fs::read_dir(&self.data_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if let Some(extension) = path.extension() {
+                if extension == "func" {
+                    if let Some(stem) = path.file_stem() {
+                        if let Some(name) = stem.to_str() {
+                            funcs.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        funcs.sort();
+        Ok(funcs)
     }
 
     /// Read and increment the auto_increment counter
@@ -1789,6 +1840,17 @@ fn decode_check_text(text: &str) -> String {
             .map(|(name, _, _, _)| name.clone()))
     }
 
+    /// List all index names
+    pub fn list_indexes(&self) -> io::Result<Vec<String>> {
+        let meta = match self.load_index_meta() {
+            Ok(m) => m,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let mut names: Vec<String> = meta.into_iter().map(|(name, _, _, _)| name).collect();
+        names.sort();
+        Ok(names)
+    }
+
     /// Rebuild all indexes for a table (called after insert/update/delete)
     fn rebuild_indexes_for_table(&self, table_name: &str) -> Result<(), StorageError> {
         let meta = self.load_index_meta()?;
@@ -1974,8 +2036,15 @@ fn execute_scalar_subquery(stmt: &SelectStatement, storage: &Storage) -> Option<
         FromClause::Table(t) => t.clone(),
         _ => return None, // nested subquery FROM not supported here
     };
-    let schema = storage.load_schema(&table_name).ok()?;
-    let rows = storage.read_rows(&table_name).ok()?;
+    let (schema, rows) = if Storage::is_metadata_table(&table_name) {
+        let schema = Storage::metadata_schema(&table_name)?;
+        let rows = storage.read_metadata_rows(&table_name)?;
+        (schema, rows)
+    } else {
+        let schema = storage.load_schema(&table_name).ok()?;
+        let rows = storage.read_rows(&table_name).ok()?;
+        (schema, rows)
+    };
 
     let filtered: Vec<Vec<Value>> = rows.into_iter()
         .filter(|row| match &stmt.where_clause {
@@ -2007,8 +2076,15 @@ fn execute_correlated_scalar_subquery(
         FromClause::Table(t) => t.clone(),
         _ => return None,
     };
-    let schema = storage.load_schema(&table_name).ok()?;
-    let rows = storage.read_rows(&table_name).ok()?;
+    let (schema, rows) = if Storage::is_metadata_table(&table_name) {
+        let schema = Storage::metadata_schema(&table_name)?;
+        let rows = storage.read_metadata_rows(&table_name)?;
+        (schema, rows)
+    } else {
+        let schema = storage.load_schema(&table_name).ok()?;
+        let rows = storage.read_rows(&table_name).ok()?;
+        (schema, rows)
+    };
 
     let filtered: Vec<Vec<Value>> = rows.into_iter()
         .filter(|row| match &stmt.where_clause {
@@ -3205,6 +3281,374 @@ fn deserialize_row(s: &str) -> Result<Vec<Value>, StorageError> {
     }
 
     Ok(values)
+}
+
+// ---------------------------------------------------------------------------
+// Metadata (information_schema) tables
+// ---------------------------------------------------------------------------
+
+const METADATA_TABLES: &[&str] = &[
+    "information_schema.schemata",
+    "information_schema.tables",
+    "information_schema.columns",
+    "information_schema.views",
+    "information_schema.table_constraints",
+    "information_schema.key_column_usage",
+    "information_schema.referential_constraints",
+    "information_schema.check_constraints",
+    "information_schema.routines",
+];
+
+impl Storage {
+    pub fn is_metadata_table(name: &str) -> bool {
+        METADATA_TABLES.contains(&name)
+    }
+
+    /// Return synthetic column definitions for a metadata table.
+    pub fn metadata_schema(name: &str) -> Option<CreateTableStatement> {
+        let columns = match name {
+            "information_schema.schemata" => vec![
+                ColumnDefinition { name: "catalog_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "schema_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "default_character_set_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "default_collation_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+            ],
+            "information_schema.tables" => vec![
+                ColumnDefinition { name: "table_catalog".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "table_schema".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "table_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "table_type".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+            ],
+            "information_schema.columns" => vec![
+                ColumnDefinition { name: "table_catalog".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "table_schema".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "table_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "column_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "ordinal_position".into(), data_type: DataType::Int, auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "column_default".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "is_nullable".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "data_type".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+            ],
+            "information_schema.views" => vec![
+                ColumnDefinition { name: "table_catalog".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "table_schema".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "table_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "view_definition".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+            ],
+            "information_schema.table_constraints" => vec![
+                ColumnDefinition { name: "constraint_catalog".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "constraint_schema".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "constraint_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "table_schema".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "table_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "constraint_type".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+            ],
+            "information_schema.key_column_usage" => vec![
+                ColumnDefinition { name: "constraint_catalog".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "constraint_schema".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "constraint_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "table_catalog".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "table_schema".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "table_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "column_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "ordinal_position".into(), data_type: DataType::Int, auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+            ],
+            "information_schema.referential_constraints" => vec![
+                ColumnDefinition { name: "constraint_catalog".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "constraint_schema".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "constraint_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "unique_constraint_catalog".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "unique_constraint_schema".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "unique_constraint_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "delete_rule".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "update_rule".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+            ],
+            "information_schema.check_constraints" => vec![
+                ColumnDefinition { name: "constraint_catalog".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "constraint_schema".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "constraint_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "check_clause".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+            ],
+            "information_schema.routines" => vec![
+                ColumnDefinition { name: "specific_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "routine_catalog".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "routine_schema".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "routine_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "routine_type".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "data_type".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "created".into(), data_type: DataType::Timestamp, auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+            ],
+            _ => return None,
+        };
+        Some(CreateTableStatement { table_name: name.to_string(), columns })
+    }
+
+    /// Generate synthetic rows for a metadata table by querying live storage state.
+    pub fn read_metadata_rows(&self, name: &str) -> Option<Vec<Vec<Value>>> {
+        match name {
+            "information_schema.schemata" => {
+                Some(vec![vec![
+                    Value::String("default".into()),
+                    Value::String("public".into()),
+                    Value::String("UTF8".into()),
+                    Value::String("en_US.UTF-8".into()),
+                ]])
+            }
+            "information_schema.tables" => {
+                let mut rows: Vec<Vec<Value>> = Vec::new();
+                // User tables
+                if let Ok(tables) = self.list_tables() {
+                    for t in &tables {
+                        rows.push(vec![
+                            Value::String("default".into()),
+                            Value::String("public".into()),
+                            Value::String(t.clone()),
+                            Value::String("BASE TABLE".into()),
+                        ]);
+                    }
+                }
+                // Views
+                if let Ok(views) = self.list_views() {
+                    for v in &views {
+                        rows.push(vec![
+                            Value::String("default".into()),
+                            Value::String("public".into()),
+                            Value::String(v.clone()),
+                            Value::String("VIEW".into()),
+                        ]);
+                    }
+                }
+                Some(rows)
+            }
+            "information_schema.columns" => {
+                let mut rows: Vec<Vec<Value>> = Vec::new();
+                // User tables
+                if let Ok(tables) = self.list_tables() {
+                    for t in &tables {
+                        if let Ok(schema) = self.load_schema(t) {
+                            for (i, col) in schema.columns.iter().enumerate() {
+                                rows.push(vec![
+                                    Value::String("default".into()),
+                                    Value::String("public".into()),
+                                    Value::String(t.clone()),
+                                    Value::String(col.name.clone()),
+                                    Value::Int((i + 1) as i64),
+                                    Value::Null,
+                                    Value::String(if col.not_null || col.primary_key { "NO".into() } else { "YES".into() }),
+                                    Value::String(data_type_to_string(&col.data_type)),
+                                ]);
+                            }
+                        }
+                    }
+                }
+                // Views
+                if let Ok(views) = self.list_views() {
+                    for v in &views {
+                        if let Ok(Some(_view_sql)) = self.load_view(v) {
+                            rows.push(vec![
+                                Value::String("default".into()),
+                                Value::String("public".into()),
+                                Value::String(v.clone()),
+                                Value::String("?".into()),
+                                Value::Int(1),
+                                Value::Null,
+                                Value::String("YES".into()),
+                                Value::String("VARCHAR".into()),
+                            ]);
+                        }
+                    }
+                }
+                Some(rows)
+            }
+            "information_schema.views" => {
+                let mut rows: Vec<Vec<Value>> = Vec::new();
+                if let Ok(views) = self.list_views() {
+                    for v in &views {
+                        if let Ok(Some(sql)) = self.load_view(v) {
+                            rows.push(vec![
+                                Value::String("default".into()),
+                                Value::String("public".into()),
+                                Value::String(v.clone()),
+                                Value::String(sql),
+                            ]);
+                        }
+                    }
+                }
+                Some(rows)
+            }
+            "information_schema.table_constraints" => {
+                let mut rows: Vec<Vec<Value>> = Vec::new();
+                if let Ok(tables) = self.list_tables() {
+                    for t in &tables {
+                        if let Ok(schema) = self.load_schema(t) {
+                            let has_pk = schema.columns.iter().any(|c| c.primary_key);
+                            if has_pk {
+                                let constraint_name = format!("{}_pkey", t);
+                                rows.push(vec![
+                                    Value::String("default".into()),
+                                    Value::String("public".into()),
+                                    Value::String(constraint_name),
+                                    Value::String("public".into()),
+                                    Value::String(t.clone()),
+                                    Value::String("PRIMARY KEY".into()),
+                                ]);
+                            }
+                            let has_unique = schema.columns.iter().any(|c| c.unique);
+                            if has_unique {
+                                let constraint_name = format!("{}_unique", t);
+                                rows.push(vec![
+                                    Value::String("default".into()),
+                                    Value::String("public".into()),
+                                    Value::String(constraint_name),
+                                    Value::String("public".into()),
+                                    Value::String(t.clone()),
+                                    Value::String("UNIQUE".into()),
+                                ]);
+                            }
+                            let has_fk = schema.columns.iter().any(|c| c.references.is_some());
+                            if has_fk {
+                                let constraint_name = format!("{}_fkey", t);
+                                rows.push(vec![
+                                    Value::String("default".into()),
+                                    Value::String("public".into()),
+                                    Value::String(constraint_name),
+                                    Value::String("public".into()),
+                                    Value::String(t.clone()),
+                                    Value::String("FOREIGN KEY".into()),
+                                ]);
+                            }
+                            let has_ck = schema.columns.iter().any(|c| c.check_constraint.is_some());
+                            if has_ck {
+                                let constraint_name = format!("{}_check", t);
+                                rows.push(vec![
+                                    Value::String("default".into()),
+                                    Value::String("public".into()),
+                                    Value::String(constraint_name),
+                                    Value::String("public".into()),
+                                    Value::String(t.clone()),
+                                    Value::String("CHECK".into()),
+                                ]);
+                            }
+                        }
+                    }
+                }
+                Some(rows)
+            }
+            "information_schema.key_column_usage" => {
+                let mut rows: Vec<Vec<Value>> = Vec::new();
+                if let Ok(tables) = self.list_tables() {
+                    for t in &tables {
+                        if let Ok(schema) = self.load_schema(t) {
+                            for (i, col) in schema.columns.iter().enumerate() {
+                                if col.primary_key {
+                                    rows.push(vec![
+                                        Value::String("default".into()),
+                                        Value::String("public".into()),
+                                        Value::String(format!("{}_pkey", t)),
+                                        Value::String("default".into()),
+                                        Value::String("public".into()),
+                                        Value::String(t.clone()),
+                                        Value::String(col.name.clone()),
+                                        Value::Int((i + 1) as i64),
+                                    ]);
+                                }
+                                if col.unique && !col.primary_key {
+                                    rows.push(vec![
+                                        Value::String("default".into()),
+                                        Value::String("public".into()),
+                                        Value::String(format!("{}_unique", t)),
+                                        Value::String("default".into()),
+                                        Value::String("public".into()),
+                                        Value::String(t.clone()),
+                                        Value::String(col.name.clone()),
+                                        Value::Int((i + 1) as i64),
+                                    ]);
+                                }
+                                if col.references.is_some() {
+                                    rows.push(vec![
+                                        Value::String("default".into()),
+                                        Value::String("public".into()),
+                                        Value::String(format!("{}_fkey", t)),
+                                        Value::String("default".into()),
+                                        Value::String("public".into()),
+                                        Value::String(t.clone()),
+                                        Value::String(col.name.clone()),
+                                        Value::Int((i + 1) as i64),
+                                    ]);
+                                }
+                            }
+                        }
+                    }
+                }
+                Some(rows)
+            }
+            "information_schema.referential_constraints" => {
+                let mut rows: Vec<Vec<Value>> = Vec::new();
+                if let Ok(tables) = self.list_tables() {
+                    for t in &tables {
+                        if let Ok(schema) = self.load_schema(t) {
+                            for col in &schema.columns {
+                                if let Some(ref fk) = col.references {
+                                    rows.push(vec![
+                                        Value::String("default".into()),
+                                        Value::String("public".into()),
+                                        Value::String(format!("{}_fkey", t)),
+                                        Value::String("default".into()),
+                                        Value::String("public".into()),
+                                        Value::String(format!("{}_{}_fkey", fk.table, fk.column)),
+                                        Value::String("NO ACTION".into()),
+                                        Value::String("NO ACTION".into()),
+                                    ]);
+                                }
+                            }
+                        }
+                    }
+                }
+                Some(rows)
+            }
+            "information_schema.check_constraints" => {
+                let mut rows: Vec<Vec<Value>> = Vec::new();
+                if let Ok(tables) = self.list_tables() {
+                    for t in &tables {
+                        if let Ok(schema) = self.load_schema(t) {
+                            for col in &schema.columns {
+                                if let Some(ref ck) = col.check_constraint_text {
+                                    rows.push(vec![
+                                        Value::String("default".into()),
+                                        Value::String("public".into()),
+                                        Value::String(format!("{}_check", t)),
+                                        Value::String(ck.clone()),
+                                    ]);
+                                }
+                            }
+                        }
+                    }
+                }
+                Some(rows)
+            }
+            "information_schema.routines" => {
+                let mut rows: Vec<Vec<Value>> = Vec::new();
+                if let Ok(functions) = self.list_functions() {
+                    for f in &functions {
+                        if let Ok(Some(sig)) = self.load_function(f) {
+                            let return_type_str = sig.return_type.as_deref().unwrap_or("").to_string();
+                            rows.push(vec![
+                                Value::String(f.clone()),
+                                Value::String("default".into()),
+                                Value::String("public".into()),
+                                Value::String(f.clone()),
+                                Value::String("FUNCTION".into()),
+                                Value::String(return_type_str),
+                                Value::Null, // created
+                            ]);
+                        }
+                    }
+                }
+                Some(rows)
+            }
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]

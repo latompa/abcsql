@@ -1740,3 +1740,106 @@ fn test_create_function_twice_fails() {
     let r = execute(&db.storage, "CREATE FUNCTION f(x INT) RETURNS INT AS x");
     assert!(r.is_err(), "expected error creating duplicate function");
 }
+
+// ---- information_schema metadata tables ----
+
+#[test]
+fn test_metadata_schemata() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (id INT)").unwrap();
+    // schemata always has 1 row
+    let r = execute(&db.storage, "SELECT * FROM information_schema.schemata").unwrap();
+    assert_eq!(r, "(1 rows)");
+}
+
+#[test]
+fn test_metadata_tables() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t1 (id INT)").unwrap();
+    execute(&db.storage, "CREATE TABLE t2 (name TEXT)").unwrap();
+    let r = execute(&db.storage, "SELECT table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE' ORDER BY table_name").unwrap();
+    assert_eq!(r, "(2 rows)");
+}
+
+#[test]
+fn test_metadata_tables_select_star() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (id INT)").unwrap();
+    let r = execute(&db.storage, "SELECT * FROM information_schema.tables").unwrap();
+    assert_eq!(r, "(1 rows)");
+}
+
+#[test]
+fn test_metadata_columns() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT NOT NULL)").unwrap();
+    let r = execute(&db.storage, "SELECT * FROM information_schema.columns WHERE table_name = 't' ORDER BY ordinal_position").unwrap();
+    assert_eq!(r, "(2 rows)");
+}
+
+#[test]
+fn test_metadata_views() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (id INT)").unwrap();
+    execute(&db.storage, "CREATE VIEW v AS SELECT * FROM t").unwrap();
+    let r = execute(&db.storage, "SELECT table_name FROM information_schema.tables WHERE table_type = 'VIEW'").unwrap();
+    assert_eq!(r, "(1 rows)");
+    let r2 = execute(&db.storage, "SELECT * FROM information_schema.views").unwrap();
+    assert_eq!(r2, "(1 rows)");
+}
+
+#[test]
+fn test_metadata_table_constraints() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT UNIQUE)").unwrap();
+    let r = execute(&db.storage, "SELECT * FROM information_schema.table_constraints WHERE table_name = 't' ORDER BY constraint_type").unwrap();
+    assert_eq!(r, "(2 rows)");
+}
+
+#[test]
+fn test_metadata_subquery() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (id INT)").unwrap();
+    // EXISTS with metadata table should work
+    let r = execute(&db.storage, "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM information_schema.schemata)").unwrap();
+    assert_eq!(r, "(0 rows)");
+}
+
+#[test]
+fn test_metadata_parse_qualified_name() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (id INT)").unwrap();
+    let r = execute(&db.storage, "SELECT * FROM information_schema.tables").unwrap();
+    assert_eq!(r, "(1 rows)");
+}
+
+#[test]
+fn test_metadata_where_on_metadata() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE mytab (id INT)").unwrap();
+    let r = execute(&db.storage, "SELECT * FROM information_schema.tables WHERE table_name = 'mytab'").unwrap();
+    assert_eq!(r, "(1 rows)");
+}
+
+#[test]
+fn test_metadata_no_tables() {
+    let db = TestDb::new();
+    let r = execute(&db.storage, "SELECT * FROM information_schema.tables").unwrap();
+    assert_eq!(r, "(0 rows)");
+}
+
+#[test]
+fn test_metadata_key_column_usage() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT UNIQUE)").unwrap();
+    let r = execute(&db.storage, "SELECT * FROM information_schema.key_column_usage WHERE table_name = 't' ORDER BY ordinal_position").unwrap();
+    assert_eq!(r, "(2 rows)");
+}
+
+#[test]
+fn test_metadata_routines() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE FUNCTION one() AS 1").unwrap();
+    let r = execute(&db.storage, "SELECT * FROM information_schema.routines").unwrap();
+    assert_eq!(r, "(1 rows)");
+}

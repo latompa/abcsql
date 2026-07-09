@@ -2,9 +2,10 @@ mod parser;
 mod storage;
 
 use std::collections::HashMap;
-use std::io::{self, Write};
 use parser::{parse_sql, SqlStatement, Value};
 use storage::Storage;
+use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
 
 fn main() {
     let data_dir = std::env::args().nth(1).unwrap_or_else(|| "./data".to_string());
@@ -17,42 +18,131 @@ fn main() {
         }
     };
 
+    let history_file = dirs_or_default(&data_dir, ".abcsql_history");
+
+    let mut rl = match DefaultEditor::new() {
+        Ok(rl) => rl,
+        Err(e) => {
+            eprintln!("Failed to initialize REPL: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    if rl.load_history(&history_file).is_err() {
+        // No previous history — ok
+    }
+
     println!("abcsql v0.1.0");
     println!("Data directory: {}", data_dir);
     println!("Type .help for help, .quit to exit\n");
 
-    let mut input = String::new();
-
     loop {
-        print!("abcsql> ");
-        io::stdout().flush().unwrap();
-
-        input.clear();
-        match io::stdin().read_line(&mut input) {
-            Ok(0) => break, // EOF
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("Error reading input: {}", e);
-                continue;
+        let prompt = "abcsql> ";
+        let line = match rl.readline(prompt) {
+            Ok(line) => line,
+            Err(ReadlineError::Interrupted) => {
+                println!("^C");
+                break;
             }
-        }
+            Err(ReadlineError::Eof) => {
+                println!();
+                break;
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                break;
+            }
+        };
 
-        let trimmed = input.trim();
+        let trimmed = line.trim().to_string();
         if trimmed.is_empty() {
             continue;
         }
 
-        // Handle meta-commands
+        // Meta-commands are single-line
         if trimmed.starts_with('.') {
-            handle_meta_command(trimmed, &storage);
+            let _ = rl.add_history_entry(trimmed.as_str());
+            handle_meta_command(&trimmed, &storage);
             continue;
         }
 
-        // Parse and execute SQL
-        execute_sql(trimmed, &storage);
+        // Handle multi-line SQL: keep reading with continuation prompt
+        // until we have balanced parens/quotes and non-empty input
+        let mut buffer = trimmed;
+        loop {
+            let sql = buffer.trim();
+            if sql.is_empty() {
+                break;
+            }
+            if is_sql_complete(sql) {
+                let _ = rl.add_history_entry(sql);
+                execute_sql(sql, &storage);
+                break;
+            }
+            // Read continuation line
+            let cont = match rl.readline("  ...> ") {
+                Ok(l) => l,
+                Err(ReadlineError::Interrupted) => {
+                    println!("^C");
+                    buffer.clear();
+                    break;
+                }
+                Err(ReadlineError::Eof) => {
+                    println!();
+                    buffer.clear();
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    buffer.clear();
+                    break;
+                }
+            };
+            buffer.push('\n');
+            buffer.push_str(&cont);
+        }
     }
 
+    let _ = rl.save_history(&history_file);
     println!("\nGoodbye!");
+}
+
+/// Return a full path for a file inside the data directory.
+fn dirs_or_default(data_dir: &str, file: &str) -> String {
+    let path = std::path::Path::new(data_dir).join(file);
+    path.to_string_lossy().into_owned()
+}
+
+/// Simple heuristic: SQL is "complete" when parentheses and string literals
+/// are balanced, so the parser can attempt to parse the whole buffer.
+fn is_sql_complete(s: &str) -> bool {
+    let mut depth: i32 = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut prev_bs = false;
+    for c in s.chars() {
+        if prev_bs {
+            prev_bs = false;
+            continue;
+        }
+        if c == '\\' { prev_bs = true; continue; }
+        if in_single {
+            if c == '\'' { in_single = false; }
+            continue;
+        }
+        if in_double {
+            if c == '"' { in_double = false; }
+            continue;
+        }
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            '\'' => in_single = true,
+            '"' => in_double = true,
+            _ => {}
+        }
+    }
+    depth == 0 && !in_single && !in_double
 }
 
 fn handle_meta_command(cmd: &str, storage: &Storage) {
@@ -67,15 +157,17 @@ fn handle_meta_command(cmd: &str, storage: &Storage) {
         ".help" => {
             println!("Meta-commands:");
             println!("  .help              Show this help");
-            println!("  .quit              Exit the REPL");
+            println!("  .quit,.exit        Exit the REPL");
             println!("  .tables            List all tables");
+            println!("  .views             List all views");
+            println!("  .indices           List all indexes");
+            println!("  .functions         List all user-defined functions");
             println!("  .schema <table>    Show table schema");
-            println!("\nSQL statements:");
-            println!("  CREATE TABLE name (col TYPE, ...)");
-            println!("  INSERT INTO table VALUES (val, ...)");
-            println!("  SELECT * FROM table [WHERE cond]");
-            println!("  UPDATE table SET col = val [WHERE cond]");
-            println!("  DELETE FROM table [WHERE cond]");
+            println!("  .databases         Show current database path");
+            println!("\nSQL statements (multi-line supported):");
+            println!("  CREATE TABLE, INSERT, SELECT, UPDATE, DELETE, MERGE");
+            println!("  CREATE/DROP VIEW, CREATE/DROP INDEX, CREATE/DROP FUNCTION");
+            println!("  BEGIN, COMMIT, ROLLBACK, SAVEPOINT, TRUNCATE, ALTER TABLE");
         }
         ".tables" => {
             match storage.list_tables() {
@@ -91,38 +183,77 @@ fn handle_meta_command(cmd: &str, storage: &Storage) {
                 Err(e) => eprintln!("Error: {}", e),
             }
         }
+        ".views" => {
+            match storage.list_views() {
+                Ok(views) => {
+                    if views.is_empty() {
+                        println!("(no views)");
+                    } else {
+                        for v in views {
+                            println!("{}", v);
+                        }
+                    }
+                }
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        }
+        ".indices" => {
+            match storage.list_indexes() {
+                Ok(indexes) => {
+                    if indexes.is_empty() {
+                        println!("(no indexes)");
+                    } else {
+                        for idx in indexes {
+                            println!("{}", idx);
+                        }
+                    }
+                }
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        }
+        ".functions" => {
+            match storage.list_functions() {
+                Ok(funcs) => {
+                    if funcs.is_empty() {
+                        println!("(no functions)");
+                    } else {
+                        for f in funcs {
+                            println!("{}", f);
+                        }
+                    }
+                }
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        }
+        ".databases" => {
+            println!("{}", storage.data_dir().display());
+        }
         ".schema" => {
             if parts.len() < 2 {
                 println!("Usage: .schema <table_name>");
                 return;
             }
             let table_name = parts[1];
+            if Storage::is_metadata_table(table_name) {
+                if let Some(schema) = Storage::metadata_schema(table_name) {
+                    println!("CREATE TABLE {} (", schema.table_name);
+                    for (i, col) in schema.columns.iter().enumerate() {
+                        let type_str = data_type_display(&col.data_type);
+                        let nn = if col.not_null { " NOT NULL" } else { "" };
+                        let comma = if i < schema.columns.len() - 1 { "," } else { "" };
+                        println!("  {} {}{}{}", col.name, type_str, nn, comma);
+                    }
+                    println!(");");
+                } else {
+                    eprintln!("Metadata table '{}' not found", table_name);
+                }
+                return;
+            }
             match storage.load_schema(table_name) {
                 Ok(schema) => {
                     println!("CREATE TABLE {} (", schema.table_name);
                     for (i, col) in schema.columns.iter().enumerate() {
-                        let type_str = match &col.data_type {
-                            parser::DataType::Int => "INT".to_string(),
-                            parser::DataType::SmallInt => "SMALLINT".to_string(),
-                            parser::DataType::BigInt => "BIGINT".to_string(),
-                            parser::DataType::Float => "FLOAT".to_string(),
-                            parser::DataType::Real => "REAL".to_string(),
-                            parser::DataType::Double => "DOUBLE".to_string(),
-                            parser::DataType::Boolean => "BOOLEAN".to_string(),
-                            parser::DataType::Date => "DATE".to_string(),
-                            parser::DataType::Timestamp => "TIMESTAMP".to_string(),
-                            parser::DataType::Varchar(Some(n)) => format!("VARCHAR({})", n),
-                            parser::DataType::Varchar(None) => "VARCHAR".to_string(),
-                            parser::DataType::Char(Some(n)) => format!("CHAR({})", n),
-                            parser::DataType::Char(None) => "CHAR".to_string(),
-                            parser::DataType::Text => "TEXT".to_string(),
-                            parser::DataType::Decimal(Some(p), Some(s)) => format!("DECIMAL({},{})", p, s),
-                            parser::DataType::Decimal(Some(p), None) => format!("DECIMAL({})", p),
-                            parser::DataType::Decimal(None, _) => "DECIMAL".to_string(),
-                            parser::DataType::Uuid => "UUID".to_string(),
-                            parser::DataType::Json => "JSON".to_string(),
-                            parser::DataType::Jsonb => "JSONB".to_string(),
-                        };
+                        let type_str = data_type_display(&col.data_type);
                         let nn = if col.not_null { " NOT NULL" } else { "" };
                         let uq = if col.unique { " UNIQUE" } else { "" };
                         let auto_inc = if col.auto_increment { " AUTO_INCREMENT" } else { "" };
@@ -141,6 +272,31 @@ fn handle_meta_command(cmd: &str, storage: &Storage) {
         _ => {
             println!("Unknown command: {}. Type .help for help.", command);
         }
+    }
+}
+
+fn data_type_display(dt: &parser::DataType) -> String {
+    match dt {
+        parser::DataType::Int => "INT".into(),
+        parser::DataType::SmallInt => "SMALLINT".into(),
+        parser::DataType::BigInt => "BIGINT".into(),
+        parser::DataType::Float => "FLOAT".into(),
+        parser::DataType::Real => "REAL".into(),
+        parser::DataType::Double => "DOUBLE".into(),
+        parser::DataType::Boolean => "BOOLEAN".into(),
+        parser::DataType::Date => "DATE".into(),
+        parser::DataType::Timestamp => "TIMESTAMP".into(),
+        parser::DataType::Varchar(Some(n)) => format!("VARCHAR({})", n),
+        parser::DataType::Varchar(None) => "VARCHAR".into(),
+        parser::DataType::Char(Some(n)) => format!("CHAR({})", n),
+        parser::DataType::Char(None) => "CHAR".into(),
+        parser::DataType::Text => "TEXT".into(),
+        parser::DataType::Decimal(Some(p), Some(s)) => format!("DECIMAL({},{})", p, s),
+        parser::DataType::Decimal(Some(p), None) => format!("DECIMAL({})", p),
+        parser::DataType::Decimal(None, _) => "DECIMAL".into(),
+        parser::DataType::Uuid => "UUID".into(),
+        parser::DataType::Json => "JSON".into(),
+        parser::DataType::Jsonb => "JSONB".into(),
     }
 }
 
@@ -373,6 +529,19 @@ fn load_table_with_index(
             }).collect())
             .collect();
         return Ok((cols, rows));
+    }
+
+    // Check for information_schema metadata tables
+    if Storage::is_metadata_table(name) {
+        if let Some(rows) = storage.read_metadata_rows(name) {
+            if let Some(schema) = Storage::metadata_schema(name) {
+                let cols: Vec<ResultColumn> = schema.columns.iter()
+                    .map(|c| ResultColumn { table: name.to_string(), name: c.name.clone() })
+                    .collect();
+                return Ok((cols, rows));
+            }
+        }
+        return Err(format!("Metadata table '{}' not found", name));
     }
 
     let schema = storage.load_schema(name).map_err(|e| e.to_string())?;

@@ -7,7 +7,7 @@ use nom::{
 };
 
 use super::ast::*;
-use super::cond::{parse_condition, parse_expression, parse_value, parse_identifier, parse_window_clause};
+use super::cond::{parse_condition, parse_expression, parse_value, parse_identifier, parse_window_clause, parse_table_name};
 pub fn parse_sql(input: &str) -> IResult<&str, SqlStatement> {
     let (input, _) = multispace0(input)?;
     let (input, stmt) = nom::branch::alt((
@@ -1003,9 +1003,9 @@ fn parse_values_alias(input: &str) -> IResult<&str, (String, Vec<String>)> {
 
 /// Parse an extra comma-separated FROM table (returns name and optional alias)
 fn parse_extra_from_table(input: &str) -> IResult<&str, (String, Option<String>)> {
-    let (input, tbl) = parse_identifier(input)?;
+    let (input, tbl) = parse_table_name(input)?;
     let (input, alias) = nom::combinator::opt(parse_table_alias)(input)?;
-    Ok((input, (tbl.to_string(), alias)))
+    Ok((input, (tbl, alias)))
 }
 
 /// Parse SELECT into a SelectStatement (used by both top-level and subqueries)
@@ -1052,9 +1052,9 @@ pub fn parse_select_statement(input: &str) -> IResult<&str, SelectStatement> {
                 (input, FromClause::Subquery(Box::new(subquery)), Some(alias.to_string()))
             }
         } else {
-            let (input, table) = parse_identifier(input)?;
+            let (input, table) = parse_table_name(input)?;
             let (input, from_alias) = nom::combinator::opt(parse_table_alias)(input)?;
-            (input, FromClause::Table(table.to_string()), from_alias)
+            (input, FromClause::Table(table), from_alias)
         }
     } else {
         // No FROM clause — use a sentinel table name so the rest of the machinery works
@@ -1633,11 +1633,11 @@ pub fn parse_join(input: &str) -> IResult<&str, JoinClause> {
         ))(input)?;
         let (input, _) = tag_no_case("JOIN")(input)?;
         let (input, _) = multispace1(input)?;
-        let (input, table) = parse_identifier(input)?;
+        let (input, table) = parse_table_name(input)?;
         let (input, alias) = nom::combinator::opt(parse_table_alias)(input)?;
         return Ok((input, JoinClause {
             join_type: JoinType::Natural,
-            table: table.to_string(),
+            table,
             alias,
             on: None,
             using: None,
@@ -1687,12 +1687,12 @@ pub fn parse_join(input: &str) -> IResult<&str, JoinClause> {
         }));
     }
 
-    let (input, table) = parse_identifier(input)?;
+    let (input, table) = parse_table_name(input)?;
     let (input, alias) = nom::combinator::opt(parse_table_alias)(input)?;
 
     // CROSS JOIN has no ON/USING clause
     if join_type == JoinType::Cross {
-        return Ok((input, JoinClause { join_type, table: table.to_string(), alias, on: None, using: None, lateral: None }));
+        return Ok((input, JoinClause { join_type, table, alias, on: None, using: None, lateral: None }));
     }
 
     // Try USING (col1, col2, ...)
@@ -1712,7 +1712,7 @@ pub fn parse_join(input: &str) -> IResult<&str, JoinClause> {
         let (input, _) = nom_char(')')(input)?;
         return Ok((input, JoinClause {
             join_type,
-            table: table.to_string(),
+            table,
             alias,
             on: None,
             using: Some(cols.iter().map(|s| s.to_string()).collect()),
@@ -1725,6 +1725,6 @@ pub fn parse_join(input: &str) -> IResult<&str, JoinClause> {
     let (input, _) = multispace1(input)?;
     let (input, condition) = parse_condition(input)?;
 
-    Ok((input, JoinClause { join_type, table: table.to_string(), alias, on: Some(condition), using: None, lateral: None }))
+    Ok((input, JoinClause { join_type, table, alias, on: Some(condition), using: None, lateral: None }))
 }
 

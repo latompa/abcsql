@@ -1669,3 +1669,18 @@ pub(crate) fn parse_identifier(input: &str) -> IResult<&str, &str> {
     )))(input)
 }
 
+/// Parse a table name, optionally schema-qualified (e.g. `information_schema.tables`).
+/// Returns the full name as a single owned String.
+pub(crate) fn parse_table_name(input: &str) -> IResult<&str, String> {
+    let (input, first) = parse_identifier(input)?;
+    let (input, qualifier) = nom::combinator::opt(nom::sequence::preceded(
+        nom::bytes::complete::tag("."),
+        parse_identifier,
+    ))(input)?;
+    let name = match qualifier {
+        Some(second) => format!("{}.{}", first, second),
+        None => first.to_string(),
+    };
+    Ok((input, name))
+}
+

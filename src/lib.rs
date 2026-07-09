@@ -184,6 +184,16 @@ fn lib_load_table<'a>(
         };
         return lib_materialize_select(&inner_stmt, storage, cte_map);
     }
+    // Check for information_schema metadata tables
+    if Storage::is_metadata_table(name) {
+        if let Some(rows) = storage.read_metadata_rows(name) {
+            if let Some(schema) = Storage::metadata_schema(name) {
+                let cols: LibCols = schema.columns.iter().map(|c| (name.to_string(), c.name.clone())).collect();
+                return Ok((cols, rows));
+            }
+        }
+        return Err(format!("Metadata table '{}' not found", name));
+    }
     let schema = storage.load_schema(name).map_err(|e| e.to_string())?;
     let rows = storage.read_rows(name).map_err(|e| e.to_string())?;
     let cols: LibCols = schema.columns.iter().map(|c| (name.to_string(), c.name.clone())).collect();
@@ -531,23 +541,32 @@ fn execute_select_to_string(
         return execute_select_to_string(&inner_stmt, storage);
     }
 
-    let from_schema = storage.load_schema(table_name).map_err(|e| e.to_string())?;
+    // Check for information_schema metadata tables
+    let (from_schema, from_rows) = if Storage::is_metadata_table(table_name) {
+        let schema = Storage::metadata_schema(table_name).ok_or_else(|| format!("Metadata table '{}' not found", table_name))?;
+        let rows = storage.read_metadata_rows(table_name).ok_or_else(|| format!("Metadata table '{}' not found", table_name))?;
+        (schema, rows)
+    } else {
+        let schema = storage.load_schema(table_name).map_err(|e| e.to_string())?;
 
-    // Try to use an index if WHERE is a simple column = literal equality
-    let from_rows = if let Some(ref wc) = stmt.where_clause {
-        let hint = if let parser::Condition::Comparison { left, operator: parser::Operator::Equals, right, .. } = &wc.condition {
-            match (left, right) {
-                (parser::Expression::Column(col), parser::Expression::Literal(val)) => Some((col.as_str(), val)),
-                (parser::Expression::Literal(val), parser::Expression::Column(col)) => Some((col.as_str(), val)),
-                _ => None,
-            }
-        } else {
-            None
-        };
-        if let Some((col, val)) = hint {
-            if let Ok(Some(idx_name)) = storage.find_index(table_name, col) {
-                if let Ok(Some(row_nums)) = storage.lookup_index(&idx_name, val) {
-                    storage.read_rows_by_numbers(table_name, &row_nums).map_err(|e| e.to_string())?
+        // Try to use an index if WHERE is a simple column = literal equality
+        let rows = if let Some(ref wc) = stmt.where_clause {
+            let hint = if let parser::Condition::Comparison { left, operator: parser::Operator::Equals, right, .. } = &wc.condition {
+                match (left, right) {
+                    (parser::Expression::Column(col), parser::Expression::Literal(val)) => Some((col.as_str(), val)),
+                    (parser::Expression::Literal(val), parser::Expression::Column(col)) => Some((col.as_str(), val)),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some((col, val)) = hint {
+                if let Ok(Some(idx_name)) = storage.find_index(table_name, col) {
+                    if let Ok(Some(row_nums)) = storage.lookup_index(&idx_name, val) {
+                        storage.read_rows_by_numbers(table_name, &row_nums).map_err(|e| e.to_string())?
+                    } else {
+                        storage.read_rows(table_name).map_err(|e| e.to_string())?
+                    }
                 } else {
                     storage.read_rows(table_name).map_err(|e| e.to_string())?
                 }
@@ -556,9 +575,8 @@ fn execute_select_to_string(
             }
         } else {
             storage.read_rows(table_name).map_err(|e| e.to_string())?
-        }
-    } else {
-        storage.read_rows(table_name).map_err(|e| e.to_string())?
+        };
+        (schema, rows)
     };
 
     let from_alias = stmt.from_alias.as_deref().unwrap_or(table_name);
@@ -643,8 +661,15 @@ fn execute_select_to_string(
             continue;
         }
 
-        let join_schema = storage.load_schema(&join.table).map_err(|e| e.to_string())?;
-        let join_rows = storage.read_rows(&join.table).map_err(|e| e.to_string())?;
+        let (join_schema, join_rows) = if Storage::is_metadata_table(&join.table) {
+            let schema = Storage::metadata_schema(&join.table).ok_or_else(|| format!("Metadata table '{}' not found", join.table))?;
+            let rows = storage.read_metadata_rows(&join.table).ok_or_else(|| format!("Metadata table '{}' not found", join.table))?;
+            (schema, rows)
+        } else {
+            let schema = storage.load_schema(&join.table).map_err(|e| e.to_string())?;
+            let rows = storage.read_rows(&join.table).map_err(|e| e.to_string())?;
+            (schema, rows)
+        };
         let join_alias = join.alias.as_deref().unwrap_or(&join.table);
         let join_cols: Vec<(String, String)> = join_schema.columns.iter()
             .map(|c| (join_alias.to_string(), c.name.clone()))

@@ -68,6 +68,28 @@ pub enum MergeAction {
 pub struct CreateTableStatement {
     pub table_name: String,
     pub columns: Vec<ColumnDefinition>,
+    pub constraints: Vec<TableConstraint>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct TableConstraint {
+    pub name: Option<String>,
+    pub kind: TableConstraintKind,
+    /// Raw SQL text of the whole constraint, preserved for schema file round-trips.
+    pub raw: String,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum TableConstraintKind {
+    PrimaryKey(Vec<String>),
+    Unique(Vec<String>),
+    ForeignKey {
+        columns: Vec<String>,
+        ref_table: String,
+        /// Empty means "the referenced table's PRIMARY KEY columns"
+        ref_columns: Vec<String>,
+    },
+    Check(Condition),
 }
 
 #[derive(Debug, PartialEq, Clone)]

@@ -1976,3 +1976,134 @@ fn test_default_null_explicit() {
     let r = with_db(&setup, "SELECT id FROM t WHERE x IS NULL");
     assert!(r.as_ref().unwrap().contains("1 rows"), "DEFAULT NULL failed: {:?}", r);
 }
+
+// ---- Table-level constraints ----
+
+#[test]
+fn test_table_constraint_parse() {
+    use abcsql::{parse_sql, SqlStatement, parser::TableConstraintKind};
+    let (_, stmt) = parse_sql("CREATE TABLE t (a INT, b INT, CONSTRAINT pk_ab PRIMARY KEY (a, b))").expect("parse failed");
+    if let SqlStatement::CreateTable(ct) = stmt {
+        assert_eq!(ct.columns.len(), 2);
+        assert_eq!(ct.constraints.len(), 1);
+        assert_eq!(ct.constraints[0].name.as_deref(), Some("pk_ab"));
+        assert!(matches!(&ct.constraints[0].kind, TableConstraintKind::PrimaryKey(c) if c == &vec!["a".to_string(), "b".to_string()]));
+    } else {
+        panic!("expected CreateTable");
+    }
+}
+
+#[test]
+fn test_composite_primary_key_uniqueness() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (a INT, b INT, PRIMARY KEY (a, b))").unwrap();
+    execute(&db.storage, "INSERT INTO t VALUES (1, 1)").unwrap();
+    // Same a, different b — allowed
+    execute(&db.storage, "INSERT INTO t VALUES (1, 2)").unwrap();
+    // Exact duplicate tuple — rejected
+    let r = execute(&db.storage, "INSERT INTO t VALUES (1, 1)");
+    assert!(r.is_err(), "expected composite PK violation");
+}
+
+#[test]
+fn test_composite_primary_key_not_null() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (a INT, b INT, PRIMARY KEY (a, b))").unwrap();
+    let r = execute(&db.storage, "INSERT INTO t VALUES (1, NULL)");
+    assert!(r.is_err(), "expected NOT NULL violation on composite PK part");
+}
+
+#[test]
+fn test_composite_unique_allows_nulls() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (a INT, b INT, UNIQUE (a, b))").unwrap();
+    execute(&db.storage, "INSERT INTO t VALUES (1, NULL)").unwrap();
+    // NULL-containing tuples never conflict
+    execute(&db.storage, "INSERT INTO t VALUES (1, NULL)").unwrap();
+    execute(&db.storage, "INSERT INTO t VALUES (2, 3)").unwrap();
+    let r = execute(&db.storage, "INSERT INTO t VALUES (2, 3)");
+    assert!(r.is_err(), "expected composite UNIQUE violation");
+}
+
+#[test]
+fn test_table_check_constraint() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (lo INT, hi INT, CHECK (lo < hi))").unwrap();
+    execute(&db.storage, "INSERT INTO t VALUES (1, 10)").unwrap();
+    let r = execute(&db.storage, "INSERT INTO t VALUES (10, 1)");
+    assert!(r.is_err(), "expected table CHECK violation on insert");
+    let r2 = execute(&db.storage, "UPDATE t SET hi = 0");
+    assert!(r2.is_err(), "expected table CHECK violation on update");
+}
+
+#[test]
+fn test_named_check_constraint() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (qty INT, CONSTRAINT positive_qty CHECK (qty > 0))").unwrap();
+    let r = execute(&db.storage, "INSERT INTO t VALUES (-5)");
+    assert!(r.is_err(), "expected named CHECK violation");
+}
+
+#[test]
+fn test_composite_foreign_key() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE parent (a INT, b INT, PRIMARY KEY (a, b))").unwrap();
+    execute(&db.storage, "INSERT INTO parent VALUES (1, 2)").unwrap();
+    execute(&db.storage, "CREATE TABLE child (x INT, y INT, FOREIGN KEY (x, y) REFERENCES parent (a, b))").unwrap();
+    execute(&db.storage, "INSERT INTO child VALUES (1, 2)").unwrap();
+    let r = execute(&db.storage, "INSERT INTO child VALUES (1, 3)");
+    assert!(r.is_err(), "expected composite FK violation");
+    // NULL part exempts the tuple
+    execute(&db.storage, "INSERT INTO child VALUES (1, NULL)").unwrap();
+}
+
+#[test]
+fn test_foreign_key_defaults_to_referenced_pk() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE parent (a INT, b INT, PRIMARY KEY (a, b))").unwrap();
+    execute(&db.storage, "INSERT INTO parent VALUES (7, 8)").unwrap();
+    execute(&db.storage, "CREATE TABLE child (x INT, y INT, FOREIGN KEY (x, y) REFERENCES parent)").unwrap();
+    execute(&db.storage, "INSERT INTO child VALUES (7, 8)").unwrap();
+    let r = execute(&db.storage, "INSERT INTO child VALUES (9, 9)");
+    assert!(r.is_err(), "expected FK-to-PK violation");
+}
+
+#[test]
+fn test_table_constraint_survives_reload() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (a INT, b INT, CONSTRAINT u_ab UNIQUE (a, b))").unwrap();
+    execute(&db.storage, "INSERT INTO t VALUES (1, 2)").unwrap();
+    // load_schema re-reads the file per statement, exercising the !TC= round-trip
+    let r = execute(&db.storage, "INSERT INTO t VALUES (1, 2)");
+    assert!(r.is_err(), "constraint lost after schema reload");
+}
+
+#[test]
+fn test_named_constraint_in_information_schema() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (a INT, b INT, CONSTRAINT pk_ab PRIMARY KEY (a, b))").unwrap();
+    let r = execute(&db.storage, "SELECT constraint_name FROM information_schema.table_constraints WHERE constraint_name = 'pk_ab'").unwrap();
+    assert!(r.contains("1 rows"), "named constraint missing from metadata: {}", r);
+}
+
+#[test]
+fn test_drop_column_removes_its_constraints() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (a INT, b INT, UNIQUE (a, b))").unwrap();
+    execute(&db.storage, "INSERT INTO t VALUES (1, 2)").unwrap();
+    execute(&db.storage, "ALTER TABLE t DROP COLUMN b").unwrap();
+    // Constraint referencing b is gone, so duplicate a values are fine
+    execute(&db.storage, "INSERT INTO t VALUES (1)").unwrap();
+    let r = execute(&db.storage, "SELECT a FROM t WHERE a = 1").unwrap();
+    assert!(r.contains("2 rows"));
+}
+
+#[test]
+fn test_on_conflict_do_nothing_with_composite_unique() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (a INT, b INT, UNIQUE (a, b))").unwrap();
+    execute(&db.storage, "INSERT INTO t VALUES (1, 2)").unwrap();
+    execute(&db.storage, "INSERT INTO t VALUES (1, 2) ON CONFLICT DO NOTHING").unwrap();
+    let r = execute(&db.storage, "SELECT a FROM t").unwrap();
+    assert!(r.contains("1 rows"), "DO NOTHING should skip composite conflict: {}", r);
+}

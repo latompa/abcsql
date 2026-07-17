@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::fmt;
 use std::collections::HashMap;
 use regex::Regex;
-use crate::parser::{CreateTableStatement, CreateIndexStatement, CreateFunctionStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, InsertSource, OnConflict, UpdateStatement, DeleteStatement, TruncateStatement, MergeStatement, MergeSource, MergeAction, AlterTableStatement, AlterAction, Value, Condition, Expression, Operator, ArithOp, SelectStatement, SelectColumn, FromClause, apply_scalar_func, apply_round, apply_concat, apply_substr, apply_replace, apply_lpad, apply_rpad, apply_cast, apply_greatest, apply_least, apply_power, apply_position, apply_repeat, apply_json_typeof, apply_json_array_length, apply_json_build_object, apply_json_build_array};
+use crate::parser::{CreateTableStatement, CreateIndexStatement, CreateFunctionStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, InsertSource, OnConflict, UpdateStatement, DeleteStatement, TruncateStatement, MergeStatement, MergeSource, MergeAction, AlterTableStatement, AlterAction, Value, Condition, Expression, Operator, ArithOp, SelectStatement, SelectColumn, FromClause, TableConstraint, TableConstraintKind, apply_scalar_func, apply_round, apply_concat, apply_substr, apply_replace, apply_lpad, apply_rpad, apply_cast, apply_greatest, apply_least, apply_power, apply_position, apply_repeat, apply_json_typeof, apply_json_array_length, apply_json_build_object, apply_json_build_array};
 
 /// Before-image snapshot for a single transaction
 struct TransactionState {
@@ -233,7 +233,23 @@ impl Storage {
         let seq_path = self.seq_path(&stmt.table_name);
         self.snapshot_before_write(&seq_path);
 
-        self.write_schema_file(&stmt.table_name, &stmt.columns)?;
+        // Validate that table constraints reference known columns
+        for tc in &stmt.constraints {
+            let cols: &[String] = match &tc.kind {
+                TableConstraintKind::PrimaryKey(c) | TableConstraintKind::Unique(c) => c,
+                TableConstraintKind::ForeignKey { columns, .. } => columns,
+                TableConstraintKind::Check(_) => &[],
+            };
+            for col in cols {
+                if !stmt.columns.iter().any(|c| c.name.eq_ignore_ascii_case(col)) {
+                    return Err(StorageError::InvalidSchema(
+                        format!("constraint references unknown column '{}'", col)
+                    ));
+                }
+            }
+        }
+
+        self.write_schema_file(&stmt.table_name, &stmt.columns, &stmt.constraints)?;
 
         // Create empty data file
         fs::File::create(&data_path)?;
@@ -247,7 +263,7 @@ impl Storage {
     }
 
     /// Write (or overwrite) a schema file for a table
-    fn write_schema_file(&self, table_name: &str, columns: &[ColumnDefinition]) -> Result<(), StorageError> {
+    fn write_schema_file(&self, table_name: &str, columns: &[ColumnDefinition], constraints: &[TableConstraint]) -> Result<(), StorageError> {
         let schema_path = self.schema_path(table_name);
         self.snapshot_before_write(&schema_path);
         let mut file = fs::File::create(schema_path)?;
@@ -277,8 +293,33 @@ impl Storage {
             if let Some(ref df) = default_str { parts.push(df); }
             writeln!(file, "{}", parts.join(":"))?;
         }
+        for tc in constraints {
+            let escaped = tc.raw.replace('\\', "\\\\").replace('\n', " ");
+            writeln!(file, "!TC={}", escaped)?;
+        }
         Ok(())
     }
+
+/// Regenerate the SQL text of a table constraint from its parsed form.
+/// CHECK constraints keep their original text since the condition isn't re-serialized.
+fn constraint_to_sql(tc: &TableConstraint) -> String {
+    let body = match &tc.kind {
+        TableConstraintKind::PrimaryKey(c) => format!("PRIMARY KEY ({})", c.join(", ")),
+        TableConstraintKind::Unique(c) => format!("UNIQUE ({})", c.join(", ")),
+        TableConstraintKind::ForeignKey { columns, ref_table, ref_columns } => {
+            if ref_columns.is_empty() {
+                format!("FOREIGN KEY ({}) REFERENCES {}", columns.join(", "), ref_table)
+            } else {
+                format!("FOREIGN KEY ({}) REFERENCES {} ({})", columns.join(", "), ref_table, ref_columns.join(", "))
+            }
+        }
+        TableConstraintKind::Check(_) => return tc.raw.clone(),
+    };
+    match &tc.name {
+        Some(n) => format!("CONSTRAINT {} {}", n, body),
+        None => body,
+    }
+}
 
 /// Decode a CHECK constraint text that was escaped for schema file storage.
 fn decode_check_text(text: &str) -> String {
@@ -462,6 +503,50 @@ fn decode_check_text(text: &str) -> String {
             }
         }
 
+        // Enforce table-level PRIMARY KEY / UNIQUE constraints (composite keys)
+        for tc in &schema.constraints {
+            let (cols, is_pk) = match &tc.kind {
+                TableConstraintKind::PrimaryKey(c) => (c, true),
+                TableConstraintKind::Unique(c) => (c, false),
+                _ => continue,
+            };
+            let idxs: Vec<usize> = cols.iter()
+                .filter_map(|c| schema.columns.iter().position(|col| col.name.eq_ignore_ascii_case(c)))
+                .collect();
+            if idxs.len() != cols.len() { continue; }
+
+            if is_pk {
+                for &i in &idxs {
+                    if final_values[i] == Value::Null {
+                        return Err(StorageError::NullConstraint { column: schema.columns[i].name.clone() });
+                    }
+                }
+            } else if idxs.iter().any(|&i| final_values[i] == Value::Null) {
+                // UNIQUE tuples containing NULL never conflict
+                continue;
+            }
+
+            let existing_rows = self.read_rows(table_name)?;
+            for row in &existing_rows {
+                if idxs.iter().all(|&i| row[i] == final_values[i]) {
+                    match on_conflict {
+                        Some(OnConflict::DoNothing) => return Ok(None),
+                        Some(OnConflict::DoUpdate { assignments, .. }) => {
+                            return self.apply_conflict_update(table_name, schema, &final_values, assignments);
+                        }
+                        None => {
+                            let key = tc.name.clone().unwrap_or_else(|| cols.join(", "));
+                            let vals: Vec<String> = idxs.iter().map(|&i| format!("{:?}", final_values[i])).collect();
+                            return Err(StorageError::DuplicateKey {
+                                column: key,
+                                value: vals.join(", "),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         // Check unique index constraints
         if let Err(e) = self.check_unique_indexes_conflict(table_name, &final_values, on_conflict, schema) {
             return Err(e);
@@ -476,6 +561,13 @@ fn decode_check_text(text: &str) -> String {
             }
         }
 
+        // Enforce table-level FOREIGN KEY constraints (composite references)
+        for tc in &schema.constraints {
+            if let TableConstraintKind::ForeignKey { columns, ref_table, ref_columns } = &tc.kind {
+                self.validate_composite_foreign_key(&final_values, schema, columns, ref_table, ref_columns)?;
+            }
+        }
+
         // Enforce CHECK constraints
         for (_i, col_def) in schema.columns.iter().enumerate() {
             if let Some(ref check) = col_def.check_constraint {
@@ -483,6 +575,18 @@ fn decode_check_text(text: &str) -> String {
                     return Err(StorageError::CheckConstraintViolation {
                         column: col_def.name.clone(),
                         reason: format!("CHECK constraint failed: {:?}", check),
+                    });
+                }
+            }
+        }
+
+        // Enforce table-level CHECK constraints
+        for tc in &schema.constraints {
+            if let TableConstraintKind::Check(cond) = &tc.kind {
+                if !evaluate_condition(cond, &final_values, &schema.columns, self) {
+                    return Err(StorageError::CheckConstraintViolation {
+                        column: tc.name.clone().unwrap_or_else(|| "table check".to_string()),
+                        reason: format!("CHECK constraint failed: {}", tc.raw),
                     });
                 }
             }
@@ -697,6 +801,16 @@ fn decode_check_text(text: &str) -> String {
                         return Err(StorageError::CheckConstraintViolation {
                             column: col_def.name.clone(),
                             reason: format!("CHECK constraint failed: {:?}", check),
+                        });
+                    }
+                }
+            }
+            for tc in &schema.constraints {
+                if let TableConstraintKind::Check(cond) = &tc.kind {
+                    if !evaluate_condition(cond, row, &schema.columns, self) {
+                        return Err(StorageError::CheckConstraintViolation {
+                            column: tc.name.clone().unwrap_or_else(|| "table check".to_string()),
+                            reason: format!("CHECK constraint failed: {}", tc.raw),
                         });
                     }
                 }
@@ -1056,11 +1170,23 @@ fn decode_check_text(text: &str) -> String {
             ));
         }
 
-        // Parse column definitions
+        // Parse column definitions and table-level constraints
         let mut columns = Vec::new();
+        let mut constraints = Vec::new();
         for line in lines {
             let line = line.trim();
             if line.is_empty() {
+                continue;
+            }
+
+            if let Some(rest) = line.strip_prefix("!TC=") {
+                let raw = Self::decode_check_text(rest);
+                match crate::parser::parse_table_constraint(&raw) {
+                    Ok((_, tc)) => constraints.push(tc),
+                    Err(_) => return Err(StorageError::InvalidSchema(
+                        format!("Invalid table constraint: {}", raw)
+                    )),
+                }
                 continue;
             }
 
@@ -1133,6 +1259,7 @@ fn decode_check_text(text: &str) -> String {
 
         Ok(CreateTableStatement {
             table_name: table_name.to_string(),
+            constraints,
             columns,
         })
     }
@@ -1265,7 +1392,7 @@ fn decode_check_text(text: &str) -> String {
         }
         writer.flush()?;
 
-        self.write_schema_file(&schema.table_name, &new_columns)?;
+        self.write_schema_file(&schema.table_name, &new_columns, &schema.constraints)?;
 
         // Initialize sequence file if this is the first auto_increment column
         if col.auto_increment && !schema.columns.iter().any(|c| c.auto_increment) {
@@ -1333,7 +1460,19 @@ fn decode_check_text(text: &str) -> String {
             .filter(|c| c.name != col_name)
             .cloned()
             .collect();
-        self.write_schema_file(&schema.table_name, &new_columns)?;
+        // Drop table constraints that reference the removed column
+        let kept_constraints: Vec<TableConstraint> = schema.constraints.iter()
+            .filter(|tc| {
+                let cols: &[String] = match &tc.kind {
+                    TableConstraintKind::PrimaryKey(c) | TableConstraintKind::Unique(c) => c,
+                    TableConstraintKind::ForeignKey { columns, .. } => columns,
+                    TableConstraintKind::Check(_) => return true,
+                };
+                !cols.iter().any(|c| c.eq_ignore_ascii_case(col_name))
+            })
+            .cloned()
+            .collect();
+        self.write_schema_file(&schema.table_name, &new_columns, &kept_constraints)?;
 
         // Remove sequence file if no auto_increment columns remain
         let dropped_col = &schema.columns[col_idx];
@@ -1369,7 +1508,26 @@ fn decode_check_text(text: &str) -> String {
                 c.clone()
             })
             .collect();
-        self.write_schema_file(&schema.table_name, &new_columns)?;
+        // Rewrite column names inside table constraints (raw text is regenerated
+        // from the parsed form so the schema file stays consistent)
+        let renamed_constraints: Vec<TableConstraint> = schema.constraints.iter()
+            .map(|tc| {
+                let mut tc = tc.clone();
+                let rename = |cols: &mut Vec<String>| {
+                    for c in cols.iter_mut() {
+                        if c.eq_ignore_ascii_case(from) { *c = to.to_string(); }
+                    }
+                };
+                match &mut tc.kind {
+                    TableConstraintKind::PrimaryKey(c) | TableConstraintKind::Unique(c) => rename(c),
+                    TableConstraintKind::ForeignKey { columns, .. } => rename(columns),
+                    TableConstraintKind::Check(_) => {}
+                }
+                tc.raw = Self::constraint_to_sql(&tc);
+                tc
+            })
+            .collect();
+        self.write_schema_file(&schema.table_name, &new_columns, &renamed_constraints)?;
 
         // Update FK references in other tables
         let tables = self.list_tables().map_err(StorageError::IoError)?;
@@ -1394,7 +1552,7 @@ fn decode_check_text(text: &str) -> String {
                 })
                 .collect();
             if changed {
-                self.write_schema_file(t, &updated)?;
+                self.write_schema_file(t, &updated, &other.constraints)?;
             }
         }
 
@@ -1439,7 +1597,7 @@ fn decode_check_text(text: &str) -> String {
 
         // Rewrite schema with new table name (first line) at the new path
         let schema = self.load_schema(old_name)?;
-        self.write_schema_file(new_name, &schema.columns)?;
+        self.write_schema_file(new_name, &schema.columns, &schema.constraints)?;
         fs::remove_file(&old_schema)?;
 
         // Rename data file
@@ -1485,7 +1643,7 @@ fn decode_check_text(text: &str) -> String {
                 })
                 .collect();
             if changed {
-                self.write_schema_file(t, &updated_cols)?;
+                self.write_schema_file(t, &updated_cols, &other.constraints)?;
             }
         }
 
@@ -1696,6 +1854,61 @@ fn decode_check_text(text: &str) -> String {
     }
 
     /// Check that a value exists in the referenced table's column
+    /// Validate a table-level FOREIGN KEY: the tuple of values must exist in the
+    /// referenced table. Empty ref_columns means the referenced table's PRIMARY KEY.
+    fn validate_composite_foreign_key(
+        &self,
+        values: &[Value],
+        schema: &CreateTableStatement,
+        columns: &[String],
+        ref_table: &str,
+        ref_columns: &[String],
+    ) -> Result<(), StorageError> {
+        let idxs: Vec<usize> = columns.iter()
+            .filter_map(|c| schema.columns.iter().position(|col| col.name.eq_ignore_ascii_case(c)))
+            .collect();
+        if idxs.len() != columns.len() { return Ok(()); }
+        // Tuples containing NULL are exempt (spec MATCH SIMPLE behaviour)
+        if idxs.iter().any(|&i| values[i] == Value::Null) { return Ok(()); }
+
+        let ref_schema = self.load_schema(ref_table)?;
+        let ref_cols: Vec<String> = if ref_columns.is_empty() {
+            let mut pk: Vec<String> = ref_schema.columns.iter()
+                .filter(|c| c.primary_key)
+                .map(|c| c.name.clone())
+                .collect();
+            for tc in &ref_schema.constraints {
+                if let TableConstraintKind::PrimaryKey(cols) = &tc.kind {
+                    pk = cols.clone();
+                }
+            }
+            pk
+        } else {
+            ref_columns.to_vec()
+        };
+        let ref_idxs: Vec<usize> = ref_cols.iter()
+            .filter_map(|c| ref_schema.columns.iter().position(|col| col.name.eq_ignore_ascii_case(c)))
+            .collect();
+        if ref_idxs.len() != idxs.len() {
+            return Err(StorageError::InvalidSchema(
+                format!("FOREIGN KEY column count mismatch referencing {}", ref_table)
+            ));
+        }
+
+        let ref_rows = self.read_rows(ref_table)?;
+        let exists = ref_rows.iter().any(|row| {
+            idxs.iter().zip(ref_idxs.iter()).all(|(&i, &ri)| row[ri] == values[i])
+        });
+        if !exists {
+            return Err(StorageError::ForeignKeyViolation {
+                column: columns.join(", "),
+                ref_table: ref_table.to_string(),
+                ref_column: ref_cols.join(", "),
+            });
+        }
+        Ok(())
+    }
+
     fn validate_foreign_key(&self, value: &Value, fk: &ForeignKeyRef, col_name: &str) -> Result<(), StorageError> {
         let ref_schema = self.load_schema(&fk.table)?;
         let ref_col_idx = ref_schema.columns.iter()
@@ -3438,7 +3651,7 @@ impl Storage {
             ],
             _ => return None,
         };
-        Some(CreateTableStatement { table_name: name.to_string(), columns })
+        Some(CreateTableStatement { table_name: name.to_string(), columns, constraints: vec![] })
     }
 
     /// Generate synthetic rows for a metadata table by querying live storage state.
@@ -3573,6 +3786,24 @@ impl Storage {
                                     Value::String("public".into()),
                                     Value::String(t.clone()),
                                     Value::String("FOREIGN KEY".into()),
+                                ]);
+                            }
+                            for (i, tc) in schema.constraints.iter().enumerate() {
+                                let kind = match &tc.kind {
+                                    TableConstraintKind::PrimaryKey(_) => "PRIMARY KEY",
+                                    TableConstraintKind::Unique(_) => "UNIQUE",
+                                    TableConstraintKind::ForeignKey { .. } => "FOREIGN KEY",
+                                    TableConstraintKind::Check(_) => "CHECK",
+                                };
+                                let constraint_name = tc.name.clone()
+                                    .unwrap_or_else(|| format!("{}_constraint_{}", t, i + 1));
+                                rows.push(vec![
+                                    Value::String("default".into()),
+                                    Value::String("public".into()),
+                                    Value::String(constraint_name),
+                                    Value::String("public".into()),
+                                    Value::String(t.clone()),
+                                    Value::String(kind.into()),
                                 ]);
                             }
                             let has_ck = schema.columns.iter().any(|c| c.check_constraint.is_some());
@@ -3726,6 +3957,7 @@ mod tests {
 
         let stmt = CreateTableStatement {
             table_name: "users".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition::new("name", DataType::Varchar(Some(255))),
@@ -3749,6 +3981,7 @@ mod tests {
 
         let stmt = CreateTableStatement {
             table_name: "users".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
             ],
@@ -3772,6 +4005,7 @@ mod tests {
 
         let stmt = CreateTableStatement {
             table_name: "products".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition::new("name", DataType::Varchar(Some(100))),
@@ -3800,6 +4034,7 @@ mod tests {
 
         let users = CreateTableStatement {
             table_name: "users".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
             ],
@@ -3807,6 +4042,7 @@ mod tests {
 
         let orders = CreateTableStatement {
             table_name: "orders".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
             ],
@@ -3832,6 +4068,7 @@ mod tests {
 
         let stmt = CreateTableStatement {
             table_name: "temp_table".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
             ],
@@ -3856,6 +4093,7 @@ mod tests {
         // Create table
         let create_stmt = CreateTableStatement {
             table_name: "users".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition::new("name", DataType::Varchar(Some(255))),
@@ -3920,6 +4158,7 @@ mod tests {
 
         let create_stmt = CreateTableStatement {
             table_name: "products".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition::new("name", DataType::Varchar(Some(100))),
@@ -3958,6 +4197,7 @@ mod tests {
 
         let create_stmt = CreateTableStatement {
             table_name: "test".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition::new("name", DataType::Varchar(Some(255))),
@@ -3990,6 +4230,7 @@ mod tests {
 
         let create_stmt = CreateTableStatement {
             table_name: "test".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition::new("name", DataType::Varchar(Some(255))),
@@ -4057,6 +4298,7 @@ mod tests {
         // Create table and insert data
         let create_stmt = CreateTableStatement {
             table_name: "users".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition::new("name", DataType::Varchar(Some(255))),
@@ -4122,6 +4364,7 @@ mod tests {
 
         let create_stmt = CreateTableStatement {
             table_name: "users".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition::new("active", DataType::Int),
@@ -4182,6 +4425,7 @@ mod tests {
 
         let create_stmt = CreateTableStatement {
             table_name: "users".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition::new("status", DataType::Varchar(None)),
@@ -4235,6 +4479,7 @@ mod tests {
 
         let create_stmt = CreateTableStatement {
             table_name: "users".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
             ],
@@ -4289,6 +4534,7 @@ mod tests {
 
         let create_stmt = CreateTableStatement {
             table_name: "users".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
             ],
@@ -4323,6 +4569,7 @@ mod tests {
 
         let create_stmt = CreateTableStatement {
             table_name: "users".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
             ],
@@ -4358,6 +4605,7 @@ mod tests {
 
         let create_stmt = CreateTableStatement {
             table_name: "users".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition::new("name", DataType::Varchar(Some(255))),
@@ -4414,6 +4662,7 @@ mod tests {
 
         let create_stmt = CreateTableStatement {
             table_name: "users".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition::new("active", DataType::Int),
@@ -4472,6 +4721,7 @@ mod tests {
 
         let create_stmt = CreateTableStatement {
             table_name: "users".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
             ],
@@ -4518,6 +4768,7 @@ mod tests {
 
         let create_stmt = CreateTableStatement {
             table_name: "users".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
             ],
@@ -4586,6 +4837,7 @@ mod tests {
 
         let create = CreateTableStatement {
             table_name: "events".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("name", DataType::Varchar(None)),
                 ColumnDefinition::new("event_date", DataType::Date),
@@ -4629,6 +4881,7 @@ mod tests {
 
         let create = CreateTableStatement {
             table_name: "logs".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("msg", DataType::Varchar(None)),
                 ColumnDefinition::new("created_at", DataType::Timestamp),
@@ -4671,6 +4924,7 @@ mod tests {
 
         let create = CreateTableStatement {
             table_name: "users".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: true, primary_key: false, not_null: false, unique: false, references: None , check_constraint: None, check_constraint_text: None, default: None, default_text: None },
                 ColumnDefinition::new("name", DataType::Varchar(None)),
@@ -4727,6 +4981,7 @@ mod tests {
 
         let create = CreateTableStatement {
             table_name: "users".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, unique: false, references: None , check_constraint: None, check_constraint_text: None, default: None, default_text: None },
                 ColumnDefinition::new("name", DataType::Varchar(None)),
@@ -4776,6 +5031,7 @@ mod tests {
 
         let create = CreateTableStatement {
             table_name: "users".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, unique: false, references: None , check_constraint: None, check_constraint_text: None, default: None, default_text: None },
                 ColumnDefinition::new("name", DataType::Varchar(None)),
@@ -4805,6 +5061,7 @@ mod tests {
         // Parent table
         let create_users = CreateTableStatement {
             table_name: "users".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, unique: false, references: None , check_constraint: None, check_constraint_text: None, default: None, default_text: None },
                 ColumnDefinition::new("name", DataType::Varchar(None)),
@@ -4823,6 +5080,7 @@ mod tests {
         // Child table with FK
         let create_orders = CreateTableStatement {
             table_name: "orders".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition { name: "user_id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: false, not_null: false, unique: false,
@@ -4863,6 +5121,7 @@ mod tests {
         // Parent table
         let create_users = CreateTableStatement {
             table_name: "users".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, unique: false, references: None , check_constraint: None, check_constraint_text: None, default: None, default_text: None },
                 ColumnDefinition::new("name", DataType::Varchar(None)),
@@ -4889,6 +5148,7 @@ mod tests {
         // Child table with FK
         let create_orders = CreateTableStatement {
             table_name: "orders".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition { name: "user_id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: false, not_null: false, unique: false,
@@ -4945,6 +5205,7 @@ mod tests {
 
         let create = CreateTableStatement {
             table_name: "users".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition { name: "name".to_string(), data_type: DataType::Varchar(None),
@@ -4984,6 +5245,7 @@ mod tests {
 
         let create = CreateTableStatement {
             table_name: "users".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition { name: "email".to_string(), data_type: DataType::Varchar(None),
@@ -5040,6 +5302,7 @@ mod tests {
 
         let create = CreateTableStatement {
             table_name: "users".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition::new("name", DataType::Varchar(None)),
@@ -5108,6 +5371,7 @@ mod tests {
 
         let create = CreateTableStatement {
             table_name: "users".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition::new("name", DataType::Varchar(None)),
@@ -5156,6 +5420,7 @@ mod tests {
 
         let create = CreateTableStatement {
             table_name: "users".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition::new("name", DataType::Varchar(None)),
@@ -5219,6 +5484,7 @@ mod tests {
 
         let create = CreateTableStatement {
             table_name: "users".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition::new("name", DataType::Varchar(None)),
@@ -5254,6 +5520,7 @@ mod tests {
 
         let create = CreateTableStatement {
             table_name: "users".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition::new("name", DataType::Varchar(None)),
@@ -5287,6 +5554,7 @@ mod tests {
 
         let create = CreateTableStatement {
             table_name: "users".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition::new("name", DataType::Varchar(None)),
@@ -5335,6 +5603,7 @@ mod tests {
 
         let create = CreateTableStatement {
             table_name: "users".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition::new("email", DataType::Varchar(None)),
@@ -5400,6 +5669,7 @@ mod tests {
 
         let create = CreateTableStatement {
             table_name: "users".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition::new("name", DataType::Varchar(None)),
@@ -5444,6 +5714,7 @@ mod tests {
 
         storage.create_table(&CreateTableStatement {
             table_name: "users".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition::new("name", DataType::Varchar(None)),
@@ -5484,6 +5755,7 @@ mod tests {
 
         storage.create_table(&CreateTableStatement {
             table_name: "t".to_string(),
+            constraints: vec![],
             columns: vec![ColumnDefinition::new("id", DataType::Int)],
         }).unwrap();
         storage.insert_row(&InsertStatement {
@@ -5514,6 +5786,7 @@ mod tests {
 
         storage.create_table(&CreateTableStatement {
             table_name: "users".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition::new("name", DataType::Varchar(None)),
@@ -5555,6 +5828,7 @@ mod tests {
         id_col.primary_key = true;
         storage.create_table(&CreateTableStatement {
             table_name: "users".to_string(),
+            constraints: vec![],
             columns: vec![id_col],
         }).unwrap();
 
@@ -5562,6 +5836,7 @@ mod tests {
         fk_col.references = Some(ForeignKeyRef { table: "users".to_string(), column: "id".to_string() });
         storage.create_table(&CreateTableStatement {
             table_name: "orders".to_string(),
+            constraints: vec![],
             columns: vec![ColumnDefinition::new("oid", DataType::Int), fk_col],
         }).unwrap();
 
@@ -5584,6 +5859,7 @@ mod tests {
         id_col.primary_key = true;
         storage.create_table(&CreateTableStatement {
             table_name: "users".to_string(),
+            constraints: vec![],
             columns: vec![id_col],
         }).unwrap();
 
@@ -5591,6 +5867,7 @@ mod tests {
         fk_col.references = Some(ForeignKeyRef { table: "users".to_string(), column: "id".to_string() });
         storage.create_table(&CreateTableStatement {
             table_name: "orders".to_string(),
+            constraints: vec![],
             columns: vec![ColumnDefinition::new("oid", DataType::Int), fk_col],
         }).unwrap();
 
@@ -5617,6 +5894,7 @@ mod tests {
 
         storage.create_table(&CreateTableStatement {
             table_name: "users".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition::new("name", DataType::Varchar(None)),
@@ -5654,6 +5932,7 @@ mod tests {
 
         storage.create_table(&CreateTableStatement {
             table_name: "users".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition::new("email", DataType::Varchar(None)),
@@ -5684,6 +5963,7 @@ mod tests {
 
         storage.create_table(&CreateTableStatement {
             table_name: "users".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition::new("email", DataType::Varchar(None)),
@@ -5761,6 +6041,7 @@ mod tests {
     fn make_users_table(storage: &Storage) {
         let stmt = CreateTableStatement {
             table_name: "users".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition::new("name", DataType::Varchar(None)),
@@ -5924,6 +6205,7 @@ mod tests {
         // Create table with auto-increment id
         let stmt = CreateTableStatement {
             table_name: "items".to_string(),
+            constraints: vec![],
             columns: vec![{
                 let mut c = ColumnDefinition::new("id", DataType::Int);
                 c.auto_increment = true;
@@ -6026,6 +6308,7 @@ mod tests {
         let storage = Storage::new(&temp_dir).unwrap();
         let stmt = CreateTableStatement {
             table_name: "things".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition::new("id", DataType::BigInt),
                 ColumnDefinition::new("data", DataType::Json),
@@ -6048,6 +6331,7 @@ mod tests {
         // Create table with a CHECK constraint
         let create = CreateTableStatement {
             table_name: "products".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
                 ColumnDefinition { name: "price".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: Some(crate::parser::parse_condition("price > 0").unwrap().1), check_constraint_text: Some("price > 0".to_string()), default: None, default_text: None },
@@ -6079,6 +6363,7 @@ mod tests {
 
         let create = CreateTableStatement {
             table_name: "products".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
                 ColumnDefinition { name: "price".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: Some(crate::parser::parse_condition("price > 0").unwrap().1), check_constraint_text: Some("price > 0".to_string()), default: None, default_text: None },
@@ -6111,6 +6396,7 @@ mod tests {
 
         let create = CreateTableStatement {
             table_name: "products".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
                 ColumnDefinition { name: "price".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: Some(crate::parser::parse_condition("price > 0").unwrap().1), check_constraint_text: Some("price > 0".to_string()), default: None, default_text: None },
@@ -6152,6 +6438,7 @@ mod tests {
 
         let create = CreateTableStatement {
             table_name: "items".to_string(),
+            constraints: vec![],
             columns: vec![
                 ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
                 ColumnDefinition { name: "qty".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: Some(crate::parser::parse_condition("qty >= 0 AND qty < 1000").unwrap().1), check_constraint_text: Some("qty >= 0 AND qty < 1000".to_string()), default: None, default_text: None },

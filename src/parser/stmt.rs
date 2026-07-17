@@ -107,23 +107,97 @@ fn parse_create_view_inner(input: &str) -> IResult<&str, SqlStatement> {
     })))
 }
 
+enum TableItem {
+    Col(ColumnDefinition),
+    Constraint(TableConstraint),
+}
+
 fn parse_create_table_inner(input: &str) -> IResult<&str, SqlStatement> {
     let (input, _) = tag_no_case("TABLE")(input)?;
     let (input, _) = multispace1(input)?;
     let (input, table_name) = parse_identifier(input)?;
     let (input, _) = multispace0(input)?;
-    let (input, columns) = delimited(
+    let (input, items) = delimited(
         nom_char('('),
-        separated_list0(nom_char(','), parse_column_definition),
+        separated_list0(nom_char(','), nom::branch::alt((
+            nom::combinator::map(parse_table_constraint, TableItem::Constraint),
+            nom::combinator::map(parse_column_definition, TableItem::Col),
+        ))),
         nom_char(')'),
     )(input)?;
     let (input, _) = multispace0(input)?;
     let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
 
+    let mut columns = Vec::new();
+    let mut constraints = Vec::new();
+    for item in items {
+        match item {
+            TableItem::Col(c) => columns.push(c),
+            TableItem::Constraint(tc) => constraints.push(tc),
+        }
+    }
+
     Ok((input, SqlStatement::CreateTable(CreateTableStatement {
         table_name: table_name.to_string(),
         columns,
+        constraints,
     })))
+}
+
+/// Parse (col1, col2, ...) — a parenthesized column name list
+fn parse_paren_column_list(input: &str) -> IResult<&str, Vec<String>> {
+    let (input, _) = multispace0(input)?;
+    let (input, cols) = delimited(
+        nom_char('('),
+        nom::multi::separated_list1(
+            nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+            nom::sequence::preceded(multispace0, parse_identifier),
+        ),
+        nom::sequence::preceded(multispace0, nom_char(')')),
+    )(input)?;
+    Ok((input, cols.into_iter().map(|s| s.to_string()).collect()))
+}
+
+/// Parse a table-level constraint: [CONSTRAINT name] PRIMARY KEY (...) | UNIQUE (...)
+/// | FOREIGN KEY (...) REFERENCES t [(...)] | CHECK (...)
+pub fn parse_table_constraint(input: &str) -> IResult<&str, TableConstraint> {
+    let (input, _) = multispace0(input)?;
+    let raw_start = input;
+    let (input, name) = nom::combinator::opt(|i| {
+        let (i, _) = tag_no_case("CONSTRAINT")(i)?;
+        let (i, _) = multispace1(i)?;
+        let (i, n) = parse_identifier(i)?;
+        let (i, _) = multispace1(i)?;
+        Ok((i, n.to_string()))
+    })(input)?;
+
+    let (input, kind) = if let Ok((i, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("PRIMARY KEY")(input) {
+        let (i, cols) = parse_paren_column_list(i)?;
+        (i, TableConstraintKind::PrimaryKey(cols))
+    } else if let Ok((i, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("UNIQUE")(input) {
+        let (i, cols) = parse_paren_column_list(i)?;
+        (i, TableConstraintKind::Unique(cols))
+    } else if let Ok((i, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("FOREIGN KEY")(input) {
+        let (i, cols) = parse_paren_column_list(i)?;
+        let (i, _) = multispace0(i)?;
+        let (i, _) = tag_no_case("REFERENCES")(i)?;
+        let (i, _) = multispace1(i)?;
+        let (i, ref_table) = parse_identifier(i)?;
+        let (i, ref_cols) = nom::combinator::opt(parse_paren_column_list)(i)?;
+        (i, TableConstraintKind::ForeignKey {
+            columns: cols,
+            ref_table: ref_table.to_string(),
+            ref_columns: ref_cols.unwrap_or_default(),
+        })
+    } else {
+        // CHECK only matches when followed by '(' so a column named "check"
+        // still parses as a column definition
+        let (i, (cond, _)) = parse_check_constraint(input)?;
+        (i, TableConstraintKind::Check(cond))
+    };
+
+    let raw = raw_start[..raw_start.len() - input.len()].trim().to_string();
+    Ok((input, TableConstraint { name, kind, raw }))
 }
 
 // CREATE UNIQUE INDEX index_name ON table(column);
@@ -519,9 +593,9 @@ fn parse_on_conflict(input: &str) -> IResult<&str, Option<OnConflict>> {
         let (input, _) = tag_no_case("ON")(input)?;
         let (input, _) = multispace1(input)?;
         let (input, _) = tag_no_case("CONFLICT")(input)?;
-        let (input, _) = multispace0(input)?;
         // Optional conflict column list
         let (input, conflict_columns) = nom::combinator::opt(|input| {
+            let (input, _) = multispace0(input)?;
             let (input, _) = nom_char('(')(input)?;
             let (input, _) = multispace0(input)?;
             let (input, cols) = nom::multi::separated_list1(

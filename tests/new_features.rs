@@ -1843,3 +1843,136 @@ fn test_metadata_routines() {
     let r = execute(&db.storage, "SELECT * FROM information_schema.routines").unwrap();
     assert_eq!(r, "(1 rows)");
 }
+
+// ---- DEFAULT column values ----
+
+#[test]
+fn test_default_parse() {
+    use abcsql::{parse_sql, SqlStatement};
+    let (_, stmt) = parse_sql("CREATE TABLE t (id INT, qty INT DEFAULT 5)").expect("parse failed");
+    if let SqlStatement::CreateTable(ct) = stmt {
+        assert!(ct.columns[1].default.is_some(), "expected default on qty");
+        assert_eq!(ct.columns[1].default_text.as_deref(), Some("5"));
+    } else {
+        panic!("expected CreateTable");
+    }
+}
+
+#[test]
+fn test_default_applied_when_column_omitted() {
+    let setup = [
+        "CREATE TABLE items (id INT, qty INT DEFAULT 5, name VARCHAR DEFAULT 'unnamed')",
+        "INSERT INTO items (id) VALUES (1)",
+    ];
+    let r = with_db(&setup, "SELECT id FROM items WHERE qty = 5 AND name = 'unnamed'");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "defaults not applied: {:?}", r);
+}
+
+#[test]
+fn test_default_keyword_in_values_row() {
+    let setup = [
+        "CREATE TABLE t (id INT, qty INT DEFAULT 7)",
+        "INSERT INTO t VALUES (1, DEFAULT)",
+    ];
+    let r = with_db(&setup, "SELECT id FROM t WHERE qty = 7");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "DEFAULT in VALUES failed: {:?}", r);
+}
+
+#[test]
+fn test_insert_default_values() {
+    let setup = [
+        "CREATE TABLE t (id INT DEFAULT 42, note VARCHAR DEFAULT 'x')",
+        "INSERT INTO t DEFAULT VALUES",
+    ];
+    let r = with_db(&setup, "SELECT id FROM t WHERE id = 42 AND note = 'x'");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "DEFAULT VALUES failed: {:?}", r);
+}
+
+#[test]
+fn test_update_set_default() {
+    let setup = [
+        "CREATE TABLE t (id INT, qty INT DEFAULT 9)",
+        "INSERT INTO t VALUES (1, 100)",
+        "UPDATE t SET qty = DEFAULT",
+    ];
+    let r = with_db(&setup, "SELECT id FROM t WHERE qty = 9");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "UPDATE SET DEFAULT failed: {:?}", r);
+}
+
+#[test]
+fn test_default_constraint_order_variants() {
+    let setup = [
+        "CREATE TABLE t (id INT, x INT NOT NULL DEFAULT 1, y VARCHAR DEFAULT 'z' NOT NULL)",
+        "INSERT INTO t (id) VALUES (5)",
+    ];
+    let r = with_db(&setup, "SELECT id FROM t WHERE x = 1 AND y = 'z'");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "constraint order variants failed: {:?}", r);
+}
+
+#[test]
+fn test_default_expression() {
+    let setup = [
+        "CREATE TABLE t (id INT, qty INT DEFAULT 2 + 3)",
+        "INSERT INTO t (id) VALUES (1)",
+    ];
+    let r = with_db(&setup, "SELECT id FROM t WHERE qty = 5");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "expression default failed: {:?}", r);
+}
+
+#[test]
+fn test_default_current_date() {
+    let setup = [
+        "CREATE TABLE t (id INT, d DATE DEFAULT CURRENT_DATE)",
+        "INSERT INTO t (id) VALUES (1)",
+    ];
+    let r = with_db(&setup, "SELECT id FROM t WHERE d IS NOT NULL");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "CURRENT_DATE default failed: {:?}", r);
+}
+
+#[test]
+fn test_omitted_column_without_default_is_null() {
+    let setup = [
+        "CREATE TABLE t (id INT, x INT)",
+        "INSERT INTO t (id) VALUES (1)",
+    ];
+    let r = with_db(&setup, "SELECT id FROM t WHERE x IS NULL");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "omitted column should be NULL: {:?}", r);
+}
+
+#[test]
+fn test_not_null_without_default_rejects_omission() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (id INT, x INT NOT NULL)").unwrap();
+    let r = execute(&db.storage, "INSERT INTO t (id) VALUES (1)");
+    assert!(r.is_err(), "expected NOT NULL violation");
+}
+
+#[test]
+fn test_default_survives_schema_reload() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (id INT, qty INT DEFAULT 5)").unwrap();
+    // load_schema re-reads the schema file on every statement, so a second
+    // insert exercises the DF= round-trip
+    execute(&db.storage, "INSERT INTO t (id) VALUES (1)").unwrap();
+    execute(&db.storage, "INSERT INTO t (id) VALUES (2)").unwrap();
+    let r = execute(&db.storage, "SELECT id FROM t WHERE qty = 5").unwrap();
+    assert!(r.contains("2 rows"));
+}
+
+#[test]
+fn test_default_shown_in_information_schema() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (id INT, qty INT DEFAULT 5)").unwrap();
+    let r = execute(&db.storage, "SELECT column_name FROM information_schema.columns WHERE column_default = '5'").unwrap();
+    assert!(r.contains("1 rows"), "column_default not populated: {}", r);
+}
+
+#[test]
+fn test_default_null_explicit() {
+    let setup = [
+        "CREATE TABLE t (id INT, x INT DEFAULT NULL)",
+        "INSERT INTO t (id) VALUES (1)",
+    ];
+    let r = with_db(&setup, "SELECT id FROM t WHERE x IS NULL");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "DEFAULT NULL failed: {:?}", r);
+}

@@ -326,7 +326,7 @@ fn execute_sql(sql: &str, storage: &Storage) {
         }
         SqlStatement::Insert(insert_stmt) => {
             match &insert_stmt.source {
-                parser::InsertSource::Values(_) => {
+                parser::InsertSource::Values(_) | parser::InsertSource::DefaultValues => {
                     match storage.insert_row(&insert_stmt) {
                         Ok((n, _)) => println!("Inserted {} row(s)", n),
                         Err(e) => eprintln!("Error: {}", e),
@@ -2688,7 +2688,7 @@ fn format_value(value: &Value) -> String {
         Value::String(s) | Value::Json(s) => s.clone(),
         Value::Date(d) => parser::format_date(*d),
         Value::Timestamp(ts) => parser::format_timestamp(*ts),
-        Value::Null => "NULL".to_string(),
+        Value::Null | Value::Default => "NULL".to_string(),
     }
 }
 
@@ -3491,6 +3491,7 @@ fn eval_arith(left: &Value, op: &parser::ArithOp, right: &Value) -> Option<Value
             Value::Bool(b) => b.to_string(),
             Value::Date(d) => parser::format_date(*d),
             Value::Timestamp(ts) => parser::format_timestamp(*ts),
+            Value::Default => return None,
         };
         let rs = match right {
             Value::String(s) | Value::Json(s) => s.clone(),
@@ -3500,6 +3501,7 @@ fn eval_arith(left: &Value, op: &parser::ArithOp, right: &Value) -> Option<Value
             Value::Bool(b) => b.to_string(),
             Value::Date(d) => parser::format_date(*d),
             Value::Timestamp(ts) => parser::format_timestamp(*ts),
+            Value::Default => return None,
         };
         return Some(Value::String(ls + &rs));
     }

@@ -143,6 +143,9 @@ pub struct ColumnDefinition {
     /// Raw SQL text of the CHECK condition (without CHECK(...) wrapper), preserved for
     /// round-trip serialization to/from the schema file.
     pub check_constraint_text: Option<String>,
+    pub default: Option<Expression>,
+    /// Raw SQL text of the DEFAULT expression, preserved for schema file round-trips.
+    pub default_text: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -154,7 +157,7 @@ pub struct ForeignKeyRef {
 #[cfg(test)]
 impl ColumnDefinition {
     pub fn new(name: &str, data_type: DataType) -> Self {
-        Self { name: name.to_string(), data_type, auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None }
+        Self { name: name.to_string(), data_type, auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None }
     }
 }
 
@@ -191,6 +194,7 @@ pub struct InsertStatement {
 pub enum InsertSource {
     Values(Vec<Vec<Value>>),    // multi-row: each inner Vec is one row
     Select(Box<SelectStatement>),
+    DefaultValues,              // INSERT INTO t DEFAULT VALUES
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -208,7 +212,7 @@ impl InsertStatement {
     pub fn values(&self) -> &[Value] {
         match &self.source {
             InsertSource::Values(rows) => rows.first().map(|r| r.as_slice()).unwrap_or(&[]),
-            InsertSource::Select(_) => &[],
+            InsertSource::Select(_) | InsertSource::DefaultValues => &[],
         }
     }
 }
@@ -566,4 +570,7 @@ pub enum Value {
     Timestamp(i64),  // seconds since 1970-01-01 00:00:00 UTC
     Json(String),    // JSON value stored as raw text
     Null,
+    /// Marker for the DEFAULT keyword in INSERT/UPDATE; resolved against the
+    /// column's default before any value is stored.
+    Default,
 }

@@ -156,7 +156,7 @@ fn format_returning_rows(rows: &[Vec<Value>]) -> String {
             Value::String(s) | Value::Json(s) => s.clone(),
             Value::Date(d) => parser::format_date(*d),
             Value::Timestamp(ts) => parser::format_timestamp(*ts),
-            Value::Null => "NULL".to_string(),
+            Value::Null | Value::Default => "NULL".to_string(),
         }).collect::<Vec<_>>().join(", ")
     }).collect();
     format!("({} rows)\n{}", rows.len(), lines.join("\n"))
@@ -1315,6 +1315,7 @@ fn lib_eval_arith(left: &Value, op: &parser::ArithOp, right: &Value) -> Option<V
             Value::Bool(b) => b.to_string(),
             Value::Date(d) => parser::format_date(*d),
             Value::Timestamp(ts) => parser::format_timestamp(*ts),
+            Value::Default => return None,
         };
         let rs = match right {
             Value::String(s) | Value::Json(s) => s.clone(),
@@ -1324,6 +1325,7 @@ fn lib_eval_arith(left: &Value, op: &parser::ArithOp, right: &Value) -> Option<V
             Value::Bool(b) => b.to_string(),
             Value::Date(d) => parser::format_date(*d),
             Value::Timestamp(ts) => parser::format_timestamp(*ts),
+            Value::Default => return None,
         };
         return Some(Value::String(ls + &rs));
     }

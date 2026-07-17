@@ -222,6 +222,7 @@ fn value_to_json(val: &Value) -> Option<serde_json::Value> {
         Value::Json(s) => Some(serde_json::from_str(s).unwrap_or(serde_json::Value::String(s.clone()))),
         Value::Date(d) => Some(serde_json::Value::String(format_date(*d))),
         Value::Timestamp(ts) => Some(serde_json::Value::String(format_timestamp(*ts))),
+        Value::Default => None,
     }
 }
 
@@ -235,6 +236,7 @@ pub fn apply_json_typeof(val: &Value) -> Option<Value> {
         Value::Int(_) | Value::Float(_) => return Some(Value::String("number".to_string())),
         Value::Date(_) => return Some(Value::String("date".to_string())),
         Value::Timestamp(_) => return Some(Value::String("timestamp".to_string())),
+        Value::Default => return None,
     };
     let v: serde_json::Value = serde_json::from_str(&json_str).ok()?;
     Some(Value::String(match v {
@@ -290,7 +292,7 @@ pub fn apply_concat(parts: Vec<Option<Value>>) -> Option<Value> {
             Some(Value::Bool(b))      => result.push_str(if b { "true" } else { "false" }),
             Some(Value::Date(d))      => result.push_str(&format_date(d)),
             Some(Value::Timestamp(ts))=> result.push_str(&format_timestamp(ts)),
-            Some(Value::Null) | None => return None,
+            Some(Value::Null) | Some(Value::Default) | None => return None,
         }
     }
     Some(Value::String(result))
@@ -364,6 +366,7 @@ pub fn apply_cast(val: Value, type_name: &str) -> Option<Value> {
             Value::Date(d)      => Some(Value::Int(d as i64)),
             Value::Timestamp(ts)=> Some(Value::Int(ts)),
             Value::Null         => Some(Value::Null),
+            Value::Default      => None,
         },
         "FLOAT" | "DOUBLE" | "REAL" | "NUMERIC" | "DECIMAL" => match val {
             Value::Float(f)  => Some(Value::Float(f)),
@@ -380,6 +383,7 @@ pub fn apply_cast(val: Value, type_name: &str) -> Option<Value> {
             Value::Date(d)      => Some(Value::String(format_date(d))),
             Value::Timestamp(ts)=> Some(Value::String(format_timestamp(ts))),
             Value::Null         => Some(Value::Null),
+            Value::Default      => None,
         },
         "JSON" | "JSONB" => match val {
             Value::Json(s) | Value::String(s) => Some(Value::Json(s)),

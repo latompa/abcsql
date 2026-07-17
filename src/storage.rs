@@ -270,6 +270,11 @@ impl Storage {
                 format!("CK={}", escaped)
             });
             if let Some(ref ck) = check_str { parts.push(ck); }
+            let default_str = col.default_text.as_ref().map(|t| {
+                let escaped = t.replace('\\', "\\\\").replace(':', "\\:");
+                format!("DF={}", escaped)
+            });
+            if let Some(ref df) = default_str { parts.push(df); }
             writeln!(file, "{}", parts.join(":"))?;
         }
         Ok(())
@@ -296,34 +301,44 @@ fn decode_check_text(text: &str) -> String {
 
     /// Insert row(s) into a table. Returns (rows_inserted, returning_rows).
     pub fn insert_row(&self, stmt: &InsertStatement) -> Result<(usize, Option<Vec<Vec<Value>>>), StorageError> {
-        let rows = match &stmt.source {
-            InsertSource::Values(rows) => rows,
+        let schema = self.load_schema(&stmt.table_name)?;
+        let rows: Vec<Vec<Value>> = match &stmt.source {
+            InsertSource::Values(rows) => rows.clone(),
+            InsertSource::DefaultValues => vec![vec![Value::Default; schema.columns.len()]],
             InsertSource::Select(_) => panic!("insert_row called with Select source — caller must resolve to values first"),
         };
 
-        let schema = self.load_schema(&stmt.table_name)?;
         let mut count = 0usize;
         let mut returning_rows: Vec<Vec<Value>> = Vec::new();
 
-        for values in rows {
-            // Map values to schema positions when a column list is provided
-            let mapped_values = if stmt.columns.is_empty() {
+        for values in &rows {
+            // Validate column count (only when no explicit column list)
+            if stmt.columns.is_empty() && values.len() != schema.columns.len() {
+                return Err(StorageError::ColumnCountMismatch {
+                    expected: schema.columns.len(),
+                    got: values.len(),
+                });
+            }
+
+            // Map values to schema positions when a column list is provided;
+            // omitted columns take their DEFAULT (Null when none is defined)
+            let mapped_values: Vec<Value> = if stmt.columns.is_empty() {
                 values.clone()
             } else {
                 schema.columns.iter().map(|col_def| {
                     stmt.columns.iter().position(|c| c.eq_ignore_ascii_case(&col_def.name))
                         .and_then(|i| values.get(i).cloned())
-                        .unwrap_or(Value::Null)
+                        .unwrap_or(Value::Default)
                 }).collect()
             };
 
-            // Validate column count (only when no explicit column list)
-            if stmt.columns.is_empty() && mapped_values.len() != schema.columns.len() {
-                return Err(StorageError::ColumnCountMismatch {
-                    expected: schema.columns.len(),
-                    got: mapped_values.len(),
-                });
-            }
+            // Resolve DEFAULT markers against column defaults
+            let mapped_values: Vec<Value> = mapped_values.into_iter()
+                .zip(schema.columns.iter())
+                .map(|(v, col_def)| {
+                    if v == Value::Default { self.default_value_for(col_def) } else { v }
+                })
+                .collect();
 
             let result = self.insert_single_row(&stmt.table_name, mapped_values, &schema, &stmt.on_conflict);
             match result {
@@ -351,6 +366,13 @@ fn decode_check_text(text: &str) -> String {
 
         let returning = if stmt.returning.is_some() { Some(returning_rows) } else { None };
         Ok((count, returning))
+    }
+
+    /// Value used for a column when INSERT/UPDATE specifies DEFAULT or omits the column
+    fn default_value_for(&self, col: &ColumnDefinition) -> Value {
+        col.default.as_ref()
+            .and_then(|e| resolve_expression(e, &[], &[], self))
+            .unwrap_or(Value::Null)
     }
 
     /// Insert a single row; handles ON CONFLICT. Returns Some(final_values) on success, None for DO NOTHING.
@@ -519,7 +541,11 @@ fn decode_check_text(text: &str) -> String {
 
                 for assignment in assignments {
                     if let Some(col_idx) = schema.columns.iter().position(|c| c.name == assignment.column) {
-                        let new_val = resolve_expr_with_excluded(&assignment.value, &combined_row, &combined_cols);
+                        let new_val = if matches!(&assignment.value, Expression::Literal(Value::Default)) {
+                            Some(self.default_value_for(&schema.columns[col_idx]))
+                        } else {
+                            resolve_expr_with_excluded(&assignment.value, &combined_row, &combined_cols)
+                        };
                         row[col_idx] = new_val.unwrap_or(Value::Null);
                     }
                 }
@@ -608,7 +634,9 @@ fn decode_check_text(text: &str) -> String {
                 .ok_or_else(|| StorageError::ColumnNotFound(assignment.column.clone()))?;
             // Check type immediately when the RHS is a plain literal
             if let Expression::Literal(val) = &assignment.value {
-                validate_value_type(val, &col_def.data_type, &assignment.column)?;
+                if *val != Value::Default {
+                    validate_value_type(val, &col_def.data_type, &assignment.column)?;
+                }
             }
         }
 
@@ -650,8 +678,12 @@ fn decode_check_text(text: &str) -> String {
 
             for assignment in &stmt.assignments {
                 if let Some(col_idx) = schema.columns.iter().position(|c| c.name == assignment.column) {
-                    let new_val = resolve_expr_cols(&assignment.value, &combined_row, &combined_cols, self)
-                        .unwrap_or(Value::Null);
+                    let new_val = if matches!(&assignment.value, Expression::Literal(Value::Default)) {
+                        self.default_value_for(&schema.columns[col_idx])
+                    } else {
+                        resolve_expr_cols(&assignment.value, &combined_row, &combined_cols, self)
+                            .unwrap_or(Value::Null)
+                    };
                     // Type-check the resolved value
                     validate_value_type(&new_val, &schema.columns[col_idx].data_type, &assignment.column)?;
                     row[col_idx] = new_val;
@@ -867,8 +899,12 @@ fn decode_check_text(text: &str) -> String {
                             combined_cols.extend(source_cols.iter().cloned());
                             for assignment in assignments {
                                 if let Some(col_idx) = target_schema.columns.iter().position(|c| c.name == assignment.column) {
-                                    let new_val = resolve_expr_cols(&assignment.value, &combined_row, &combined_cols, self)
-                                        .unwrap_or(Value::Null);
+                                    let new_val = if matches!(&assignment.value, Expression::Literal(Value::Default)) {
+                                        self.default_value_for(&target_schema.columns[col_idx])
+                                    } else {
+                                        resolve_expr_cols(&assignment.value, &combined_row, &combined_cols, self)
+                                            .unwrap_or(Value::Null)
+                                    };
                                     tgt_row[col_idx] = new_val;
                                 }
                             }
@@ -1065,6 +1101,21 @@ fn decode_check_text(text: &str) -> String {
                 None => None,
             };
 
+            let default_text = flags.iter()
+                .find(|f| f.starts_with("DF="))
+                .map(|f| Self::decode_check_text(&f[3..]));
+            let default = match &default_text {
+                Some(text) => {
+                    match crate::parser::parse_expression(text.trim()) {
+                        Ok(("", expr)) => Some(expr),
+                        _ => return Err(StorageError::InvalidSchema(
+                            format!("Invalid DEFAULT expression: {}", text)
+                        )),
+                    }
+                }
+                None => None,
+            };
+
             columns.push(ColumnDefinition {
                 name: col_name,
                 data_type,
@@ -1075,6 +1126,8 @@ fn decode_check_text(text: &str) -> String {
                 references,
                 check_constraint,
                 check_constraint_text: check_text,
+                default,
+                default_text,
         });
         }
 
@@ -2254,7 +2307,7 @@ fn eval_condition_cols(condition: &Condition, row: &[Value], cols: &[(String, St
                             data_type: DataType::Varchar(None),
                             auto_increment: false, primary_key: false,
                             not_null: false, unique: false, references: None,
-                            check_constraint: None, check_constraint_text: None,
+                            check_constraint: None, check_constraint_text: None, default: None, default_text: None,
                         }
                     }).collect();
                     let exists = execute_correlated_scalar_subquery(subquery, storage, row, &fake_schema).is_some();
@@ -2349,7 +2402,7 @@ fn resolve_expr_cols(expr: &Expression, row: &[Value], cols: &[(String, String)]
                     not_null: false,
                     unique: false,
                     references: None,
-                    check_constraint: None, check_constraint_text: None,
+                    check_constraint: None, check_constraint_text: None, default: None, default_text: None,
                 }
             }).collect();
             resolve_expression(other, row, &fake_schema, storage)
@@ -2524,7 +2577,7 @@ fn is_unique_subquery(
             data_type: DataType::Varchar(None),
             auto_increment: false, primary_key: false,
             not_null: false, unique: false, references: None,
-            check_constraint: None, check_constraint_text: None,
+            check_constraint: None, check_constraint_text: None, default: None, default_text: None,
         }
     }).collect();
     let rows = collect_correlated_rows(subquery, storage, outer_row, &fake_schema);
@@ -2793,6 +2846,8 @@ fn resolve_expression(expr: &Expression, row: &[Value], schema: &[ColumnDefiniti
                         references: None,
                         check_constraint: None,
                         check_constraint_text: None,
+                        default: None,
+                        default_text: None,
                     }
                 })
                 .collect();
@@ -3088,6 +3143,7 @@ fn storage_eval_arith(left: &Value, op: &ArithOp, right: &Value) -> Option<Value
             Value::Bool(b) => b.to_string(),
             Value::Date(d) => crate::parser::format_date(*d),
             Value::Timestamp(ts) => crate::parser::format_timestamp(*ts),
+            Value::Default => return None,
         };
         let rs = match right {
             Value::String(s) | Value::Json(s) => s.clone(),
@@ -3097,6 +3153,7 @@ fn storage_eval_arith(left: &Value, op: &ArithOp, right: &Value) -> Option<Value
             Value::Bool(b) => b.to_string(),
             Value::Date(d) => crate::parser::format_date(*d),
             Value::Timestamp(ts) => crate::parser::format_timestamp(*ts),
+            Value::Default => return None,
         };
         return Some(Value::String(ls + &rs));
     }
@@ -3203,7 +3260,8 @@ fn serialize_value(v: &Value) -> String {
         }
         Value::Date(d) => format!("DATE:{}", d),
         Value::Timestamp(ts) => format!("TIMESTAMP:{}", ts),
-        Value::Null => "NULL".to_string(),
+        // Default markers are resolved before rows are written; store as NULL if one leaks
+        Value::Null | Value::Default => "NULL".to_string(),
     }
 }
 
@@ -3308,75 +3366,75 @@ impl Storage {
     pub fn metadata_schema(name: &str) -> Option<CreateTableStatement> {
         let columns = match name {
             "information_schema.schemata" => vec![
-                ColumnDefinition { name: "catalog_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "schema_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "default_character_set_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "default_collation_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "catalog_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "schema_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "default_character_set_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "default_collation_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
             ],
             "information_schema.tables" => vec![
-                ColumnDefinition { name: "table_catalog".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "table_schema".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "table_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "table_type".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "table_catalog".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "table_schema".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "table_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "table_type".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
             ],
             "information_schema.columns" => vec![
-                ColumnDefinition { name: "table_catalog".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "table_schema".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "table_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "column_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "ordinal_position".into(), data_type: DataType::Int, auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "column_default".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "is_nullable".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "data_type".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "table_catalog".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "table_schema".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "table_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "column_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "ordinal_position".into(), data_type: DataType::Int, auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "column_default".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "is_nullable".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "data_type".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
             ],
             "information_schema.views" => vec![
-                ColumnDefinition { name: "table_catalog".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "table_schema".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "table_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "view_definition".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "table_catalog".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "table_schema".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "table_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "view_definition".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
             ],
             "information_schema.table_constraints" => vec![
-                ColumnDefinition { name: "constraint_catalog".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "constraint_schema".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "constraint_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "table_schema".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "table_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "constraint_type".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "constraint_catalog".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "constraint_schema".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "constraint_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "table_schema".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "table_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "constraint_type".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
             ],
             "information_schema.key_column_usage" => vec![
-                ColumnDefinition { name: "constraint_catalog".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "constraint_schema".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "constraint_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "table_catalog".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "table_schema".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "table_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "column_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "ordinal_position".into(), data_type: DataType::Int, auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "constraint_catalog".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "constraint_schema".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "constraint_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "table_catalog".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "table_schema".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "table_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "column_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "ordinal_position".into(), data_type: DataType::Int, auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
             ],
             "information_schema.referential_constraints" => vec![
-                ColumnDefinition { name: "constraint_catalog".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "constraint_schema".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "constraint_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "unique_constraint_catalog".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "unique_constraint_schema".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "unique_constraint_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "delete_rule".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "update_rule".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "constraint_catalog".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "constraint_schema".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "constraint_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "unique_constraint_catalog".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "unique_constraint_schema".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "unique_constraint_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "delete_rule".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "update_rule".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
             ],
             "information_schema.check_constraints" => vec![
-                ColumnDefinition { name: "constraint_catalog".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "constraint_schema".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "constraint_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "check_clause".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "constraint_catalog".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "constraint_schema".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "constraint_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "check_clause".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
             ],
             "information_schema.routines" => vec![
-                ColumnDefinition { name: "specific_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "routine_catalog".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "routine_schema".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "routine_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "routine_type".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "data_type".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "created".into(), data_type: DataType::Timestamp, auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "specific_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "routine_catalog".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "routine_schema".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "routine_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "routine_type".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "data_type".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "created".into(), data_type: DataType::Timestamp, auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
             ],
             _ => return None,
         };
@@ -3433,7 +3491,7 @@ impl Storage {
                                     Value::String(t.clone()),
                                     Value::String(col.name.clone()),
                                     Value::Int((i + 1) as i64),
-                                    Value::Null,
+                                    col.default_text.as_ref().map(|t| Value::String(t.clone())).unwrap_or(Value::Null),
                                     Value::String(if col.not_null || col.primary_key { "NO".into() } else { "YES".into() }),
                                     Value::String(data_type_to_string(&col.data_type)),
                                 ]);
@@ -4614,7 +4672,7 @@ mod tests {
         let create = CreateTableStatement {
             table_name: "users".to_string(),
             columns: vec![
-                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: true, primary_key: false, not_null: false, unique: false, references: None , check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: true, primary_key: false, not_null: false, unique: false, references: None , check_constraint: None, check_constraint_text: None, default: None, default_text: None },
                 ColumnDefinition::new("name", DataType::Varchar(None)),
             ],
         };
@@ -4670,7 +4728,7 @@ mod tests {
         let create = CreateTableStatement {
             table_name: "users".to_string(),
             columns: vec![
-                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, unique: false, references: None , check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, unique: false, references: None , check_constraint: None, check_constraint_text: None, default: None, default_text: None },
                 ColumnDefinition::new("name", DataType::Varchar(None)),
             ],
         };
@@ -4719,7 +4777,7 @@ mod tests {
         let create = CreateTableStatement {
             table_name: "users".to_string(),
             columns: vec![
-                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, unique: false, references: None , check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, unique: false, references: None , check_constraint: None, check_constraint_text: None, default: None, default_text: None },
                 ColumnDefinition::new("name", DataType::Varchar(None)),
             ],
         };
@@ -4748,7 +4806,7 @@ mod tests {
         let create_users = CreateTableStatement {
             table_name: "users".to_string(),
             columns: vec![
-                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, unique: false, references: None , check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, unique: false, references: None , check_constraint: None, check_constraint_text: None, default: None, default_text: None },
                 ColumnDefinition::new("name", DataType::Varchar(None)),
             ],
         };
@@ -4768,7 +4826,7 @@ mod tests {
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition { name: "user_id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: false, not_null: false, unique: false,
-                    references: Some(ForeignKeyRef { table: "users".to_string(), column: "id".to_string() }), check_constraint: None, check_constraint_text: None },
+                    references: Some(ForeignKeyRef { table: "users".to_string(), column: "id".to_string() }), check_constraint: None, check_constraint_text: None, default: None, default_text: None },
             ],
         };
         storage.create_table(&create_orders).unwrap();
@@ -4806,7 +4864,7 @@ mod tests {
         let create_users = CreateTableStatement {
             table_name: "users".to_string(),
             columns: vec![
-                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, unique: false, references: None , check_constraint: None, check_constraint_text: None },
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, unique: false, references: None , check_constraint: None, check_constraint_text: None, default: None, default_text: None },
                 ColumnDefinition::new("name", DataType::Varchar(None)),
             ],
         };
@@ -4834,7 +4892,7 @@ mod tests {
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition { name: "user_id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: false, not_null: false, unique: false,
-                    references: Some(ForeignKeyRef { table: "users".to_string(), column: "id".to_string() }), check_constraint: None, check_constraint_text: None },
+                    references: Some(ForeignKeyRef { table: "users".to_string(), column: "id".to_string() }), check_constraint: None, check_constraint_text: None, default: None, default_text: None },
             ],
         };
         storage.create_table(&create_orders).unwrap();
@@ -4890,7 +4948,7 @@ mod tests {
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition { name: "name".to_string(), data_type: DataType::Varchar(None),
-                    auto_increment: false, primary_key: false, not_null: true, unique: false, references: None , check_constraint: None, check_constraint_text: None },
+                    auto_increment: false, primary_key: false, not_null: true, unique: false, references: None , check_constraint: None, check_constraint_text: None, default: None, default_text: None },
             ],
         };
         storage.create_table(&create).unwrap();
@@ -4929,7 +4987,7 @@ mod tests {
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition { name: "email".to_string(), data_type: DataType::Varchar(None),
-                    auto_increment: false, primary_key: false, not_null: false, unique: true, references: None , check_constraint: None, check_constraint_text: None },
+                    auto_increment: false, primary_key: false, not_null: false, unique: true, references: None , check_constraint: None, check_constraint_text: None, default: None, default_text: None },
             ],
         };
         storage.create_table(&create).unwrap();
@@ -5991,8 +6049,8 @@ mod tests {
         let create = CreateTableStatement {
             table_name: "products".to_string(),
             columns: vec![
-                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "price".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: Some(crate::parser::parse_condition("price > 0").unwrap().1), check_constraint_text: Some("price > 0".to_string()) },
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "price".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: Some(crate::parser::parse_condition("price > 0").unwrap().1), check_constraint_text: Some("price > 0".to_string()), default: None, default_text: None },
             ],
         };
         storage.create_table(&create).unwrap();
@@ -6022,8 +6080,8 @@ mod tests {
         let create = CreateTableStatement {
             table_name: "products".to_string(),
             columns: vec![
-                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "price".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: Some(crate::parser::parse_condition("price > 0").unwrap().1), check_constraint_text: Some("price > 0".to_string()) },
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "price".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: Some(crate::parser::parse_condition("price > 0").unwrap().1), check_constraint_text: Some("price > 0".to_string()), default: None, default_text: None },
             ],
         };
         storage.create_table(&create).unwrap();
@@ -6054,8 +6112,8 @@ mod tests {
         let create = CreateTableStatement {
             table_name: "products".to_string(),
             columns: vec![
-                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "price".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: Some(crate::parser::parse_condition("price > 0").unwrap().1), check_constraint_text: Some("price > 0".to_string()) },
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "price".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: Some(crate::parser::parse_condition("price > 0").unwrap().1), check_constraint_text: Some("price > 0".to_string()), default: None, default_text: None },
             ],
         };
         storage.create_table(&create).unwrap();
@@ -6095,9 +6153,9 @@ mod tests {
         let create = CreateTableStatement {
             table_name: "items".to_string(),
             columns: vec![
-                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None },
-                ColumnDefinition { name: "qty".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: Some(crate::parser::parse_condition("qty >= 0 AND qty < 1000").unwrap().1), check_constraint_text: Some("qty >= 0 AND qty < 1000".to_string()) },
-                ColumnDefinition { name: "status".to_string(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: Some(crate::parser::parse_condition("status IN ('active', 'inactive')").unwrap().1), check_constraint_text: Some("status IN ('active', 'inactive')".to_string()) },
+                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: true, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "qty".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: Some(crate::parser::parse_condition("qty >= 0 AND qty < 1000").unwrap().1), check_constraint_text: Some("qty >= 0 AND qty < 1000".to_string()), default: None, default_text: None },
+                ColumnDefinition { name: "status".to_string(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: Some(crate::parser::parse_condition("status IN ('active', 'inactive')").unwrap().1), check_constraint_text: Some("status IN ('active', 'inactive')".to_string()), default: None, default_text: None },
             ],
         };
         storage.create_table(&create).unwrap();

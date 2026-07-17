@@ -176,42 +176,68 @@ fn parse_create_index_inner(input: &str) -> IResult<&str, SqlStatement> {
     })))
 }
 
-/// Parse column definition: name TYPE
+/// Parse column definition: name TYPE followed by constraints in any order
 fn parse_column_definition(input: &str) -> IResult<&str, ColumnDefinition> {
     let (input, _) = multispace0(input)?;
     let (input, name) = parse_identifier(input)?;
     let (input, _) = multispace1(input)?;
     let (input, data_type) = parse_data_type(input)?;
-    let (input, _) = multispace0(input)?;
-    let (input, nn) = nom::combinator::opt(tag_no_case("NOT NULL"))(input)?;
-    let (input, _) = multispace0(input)?;
-    let (input, uniq) = nom::combinator::opt(tag_no_case("UNIQUE"))(input)?;
-    let (input, _) = multispace0(input)?;
-    let (input, auto_inc) = nom::combinator::opt(tag("AUTO_INCREMENT"))(input)?;
-    let (input, _) = multispace0(input)?;
-    let (input, pk) = nom::combinator::opt(tag_no_case("PRIMARY KEY"))(input)?;
-    let (input, _) = multispace0(input)?;
-    let (input, fk_ref) = nom::combinator::opt(parse_references)(input)?;
-    let (input, _) = multispace0(input)?;
-    let (input, check) = nom::combinator::opt(parse_check_constraint)(input)?;
-    let (input, _) = multispace0(input)?;
 
-    let (check_cond, check_text) = match check {
-        Some((cond, text)) => (Some(cond), Some(text)),
-        None => (None, None),
-    };
-
-    Ok((input, ColumnDefinition {
+    let mut col = ColumnDefinition {
         name: name.to_string(),
         data_type,
-        auto_increment: auto_inc.is_some(),
-        primary_key: pk.is_some(),
-        not_null: nn.is_some(),
-        unique: uniq.is_some(),
-        references: fk_ref,
-        check_constraint: check_cond,
-        check_constraint_text: check_text,
-    }))
+        auto_increment: false,
+        primary_key: false,
+        not_null: false,
+        unique: false,
+        references: None,
+        check_constraint: None,
+        check_constraint_text: None,
+        default: None,
+        default_text: None,
+    };
+
+    let mut input = input;
+    loop {
+        let (rest, _) = multispace0(input)?;
+        if let Ok((rest, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("NOT NULL")(rest) {
+            col.not_null = true;
+            input = rest;
+        } else if let Ok((rest, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("UNIQUE")(rest) {
+            col.unique = true;
+            input = rest;
+        } else if let Ok((rest, _)) = tag::<&str, &str, nom::error::Error<&str>>("AUTO_INCREMENT")(rest) {
+            col.auto_increment = true;
+            input = rest;
+        } else if let Ok((rest, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("PRIMARY KEY")(rest) {
+            col.primary_key = true;
+            input = rest;
+        } else if let Ok((rest, fk)) = parse_references(rest) {
+            col.references = Some(fk);
+            input = rest;
+        } else if let Ok((rest, (cond, text))) = parse_check_constraint(rest) {
+            col.check_constraint = Some(cond);
+            col.check_constraint_text = Some(text);
+            input = rest;
+        } else if let Ok((rest, (expr, text))) = parse_default_clause(rest) {
+            col.default = Some(expr);
+            col.default_text = Some(text);
+            input = rest;
+        } else {
+            let (rest, _) = multispace0(input)?;
+            return Ok((rest, col));
+        }
+    }
+}
+
+/// Parse DEFAULT expr — returns the parsed expression and its raw SQL text.
+fn parse_default_clause(input: &str) -> IResult<&str, (Expression, String)> {
+    let (input, _) = tag_no_case("DEFAULT")(input)?;
+    let (input, _) = multispace1(input)?;
+    let expr_start = input;
+    let (input, expr) = parse_expression(input)?;
+    let text = expr_start[..expr_start.len() - input.len()].trim().to_string();
+    Ok((input, (expr, text)))
 }
 
 // Parse REFERENCES table(column)
@@ -418,6 +444,25 @@ pub fn parse_insert(input: &str) -> IResult<&str, SqlStatement> {
 
     let (input, _) = multispace1(input)?;
 
+    // INSERT INTO t DEFAULT VALUES
+    if let Ok((i2, _)) = nom::sequence::separated_pair(
+        tag_no_case::<&str, &str, nom::error::Error<&str>>("DEFAULT"),
+        multispace1,
+        tag_no_case("VALUES"),
+    )(input) {
+        let (i2, on_conflict) = parse_on_conflict(i2)?;
+        let (i2, returning) = parse_returning(i2)?;
+        let (i2, _) = multispace0(i2)?;
+        let (i2, _) = nom::combinator::opt(nom_char(';'))(i2)?;
+        return Ok((i2, SqlStatement::Insert(InsertStatement {
+            table_name: table_name.to_string(),
+            columns,
+            source: InsertSource::DefaultValues,
+            on_conflict,
+            returning,
+        })));
+    }
+
     // Try INSERT INTO ... SELECT first, then VALUES
     let (input, source) = if let Ok((i2, select)) = parse_select_statement(input) {
         let (i2, _) = multispace0(i2)?;
@@ -443,7 +488,7 @@ pub fn parse_insert(input: &str) -> IResult<&str, SqlStatement> {
                 let (input, _) = multispace0(input)?;
                 let (input, values) = separated_list0(
                     delimited(multispace0, nom_char(','), multispace0),
-                    parse_value,
+                    nom::branch::alt((parse_default_marker, parse_value)),
                 )(input)?;
                 let (input, _) = multispace0(input)?;
                 let (input, _) = nom_char(')')(input)?;
@@ -556,14 +601,28 @@ pub fn parse_update(input: &str) -> IResult<&str, SqlStatement> {
     })))
 }
 
-/// Parse assignment: column = expression
+/// Parse the bare DEFAULT keyword (not part of a longer identifier) as a marker value.
+fn parse_default_marker(input: &str) -> IResult<&str, Value> {
+    let (input, _) = multispace0(input)?;
+    let (input, _) = tag_no_case("DEFAULT")(input)?;
+    // Reject if DEFAULT is a prefix of a longer identifier
+    if input.chars().next().is_some_and(|c| c.is_alphanumeric() || c == '_') {
+        return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)));
+    }
+    Ok((input, Value::Default))
+}
+
+/// Parse assignment: column = expression (or the DEFAULT keyword)
 pub fn parse_assignment(input: &str) -> IResult<&str, Assignment> {
     let (input, _) = multispace0(input)?;
     let (input, column) = parse_identifier(input)?;
     let (input, _) = multispace0(input)?;
     let (input, _) = nom_char('=')(input)?;
     let (input, _) = multispace0(input)?;
-    let (input, value) = parse_expression(input)?;
+    let (input, value) = nom::branch::alt((
+        nom::combinator::map(parse_default_marker, |v| Expression::Literal(v)),
+        parse_expression,
+    ))(input)?;
     let (input, _) = multispace0(input)?;
 
     Ok((input, Assignment {

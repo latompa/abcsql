@@ -21,12 +21,27 @@ pub enum SqlStatement {
     Delete(DeleteStatement),
     Truncate(TruncateStatement),
     Merge(MergeStatement),
-    Begin,
+    Begin(TransactionOptions),
+    SetTransaction(TransactionOptions),
     Commit,
     Rollback,
     Savepoint(String),
     RollbackToSavepoint(String),
     ReleaseSavepoint(String),
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum IsolationLevel {
+    ReadUncommitted,
+    ReadCommitted,
+    RepeatableRead,
+    Serializable,
+}
+
+#[derive(Debug, PartialEq, Clone, Default)]
+pub struct TransactionOptions {
+    pub isolation: Option<IsolationLevel>,
+    pub read_only: Option<bool>,
 }
 
 #[derive(Debug, PartialEq, Clone)]

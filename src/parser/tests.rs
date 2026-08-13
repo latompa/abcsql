@@ -2553,19 +2553,19 @@
     #[test]
     fn test_parse_begin() {
         let (_, stmt) = parse_sql("BEGIN").unwrap();
-        assert_eq!(stmt, SqlStatement::Begin);
+        assert_eq!(stmt, SqlStatement::Begin(TransactionOptions::default()));
     }
 
     #[test]
     fn test_parse_begin_transaction() {
         let (_, stmt) = parse_sql("BEGIN TRANSACTION").unwrap();
-        assert_eq!(stmt, SqlStatement::Begin);
+        assert_eq!(stmt, SqlStatement::Begin(TransactionOptions::default()));
     }
 
     #[test]
     fn test_parse_start_transaction() {
         let (_, stmt) = parse_sql("START TRANSACTION;").unwrap();
-        assert_eq!(stmt, SqlStatement::Begin);
+        assert_eq!(stmt, SqlStatement::Begin(TransactionOptions::default()));
     }
 
     #[test]

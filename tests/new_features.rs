@@ -2889,3 +2889,66 @@ fn test_non_updatable_view_rejected() {
     let r = execute(&db.storage, "INSERT INTO agg_v VALUES (1, 1)");
     assert!(r.is_err(), "aggregate view should not be updatable");
 }
+
+// ---- Transaction control options ----
+
+#[test]
+fn test_read_only_transaction_blocks_writes() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (id INT)").unwrap();
+    execute(&db.storage, "START TRANSACTION READ ONLY").unwrap();
+    assert!(execute(&db.storage, "INSERT INTO t VALUES (1)").is_err(), "insert allowed in read-only txn");
+    assert!(execute(&db.storage, "UPDATE t SET id = 2").is_err(), "update allowed in read-only txn");
+    assert!(execute(&db.storage, "DELETE FROM t").is_err(), "delete allowed in read-only txn");
+    assert!(execute(&db.storage, "CREATE TABLE t2 (id INT)").is_err(), "DDL allowed in read-only txn");
+    // reads still fine
+    execute(&db.storage, "SELECT * FROM t").unwrap();
+    execute(&db.storage, "COMMIT").unwrap();
+    // writes work again outside the transaction
+    execute(&db.storage, "INSERT INTO t VALUES (1)").unwrap();
+}
+
+#[test]
+fn test_read_write_transaction_allows_writes() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (id INT)").unwrap();
+    execute(&db.storage, "BEGIN TRANSACTION READ WRITE").unwrap();
+    execute(&db.storage, "INSERT INTO t VALUES (1)").unwrap();
+    execute(&db.storage, "COMMIT").unwrap();
+}
+
+#[test]
+fn test_isolation_level_parses_and_runs() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (id INT)").unwrap();
+    execute(&db.storage, "START TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ ONLY").unwrap();
+    assert!(execute(&db.storage, "INSERT INTO t VALUES (1)").is_err());
+    execute(&db.storage, "ROLLBACK").unwrap();
+    execute(&db.storage, "BEGIN ISOLATION LEVEL REPEATABLE READ").unwrap();
+    execute(&db.storage, "INSERT INTO t VALUES (1)").unwrap();
+    execute(&db.storage, "COMMIT").unwrap();
+}
+
+#[test]
+fn test_set_transaction_applies_to_next_begin() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (id INT)").unwrap();
+    execute(&db.storage, "SET TRANSACTION READ ONLY").unwrap();
+    execute(&db.storage, "BEGIN").unwrap();
+    assert!(execute(&db.storage, "INSERT INTO t VALUES (1)").is_err(), "stashed READ ONLY not applied");
+    execute(&db.storage, "ROLLBACK").unwrap();
+    // consumed: the following transaction is writable again
+    execute(&db.storage, "BEGIN").unwrap();
+    execute(&db.storage, "INSERT INTO t VALUES (1)").unwrap();
+    execute(&db.storage, "COMMIT").unwrap();
+}
+
+#[test]
+fn test_set_transaction_inside_transaction() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (id INT)").unwrap();
+    execute(&db.storage, "BEGIN").unwrap();
+    execute(&db.storage, "SET TRANSACTION READ ONLY").unwrap();
+    assert!(execute(&db.storage, "INSERT INTO t VALUES (1)").is_err(), "in-txn READ ONLY not applied");
+    execute(&db.storage, "ROLLBACK").unwrap();
+}

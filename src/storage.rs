@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::fmt;
 use std::collections::HashMap;
 use regex::Regex;
-use crate::parser::{RefAction, WhereClause, CreateTableStatement, CreateIndexStatement, CreateFunctionStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, InsertSource, OnConflict, UpdateStatement, DeleteStatement, TruncateStatement, MergeStatement, MergeSource, MergeAction, AlterTableStatement, AlterAction, Value, Condition, Expression, Operator, ArithOp, SelectStatement, SelectColumn, FromClause, TableConstraint, TableConstraintKind, apply_scalar_func, apply_round, apply_concat, apply_substr, apply_replace, apply_translate, eval_boolean_test, apply_lpad, apply_rpad, apply_cast, apply_greatest, apply_least, apply_power, apply_position, apply_repeat, apply_json_typeof, apply_json_array_length, apply_json_build_object, apply_json_build_array};
+use crate::parser::{RefAction, WhereClause, TransactionOptions, IsolationLevel, CreateTableStatement, CreateIndexStatement, CreateFunctionStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, InsertSource, OnConflict, UpdateStatement, DeleteStatement, TruncateStatement, MergeStatement, MergeSource, MergeAction, AlterTableStatement, AlterAction, Value, Condition, Expression, Operator, ArithOp, SelectStatement, SelectColumn, FromClause, TableConstraint, TableConstraintKind, apply_scalar_func, apply_round, apply_concat, apply_substr, apply_replace, apply_translate, eval_boolean_test, apply_lpad, apply_rpad, apply_cast, apply_greatest, apply_least, apply_power, apply_position, apply_repeat, apply_json_typeof, apply_json_array_length, apply_json_build_object, apply_json_build_array};
 
 /// Before-image snapshot for a single transaction
 struct TransactionState {
@@ -12,12 +12,16 @@ struct TransactionState {
     before_images: HashMap<PathBuf, Option<Vec<u8>>>,
     // Named savepoints in creation order; each stores current on-disk bytes of modified files
     savepoints: Vec<(String, HashMap<PathBuf, Option<Vec<u8>>>)>,
+    read_only: bool,
+    isolation: Option<IsolationLevel>,
 }
 
 /// Storage engine for persisting tables to disk
 pub struct Storage {
     data_dir: PathBuf,
     txn: std::sync::Mutex<Option<TransactionState>>,
+    // Options set by SET TRANSACTION outside a transaction, applied to the next BEGIN
+    next_txn_options: std::sync::Mutex<TransactionOptions>,
 }
 
 #[derive(Debug)]
@@ -91,7 +95,7 @@ impl std::error::Error for StorageError {
 impl Storage {
     /// Create a no-op Storage for expression evaluation contexts that don't touch files
     fn noop() -> Self {
-        Storage { data_dir: PathBuf::new(), txn: std::sync::Mutex::new(None) }
+        Storage { data_dir: PathBuf::new(), txn: std::sync::Mutex::new(None), next_txn_options: std::sync::Mutex::new(TransactionOptions::default()) }
     }
 
     /// Create a new Storage instance with the specified data directory
@@ -103,7 +107,7 @@ impl Storage {
             fs::create_dir_all(&data_dir)?;
         }
 
-        Ok(Storage { data_dir, txn: std::sync::Mutex::new(None) })
+        Ok(Storage { data_dir, txn: std::sync::Mutex::new(None), next_txn_options: std::sync::Mutex::new(TransactionOptions::default()) })
     }
 
     /// Return a reference to the data directory path
@@ -137,11 +141,54 @@ impl Storage {
     // --- Transaction control ---
 
     pub fn begin_transaction(&self) -> Result<(), StorageError> {
+        self.begin_transaction_with(TransactionOptions::default())
+    }
+
+    pub fn begin_transaction_with(&self, options: TransactionOptions) -> Result<(), StorageError> {
         let mut guard = self.txn.lock().unwrap();
         if guard.is_some() {
             return Err(StorageError::TransactionError("already in a transaction".into()));
         }
-        *guard = Some(TransactionState { before_images: HashMap::new(), savepoints: Vec::new() });
+        // Merge in options stashed by an earlier SET TRANSACTION (consumed on use)
+        let stashed = std::mem::take(&mut *self.next_txn_options.lock().unwrap());
+        *guard = Some(TransactionState {
+            before_images: HashMap::new(),
+            savepoints: Vec::new(),
+            read_only: options.read_only.or(stashed.read_only).unwrap_or(false),
+            isolation: options.isolation.or(stashed.isolation),
+        });
+        Ok(())
+    }
+
+    /// Apply SET TRANSACTION: adjusts the current transaction, or stashes the
+    /// options for the next one when no transaction is active.
+    pub fn set_transaction_options(&self, options: TransactionOptions) -> Result<(), StorageError> {
+        let mut guard = self.txn.lock().unwrap();
+        if let Some(txn) = guard.as_mut() {
+            if let Some(ro) = options.read_only { txn.read_only = ro; }
+            if options.isolation.is_some() { txn.isolation = options.isolation; }
+        } else {
+            let mut stash = self.next_txn_options.lock().unwrap();
+            if let Some(ro) = options.read_only { stash.read_only = Some(ro); }
+            if options.isolation.is_some() { stash.isolation = options.isolation; }
+        }
+        Ok(())
+    }
+
+    /// Isolation level of the active transaction, if any was requested
+    pub fn transaction_isolation(&self) -> Option<IsolationLevel> {
+        self.txn.lock().unwrap().as_ref().and_then(|t| t.isolation)
+    }
+
+    /// Reject writes inside a READ ONLY transaction
+    fn check_writable(&self) -> Result<(), StorageError> {
+        if let Some(txn) = self.txn.lock().unwrap().as_ref() {
+            if txn.read_only {
+                return Err(StorageError::TransactionError(
+                    "cannot execute a write statement in a READ ONLY transaction".into()
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -281,6 +328,7 @@ impl Storage {
     }
 
     pub fn create_table(&self, stmt: &CreateTableStatement) -> Result<(), StorageError> {
+        self.check_writable()?;
         // Schema-qualified tables require the schema to exist
         if let Some(dot) = stmt.table_name.find('.') {
             let schema_name = &stmt.table_name[..dot];
@@ -440,6 +488,7 @@ fn decode_check_text(text: &str) -> String {
 
     /// Insert row(s) into a table. Returns (rows_inserted, returning_rows).
     pub fn insert_row(&self, stmt: &InsertStatement) -> Result<(usize, Option<Vec<Vec<Value>>>), StorageError> {
+        self.check_writable()?;
         // INSERT through an updatable view: rewrite against the base table
         if let Some(view_sql) = self.load_view(&stmt.table_name)? {
             let (base, view_cols, view_where, check_option) = self.view_dml_target(&stmt.table_name, &view_sql)?;
@@ -849,6 +898,7 @@ fn decode_check_text(text: &str) -> String {
 
     /// Update rows in a table matching the WHERE condition. Returns (count, returning_rows).
     pub fn update_rows(&self, stmt: &UpdateStatement) -> Result<(usize, Option<Vec<Vec<Value>>>), StorageError> {
+        self.check_writable()?;
         // UPDATE through an updatable view: rewrite against the base table
         if let Some(view_sql) = self.load_view(&stmt.table_name)? {
             let (base, view_cols, view_where, check_option) = self.view_dml_target(&stmt.table_name, &view_sql)?;
@@ -1036,6 +1086,7 @@ fn decode_check_text(text: &str) -> String {
 
     /// Delete rows from a table matching the WHERE condition. Returns (count, returning_rows).
     pub fn delete_rows(&self, stmt: &DeleteStatement) -> Result<(usize, Option<Vec<Vec<Value>>>), StorageError> {
+        self.check_writable()?;
         // DELETE through an updatable view: rewrite against the base table,
         // restricted to rows visible through the view
         if let Some(view_sql) = self.load_view(&stmt.table_name)? {
@@ -1129,6 +1180,7 @@ fn decode_check_text(text: &str) -> String {
 
     /// Truncate a table (delete all rows, keep schema)
     pub fn truncate_table(&self, stmt: &TruncateStatement) -> Result<(), StorageError> {
+        self.check_writable()?;
         if !self.table_exists(&stmt.table_name) {
             return Err(StorageError::TableNotFound(stmt.table_name.clone()));
         }
@@ -1142,6 +1194,7 @@ fn decode_check_text(text: &str) -> String {
 
     /// Execute a MERGE statement. Returns (matched_count, inserted_count).
     pub fn execute_merge(&self, stmt: &MergeStatement) -> Result<(usize, usize), StorageError> {
+        self.check_writable()?;
         let target_schema = self.load_schema(&stmt.target)?;
         let target_alias = stmt.target_alias.as_deref().unwrap_or(&stmt.target);
 
@@ -1511,6 +1564,7 @@ fn decode_check_text(text: &str) -> String {
     /// Delete a table (removes both schema and data files)
     #[allow(dead_code)]
     pub fn drop_table(&self, table_name: &str) -> Result<(), StorageError> {
+        self.check_writable()?;
         let schema_path = self.schema_path(table_name);
         let data_path = self.data_path(table_name);
 

@@ -132,8 +132,11 @@ pub fn execute(storage: &Storage, sql: &str) -> Result<String, String> {
                 .map(|_| format!("Dropped function '{}'", stmt.name))
                 .map_err(|e| e.to_string())
         }
-        SqlStatement::Begin => {
-            storage.begin_transaction().map(|_| "BEGIN".to_string()).map_err(|e| e.to_string())
+        SqlStatement::Begin(options) => {
+            storage.begin_transaction_with(options).map(|_| "BEGIN".to_string()).map_err(|e| e.to_string())
+        }
+        SqlStatement::SetTransaction(options) => {
+            storage.set_transaction_options(options).map(|_| "SET TRANSACTION".to_string()).map_err(|e| e.to_string())
         }
         SqlStatement::Commit => {
             storage.commit_transaction().map(|_| "COMMIT".to_string()).map_err(|e| e.to_string())

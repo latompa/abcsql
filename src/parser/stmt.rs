@@ -21,6 +21,7 @@ pub fn parse_sql(input: &str) -> IResult<&str, SqlStatement> {
         parse_truncate,
         parse_merge,
         parse_begin,
+        parse_set_transaction,
         parse_commit,
         parse_rollback,
         parse_savepoint,
@@ -1093,14 +1094,85 @@ fn parse_merge_when_clause(input: &str) -> IResult<&str, WhenClause> {
 }
 
 // DROP INDEX name; / DROP TABLE [IF EXISTS] name;
-/// Parse BEGIN / BEGIN TRANSACTION / START TRANSACTION
+/// Parse BEGIN / BEGIN TRANSACTION / START TRANSACTION with optional
+/// ISOLATION LEVEL and READ ONLY / READ WRITE modes
 pub fn parse_begin(input: &str) -> IResult<&str, SqlStatement> {
     let (input, _) = nom::branch::alt((tag_no_case("BEGIN"), tag_no_case("START")))(input)?;
     let (input, _) = multispace0(input)?;
     // Optional TRANSACTION keyword
     let (input, _) = nom::combinator::opt(nom::sequence::terminated(tag_no_case("TRANSACTION"), multispace0))(input)?;
+    let (input, options) = parse_transaction_options(input)?;
+    let (input, _) = multispace0(input)?;
     let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
-    Ok((input, SqlStatement::Begin))
+    Ok((input, SqlStatement::Begin(options)))
+}
+
+/// Parse SET TRANSACTION <options>
+pub fn parse_set_transaction(input: &str) -> IResult<&str, SqlStatement> {
+    let (input, _) = tag_no_case("SET")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, _) = tag_no_case("TRANSACTION")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, options) = parse_transaction_options(input)?;
+    if options == TransactionOptions::default() {
+        return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)));
+    }
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
+    Ok((input, SqlStatement::SetTransaction(options)))
+}
+
+/// Parse zero or more transaction modes, optionally comma-separated:
+/// ISOLATION LEVEL <level> | READ ONLY | READ WRITE
+fn parse_transaction_options(input: &str) -> IResult<&str, TransactionOptions> {
+    let mut options = TransactionOptions::default();
+    let mut input = input;
+    loop {
+        let (rest, _) = multispace0(input)?;
+        let rest = match nom_char::<&str, nom::error::Error<&str>>(',')(rest) {
+            Ok((r, _)) => r.trim_start(),
+            Err(_) => rest,
+        };
+        if let Ok((r, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("ISOLATION")(rest) {
+            let (r, _) = multispace1(r)?;
+            let (r, _) = tag_no_case("LEVEL")(r)?;
+            let (r, _) = multispace1(r)?;
+            let (r, level) = nom::branch::alt((
+                nom::combinator::map(
+                    nom::sequence::separated_pair(tag_no_case("READ"), multispace1, tag_no_case("UNCOMMITTED")),
+                    |_| IsolationLevel::ReadUncommitted,
+                ),
+                nom::combinator::map(
+                    nom::sequence::separated_pair(tag_no_case("READ"), multispace1, tag_no_case("COMMITTED")),
+                    |_| IsolationLevel::ReadCommitted,
+                ),
+                nom::combinator::map(
+                    nom::sequence::separated_pair(tag_no_case("REPEATABLE"), multispace1, tag_no_case("READ")),
+                    |_| IsolationLevel::RepeatableRead,
+                ),
+                nom::combinator::map(tag_no_case("SERIALIZABLE"), |_| IsolationLevel::Serializable),
+            ))(r)?;
+            options.isolation = Some(level);
+            input = r;
+        } else if let Ok((r, _)) = nom::sequence::separated_pair(
+            tag_no_case::<&str, &str, nom::error::Error<&str>>("READ"),
+            multispace1::<&str, nom::error::Error<&str>>,
+            tag_no_case("ONLY"),
+        )(rest) {
+            options.read_only = Some(true);
+            input = r;
+        } else if let Ok((r, _)) = nom::sequence::separated_pair(
+            tag_no_case::<&str, &str, nom::error::Error<&str>>("READ"),
+            multispace1::<&str, nom::error::Error<&str>>,
+            tag_no_case("WRITE"),
+        )(rest) {
+            options.read_only = Some(false);
+            input = r;
+        } else {
+            break;
+        }
+    }
+    Ok((input, options))
 }
 
 /// Parse COMMIT [TRANSACTION]

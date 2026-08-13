@@ -450,9 +450,15 @@ fn execute_sql(sql: &str, storage: &Storage) {
                 Err(e) => eprintln!("Error: {}", e),
             }
         }
-        SqlStatement::Begin => {
-            match storage.begin_transaction() {
+        SqlStatement::Begin(options) => {
+            match storage.begin_transaction_with(options) {
                 Ok(()) => println!("BEGIN"),
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        }
+        SqlStatement::SetTransaction(options) => {
+            match storage.set_transaction_options(options) {
+                Ok(()) => println!("SET TRANSACTION"),
                 Err(e) => eprintln!("Error: {}", e),
             }
         }

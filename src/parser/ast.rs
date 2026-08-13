@@ -120,6 +120,7 @@ pub struct CreateViewStatement {
     pub view_name: String,
     pub select_sql: String, // stored as raw SQL for persistence
     pub select: SelectStatement,
+    pub check_option: bool, // WITH CHECK OPTION
 }
 
 #[derive(Debug, PartialEq, Clone)]

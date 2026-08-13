@@ -106,7 +106,7 @@ pub fn execute(storage: &Storage, sql: &str) -> Result<String, String> {
                 .map_err(|e| e.to_string())
         }
         SqlStatement::CreateView(stmt) => {
-            storage.create_view(&stmt.view_name, &stmt.select_sql)
+            storage.create_view_with_options(&stmt.view_name, &stmt.select_sql, stmt.check_option)
                 .map(|_| format!("Created view '{}'", stmt.view_name))
                 .map_err(|e| e.to_string())
         }

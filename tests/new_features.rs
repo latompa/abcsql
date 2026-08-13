@@ -2794,3 +2794,98 @@ fn test_qualified_dml_statements() {
     execute(&db.storage, "ALTER TABLE s.t ADD COLUMN note VARCHAR").unwrap();
     execute(&db.storage, "DROP TABLE s.t").unwrap();
 }
+
+// ---- Updatable views + WITH CHECK OPTION ----
+
+#[test]
+fn test_insert_through_view() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (id INT, v INT)").unwrap();
+    execute(&db.storage, "CREATE VIEW tv AS SELECT * FROM t").unwrap();
+    execute(&db.storage, "INSERT INTO tv VALUES (1, 10)").unwrap();
+    let r = execute(&db.storage, "SELECT id FROM t WHERE v = 10").unwrap();
+    assert!(r.contains("1 rows"), "insert through view failed: {}", r);
+}
+
+#[test]
+fn test_update_delete_through_view() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (id INT, v INT)").unwrap();
+    execute(&db.storage, "INSERT INTO t VALUES (1, 10), (2, 20)").unwrap();
+    execute(&db.storage, "CREATE VIEW tv AS SELECT * FROM t").unwrap();
+    execute(&db.storage, "UPDATE tv SET v = 99 WHERE id = 1").unwrap();
+    let r = execute(&db.storage, "SELECT id FROM t WHERE v = 99").unwrap();
+    assert!(r.contains("1 rows"), "update through view failed: {}", r);
+    execute(&db.storage, "DELETE FROM tv WHERE id = 2").unwrap();
+    let r2 = execute(&db.storage, "SELECT id FROM t").unwrap();
+    assert!(r2.contains("1 rows"), "delete through view failed: {}", r2);
+}
+
+#[test]
+fn test_view_where_scopes_update_and_delete() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (id INT, region VARCHAR)").unwrap();
+    execute(&db.storage, "INSERT INTO t VALUES (1, 'east'), (2, 'west')").unwrap();
+    execute(&db.storage, "CREATE VIEW east_v AS SELECT * FROM t WHERE region = 'east'").unwrap();
+    // DELETE through the view must only touch rows visible in the view
+    execute(&db.storage, "DELETE FROM east_v").unwrap();
+    let r = execute(&db.storage, "SELECT id FROM t").unwrap();
+    assert!(r.contains("1 rows"), "view-scoped delete touched other rows: {}", r);
+    let r2 = execute(&db.storage, "SELECT id FROM t WHERE region = 'west'").unwrap();
+    assert!(r2.contains("1 rows"), "west row should survive: {}", r2);
+}
+
+#[test]
+fn test_with_check_option_on_insert() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (id INT, qty INT)").unwrap();
+    execute(&db.storage, "CREATE VIEW big_v AS SELECT * FROM t WHERE qty > 100 WITH CHECK OPTION").unwrap();
+    execute(&db.storage, "INSERT INTO big_v VALUES (1, 500)").unwrap();
+    let r = execute(&db.storage, "INSERT INTO big_v VALUES (2, 5)");
+    assert!(r.is_err(), "CHECK OPTION should reject invisible row");
+}
+
+#[test]
+fn test_with_check_option_on_update() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (id INT, qty INT)").unwrap();
+    execute(&db.storage, "INSERT INTO t VALUES (1, 500)").unwrap();
+    execute(&db.storage, "CREATE VIEW big_v AS SELECT * FROM t WHERE qty > 100 WITH CHECK OPTION").unwrap();
+    let r = execute(&db.storage, "UPDATE big_v SET qty = 5 WHERE id = 1");
+    assert!(r.is_err(), "CHECK OPTION should reject update leaving the view");
+    execute(&db.storage, "UPDATE big_v SET qty = 900 WHERE id = 1").unwrap();
+}
+
+#[test]
+fn test_view_without_check_option_allows_escape() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (id INT, qty INT)").unwrap();
+    execute(&db.storage, "INSERT INTO t VALUES (1, 500)").unwrap();
+    execute(&db.storage, "CREATE VIEW big_v AS SELECT * FROM t WHERE qty > 100").unwrap();
+    // Without CHECK OPTION the update may move the row out of the view
+    execute(&db.storage, "UPDATE big_v SET qty = 5 WHERE id = 1").unwrap();
+    let r = execute(&db.storage, "SELECT id FROM t WHERE qty = 5").unwrap();
+    assert!(r.contains("1 rows"), "escape update failed: {}", r);
+}
+
+#[test]
+fn test_column_subset_view_dml() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (id INT, v INT DEFAULT 7, secret VARCHAR DEFAULT 'x')").unwrap();
+    execute(&db.storage, "CREATE VIEW pub_v AS SELECT id, v FROM t").unwrap();
+    execute(&db.storage, "INSERT INTO pub_v VALUES (1, 10)").unwrap();
+    let r = execute(&db.storage, "SELECT id FROM t WHERE secret = 'x' AND v = 10").unwrap();
+    assert!(r.contains("1 rows"), "subset view insert failed: {}", r);
+    // assigning a column outside the view is rejected
+    let r2 = execute(&db.storage, "UPDATE pub_v SET secret = 'leak'");
+    assert!(r2.is_err(), "assignment outside view accepted");
+}
+
+#[test]
+fn test_non_updatable_view_rejected() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (id INT, v INT)").unwrap();
+    execute(&db.storage, "CREATE VIEW agg_v AS SELECT id, COUNT(*) FROM t GROUP BY id").unwrap();
+    let r = execute(&db.storage, "INSERT INTO agg_v VALUES (1, 1)");
+    assert!(r.is_err(), "aggregate view should not be updatable");
+}

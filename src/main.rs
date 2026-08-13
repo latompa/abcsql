@@ -405,7 +405,7 @@ fn execute_sql(sql: &str, storage: &Storage) {
             }
         }
         SqlStatement::CreateView(stmt) => {
-            match storage.create_view(&stmt.view_name, &stmt.select_sql) {
+            match storage.create_view_with_options(&stmt.view_name, &stmt.select_sql, stmt.check_option) {
                 Ok(_) => println!("Created view '{}'", stmt.view_name),
                 Err(e) => eprintln!("Error: {}", e),
             }

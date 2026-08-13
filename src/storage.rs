@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::fmt;
 use std::collections::HashMap;
 use regex::Regex;
-use crate::parser::{RefAction, CreateTableStatement, CreateIndexStatement, CreateFunctionStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, InsertSource, OnConflict, UpdateStatement, DeleteStatement, TruncateStatement, MergeStatement, MergeSource, MergeAction, AlterTableStatement, AlterAction, Value, Condition, Expression, Operator, ArithOp, SelectStatement, SelectColumn, FromClause, TableConstraint, TableConstraintKind, apply_scalar_func, apply_round, apply_concat, apply_substr, apply_replace, apply_translate, eval_boolean_test, apply_lpad, apply_rpad, apply_cast, apply_greatest, apply_least, apply_power, apply_position, apply_repeat, apply_json_typeof, apply_json_array_length, apply_json_build_object, apply_json_build_array};
+use crate::parser::{RefAction, WhereClause, CreateTableStatement, CreateIndexStatement, CreateFunctionStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, InsertSource, OnConflict, UpdateStatement, DeleteStatement, TruncateStatement, MergeStatement, MergeSource, MergeAction, AlterTableStatement, AlterAction, Value, Condition, Expression, Operator, ArithOp, SelectStatement, SelectColumn, FromClause, TableConstraint, TableConstraintKind, apply_scalar_func, apply_round, apply_concat, apply_substr, apply_replace, apply_translate, eval_boolean_test, apply_lpad, apply_rpad, apply_cast, apply_greatest, apply_least, apply_power, apply_position, apply_repeat, apply_json_typeof, apply_json_array_length, apply_json_build_object, apply_json_build_array};
 
 /// Before-image snapshot for a single transaction
 struct TransactionState {
@@ -380,6 +380,17 @@ impl Storage {
         Ok(())
     }
 
+/// AND a view's WHERE condition with a statement's own WHERE clause
+fn combine_where(view_where: Option<Condition>, stmt_where: Option<WhereClause>) -> Option<WhereClause> {
+    match (view_where, stmt_where) {
+        (Some(v), Some(w)) => Some(WhereClause {
+            condition: Condition::And(Box::new(v), Box::new(w.condition)),
+        }),
+        (Some(v), None) => Some(WhereClause { condition: v }),
+        (None, w) => w,
+    }
+}
+
 /// Regenerate the SQL text of a table constraint from its parsed form.
 /// CHECK constraints keep their original text since the condition isn't re-serialized.
 fn constraint_to_sql(tc: &TableConstraint) -> String {
@@ -429,6 +440,35 @@ fn decode_check_text(text: &str) -> String {
 
     /// Insert row(s) into a table. Returns (rows_inserted, returning_rows).
     pub fn insert_row(&self, stmt: &InsertStatement) -> Result<(usize, Option<Vec<Vec<Value>>>), StorageError> {
+        // INSERT through an updatable view: rewrite against the base table
+        if let Some(view_sql) = self.load_view(&stmt.table_name)? {
+            let (base, view_cols, view_where, check_option) = self.view_dml_target(&stmt.table_name, &view_sql)?;
+            let columns = if !stmt.columns.is_empty() {
+                if let Some(vc) = &view_cols {
+                    for c in &stmt.columns {
+                        if !vc.iter().any(|v| v.eq_ignore_ascii_case(c)) {
+                            return Err(StorageError::ColumnNotFound(format!("{} (not in view)", c)));
+                        }
+                    }
+                }
+                stmt.columns.clone()
+            } else {
+                view_cols.clone().unwrap_or_default()
+            };
+            let rewritten = InsertStatement {
+                table_name: base,
+                columns,
+                source: stmt.source.clone(),
+                on_conflict: stmt.on_conflict.clone(),
+                returning: stmt.returning.clone(),
+            };
+            let view_check = if check_option { view_where } else { None };
+            return self.insert_row_inner(&rewritten, view_check.as_ref());
+        }
+        self.insert_row_inner(stmt, None)
+    }
+
+    fn insert_row_inner(&self, stmt: &InsertStatement, view_check: Option<&Condition>) -> Result<(usize, Option<Vec<Vec<Value>>>), StorageError> {
         let schema = self.load_schema(&stmt.table_name)?;
         let rows: Vec<Vec<Value>> = match &stmt.source {
             InsertSource::Values(rows) => rows.clone(),
@@ -468,7 +508,7 @@ fn decode_check_text(text: &str) -> String {
                 })
                 .collect();
 
-            let result = self.insert_single_row(&stmt.table_name, mapped_values, &schema, &stmt.on_conflict);
+            let result = self.insert_single_row(&stmt.table_name, mapped_values, &schema, &stmt.on_conflict, view_check);
             match result {
                 Ok(Some(final_values)) => {
                     if let Some(ref ret_cols) = stmt.returning {
@@ -510,6 +550,7 @@ fn decode_check_text(text: &str) -> String {
         values: Vec<Value>,
         schema: &CreateTableStatement,
         on_conflict: &Option<OnConflict>,
+        view_check: Option<&Condition>,
     ) -> Result<Option<Vec<Value>>, StorageError> {
         // Build final values, filling in auto_increment where NULL is provided
         let mut final_values = values;
@@ -679,6 +720,16 @@ fn decode_check_text(text: &str) -> String {
             }
         }
 
+        // Enforce the view's WITH CHECK OPTION: new rows must be visible through the view
+        if let Some(cond) = view_check {
+            if !evaluate_condition(cond, &final_values, &schema.columns, self) {
+                return Err(StorageError::CheckConstraintViolation {
+                    column: "view check option".to_string(),
+                    reason: "row is not visible through the view".to_string(),
+                });
+            }
+        }
+
         // Append row to data file
         let data_path = self.data_path(table_name);
         self.snapshot_before_write(&data_path);
@@ -798,6 +849,31 @@ fn decode_check_text(text: &str) -> String {
 
     /// Update rows in a table matching the WHERE condition. Returns (count, returning_rows).
     pub fn update_rows(&self, stmt: &UpdateStatement) -> Result<(usize, Option<Vec<Vec<Value>>>), StorageError> {
+        // UPDATE through an updatable view: rewrite against the base table
+        if let Some(view_sql) = self.load_view(&stmt.table_name)? {
+            let (base, view_cols, view_where, check_option) = self.view_dml_target(&stmt.table_name, &view_sql)?;
+            if let Some(vc) = &view_cols {
+                for a in &stmt.assignments {
+                    if !vc.iter().any(|v| v.eq_ignore_ascii_case(&a.column)) {
+                        return Err(StorageError::ColumnNotFound(format!("{} (not in view)", a.column)));
+                    }
+                }
+            }
+            let combined_where = Self::combine_where(view_where.clone(), stmt.where_clause.clone());
+            let rewritten = UpdateStatement {
+                table_name: base,
+                assignments: stmt.assignments.clone(),
+                from: stmt.from.clone(),
+                where_clause: combined_where,
+                returning: stmt.returning.clone(),
+            };
+            let view_check = if check_option { view_where } else { None };
+            return self.update_rows_inner(&rewritten, view_check.as_ref());
+        }
+        self.update_rows_inner(stmt, None)
+    }
+
+    fn update_rows_inner(&self, stmt: &UpdateStatement, view_check: Option<&Condition>) -> Result<(usize, Option<Vec<Vec<Value>>>), StorageError> {
         let schema = self.load_schema(&stmt.table_name)?;
 
         // Build column context for the target table
@@ -905,6 +981,16 @@ fn decode_check_text(text: &str) -> String {
                 }
             }
 
+            // Enforce the view's WITH CHECK OPTION: updated rows must stay visible
+            if let Some(cond) = view_check {
+                if !evaluate_condition(cond, row, &schema.columns, self) {
+                    return Err(StorageError::CheckConstraintViolation {
+                        column: "view check option".to_string(),
+                        reason: "updated row is not visible through the view".to_string(),
+                    });
+                }
+            }
+
             // Validate this table's own foreign keys against the new values
             for (i, col_def) in schema.columns.iter().enumerate() {
                 if let Some(ref fk) = col_def.references {
@@ -950,6 +1036,19 @@ fn decode_check_text(text: &str) -> String {
 
     /// Delete rows from a table matching the WHERE condition. Returns (count, returning_rows).
     pub fn delete_rows(&self, stmt: &DeleteStatement) -> Result<(usize, Option<Vec<Vec<Value>>>), StorageError> {
+        // DELETE through an updatable view: rewrite against the base table,
+        // restricted to rows visible through the view
+        if let Some(view_sql) = self.load_view(&stmt.table_name)? {
+            let (base, _, view_where, _) = self.view_dml_target(&stmt.table_name, &view_sql)?;
+            let rewritten = DeleteStatement {
+                table_name: base,
+                using: stmt.using.clone(),
+                where_clause: Self::combine_where(view_where, stmt.where_clause.clone()),
+                returning: stmt.returning.clone(),
+            };
+            return self.delete_rows(&rewritten);
+        }
+
         let schema = self.load_schema(&stmt.table_name)?;
         let target_cols: Vec<(String, String)> = schema.columns.iter()
             .map(|c| (stmt.table_name.clone(), c.name.clone()))
@@ -1810,12 +1909,69 @@ fn decode_check_text(text: &str) -> String {
 
     /// Create a view by persisting its SELECT SQL to disk
     pub fn create_view(&self, view_name: &str, select_sql: &str) -> Result<(), StorageError> {
+        self.create_view_with_options(view_name, select_sql, false)
+    }
+
+    pub fn create_view_with_options(&self, view_name: &str, select_sql: &str, check_option: bool) -> Result<(), StorageError> {
         let path = self.view_path(view_name);
         if path.exists() {
             return Err(StorageError::InvalidSchema(format!("View '{}' already exists", view_name)));
         }
         self.snapshot_before_write(&path);
-        fs::write(&path, select_sql).map_err(StorageError::IoError)
+        fs::write(&path, select_sql).map_err(StorageError::IoError)?;
+        if check_option {
+            let opt_path = self.view_opt_path(view_name);
+            self.snapshot_before_write(&opt_path);
+            fs::write(&opt_path, "CHECK_OPTION\n").map_err(StorageError::IoError)?;
+        }
+        Ok(())
+    }
+
+    fn view_opt_path(&self, view_name: &str) -> PathBuf {
+        self.data_dir.join(format!("{}.viewopt", view_name))
+    }
+
+    fn view_has_check_option(&self, view_name: &str) -> bool {
+        self.view_opt_path(view_name).exists()
+    }
+
+    /// Resolve a view into a DML target: (base table, view columns or None for *,
+    /// view WHERE condition, check_option). Errors when the view isn't simple enough
+    /// to be updatable.
+    fn view_dml_target(&self, view_name: &str, sql: &str) -> Result<(String, Option<Vec<String>>, Option<Condition>, bool), StorageError> {
+        let not_updatable = |reason: &str| StorageError::InvalidSchema(
+            format!("view '{}' is not updatable: {}", view_name, reason)
+        );
+        let select = match crate::parser::parse_select_statement(sql) {
+            Ok((_, s)) => s,
+            Err(_) => return Err(not_updatable("cannot parse view definition")),
+        };
+        let base = match &select.from {
+            FromClause::Table(t) => t.clone(),
+            _ => return Err(not_updatable("FROM is not a plain table")),
+        };
+        if self.load_view(&base)?.is_some() {
+            return Err(not_updatable("view is defined over another view"));
+        }
+        if !select.joins.is_empty() || !select.group_by.is_empty() || select.grouping_sets.is_some()
+            || select.distinct || select.union.is_some() || !select.ctes.is_empty() || select.having.is_some() {
+            return Err(not_updatable("definition uses joins, grouping, DISTINCT or set operations"));
+        }
+        let columns = if select.columns.len() == 1 && matches!(select.columns[0], SelectColumn::All) {
+            None
+        } else {
+            let mut cols = Vec::new();
+            for c in &select.columns {
+                match c {
+                    SelectColumn::Column(name) => cols.push(name.clone()),
+                    SelectColumn::QualifiedColumn(_, name) => cols.push(name.clone()),
+                    _ => return Err(not_updatable("select list contains expressions or aliases")),
+                }
+            }
+            Some(cols)
+        };
+        let where_cond = select.where_clause.as_ref().map(|w| w.condition.clone());
+        Ok((base, columns, where_cond, self.view_has_check_option(view_name)))
     }
 
     /// Load a view's SELECT SQL from disk
@@ -1832,6 +1988,11 @@ fn decode_check_text(text: &str) -> String {
         let path = self.view_path(view_name);
         if !path.exists() {
             return Err(StorageError::TableNotFound(format!("View '{}' not found", view_name)));
+        }
+        let opt_path = self.view_opt_path(view_name);
+        if opt_path.exists() {
+            self.snapshot_before_write(&opt_path);
+            let _ = fs::remove_file(&opt_path);
         }
         self.snapshot_before_write(&path);
         fs::remove_file(&path).map_err(StorageError::IoError)

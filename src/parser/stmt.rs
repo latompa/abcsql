@@ -110,11 +110,26 @@ fn parse_create_view_inner(input: &str) -> IResult<&str, SqlStatement> {
     let consumed_len = select_sql_start.len() - input.len();
     let select_sql = select_sql_start[..consumed_len].trim_end_matches(';').trim().to_string();
     let (input, _) = multispace0(input)?;
+    // Optional WITH [CASCADED | LOCAL] CHECK OPTION
+    let (input, check_option) = nom::combinator::opt(|i| {
+        let (i, _) = tag_no_case("WITH")(i)?;
+        let (i, _) = multispace1(i)?;
+        let (i, _) = nom::combinator::opt(nom::sequence::terminated(
+            nom::branch::alt((tag_no_case("CASCADED"), tag_no_case("LOCAL"))),
+            multispace1,
+        ))(i)?;
+        let (i, _) = tag_no_case("CHECK")(i)?;
+        let (i, _) = multispace1(i)?;
+        let (i, _) = tag_no_case("OPTION")(i)?;
+        Ok((i, ()))
+    })(input)?;
+    let (input, _) = multispace0(input)?;
     let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
     Ok((input, SqlStatement::CreateView(CreateViewStatement {
         view_name: view_name.to_string(),
         select_sql,
         select,
+        check_option: check_option.is_some(),
     })))
 }
 

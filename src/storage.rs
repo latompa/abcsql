@@ -218,7 +218,78 @@ impl Storage {
     }
 
     /// Create a new table by persisting its schema to disk
+    fn schemas_file(&self) -> PathBuf {
+        self.data_dir.join("_schemas")
+    }
+
+    /// All namespaces: the built-in "public" plus any created with CREATE SCHEMA
+    pub fn list_schemas(&self) -> Vec<String> {
+        let mut schemas = vec!["public".to_string()];
+        if let Ok(content) = fs::read_to_string(self.schemas_file()) {
+            schemas.extend(content.lines().filter(|l| !l.is_empty()).map(|l| l.to_string()));
+        }
+        schemas
+    }
+
+    pub fn create_schema_ns(&self, name: &str) -> Result<(), StorageError> {
+        let lower = name.to_lowercase();
+        if lower == "public" || lower == "information_schema" {
+            return Err(StorageError::InvalidSchema(format!("schema '{}' is reserved", name)));
+        }
+        if self.list_schemas().iter().any(|s| s.eq_ignore_ascii_case(name)) {
+            return Err(StorageError::InvalidSchema(format!("schema '{}' already exists", name)));
+        }
+        let path = self.schemas_file();
+        self.snapshot_before_write(&path);
+        let mut content = fs::read_to_string(&path).unwrap_or_default();
+        content.push_str(name);
+        content.push('\n');
+        fs::write(&path, content)?;
+        Ok(())
+    }
+
+    pub fn drop_schema_ns(&self, name: &str, cascade: bool) -> Result<(), StorageError> {
+        let lower = name.to_lowercase();
+        if lower == "public" || lower == "information_schema" {
+            return Err(StorageError::InvalidSchema(format!("schema '{}' cannot be dropped", name)));
+        }
+        let existing = self.list_schemas();
+        if !existing.iter().any(|s| s.eq_ignore_ascii_case(name)) {
+            return Err(StorageError::InvalidSchema(format!("schema '{}' does not exist", name)));
+        }
+        let prefix = format!("{}.", name);
+        let tables: Vec<String> = self.list_tables().map_err(StorageError::IoError)?
+            .into_iter()
+            .filter(|t| t.to_lowercase().starts_with(&prefix.to_lowercase()))
+            .collect();
+        if !tables.is_empty() && !cascade {
+            return Err(StorageError::InvalidSchema(
+                format!("schema '{}' is not empty (use DROP SCHEMA ... CASCADE)", name)
+            ));
+        }
+        for t in &tables {
+            self.drop_table(t)?;
+        }
+        let path = self.schemas_file();
+        self.snapshot_before_write(&path);
+        let content = fs::read_to_string(&path).unwrap_or_default();
+        let remaining: Vec<&str> = content.lines()
+            .filter(|l| !l.is_empty() && !l.eq_ignore_ascii_case(name))
+            .collect();
+        fs::write(&path, format!("{}\n", remaining.join("\n")))?;
+        Ok(())
+    }
+
     pub fn create_table(&self, stmt: &CreateTableStatement) -> Result<(), StorageError> {
+        // Schema-qualified tables require the schema to exist
+        if let Some(dot) = stmt.table_name.find('.') {
+            let schema_name = &stmt.table_name[..dot];
+            if !self.list_schemas().iter().any(|s| s.eq_ignore_ascii_case(schema_name)) {
+                return Err(StorageError::InvalidSchema(
+                    format!("schema '{}' does not exist", schema_name)
+                ));
+            }
+        }
         let schema_path = self.schema_path(&stmt.table_name);
 
         // Check if table already exists
@@ -3988,12 +4059,12 @@ impl Storage {
     pub fn read_metadata_rows(&self, name: &str) -> Option<Vec<Vec<Value>>> {
         match name {
             "information_schema.schemata" => {
-                Some(vec![vec![
+                Some(self.list_schemas().into_iter().map(|s| vec![
                     Value::String("default".into()),
-                    Value::String("public".into()),
+                    Value::String(s),
                     Value::String("UTF8".into()),
                     Value::String("en_US.UTF-8".into()),
-                ]])
+                ]).collect())
             }
             "information_schema.tables" => {
                 let mut rows: Vec<Vec<Value>> = Vec::new();

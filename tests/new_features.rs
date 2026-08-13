@@ -2708,3 +2708,89 @@ fn test_is_null_still_works() {
     let r2 = with_db(&setup, "SELECT id FROM t WHERE active IS NOT NULL");
     assert!(r2.as_ref().unwrap().contains("1 rows"), "IS NOT NULL regressed: {:?}", r2);
 }
+
+// ---- Schemas: CREATE SCHEMA + qualified names ----
+
+#[test]
+fn test_create_schema_and_qualified_table() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE SCHEMA sales").unwrap();
+    execute(&db.storage, "CREATE TABLE sales.orders (id INT, total INT)").unwrap();
+    execute(&db.storage, "INSERT INTO sales.orders VALUES (1, 100)").unwrap();
+    let r = execute(&db.storage, "SELECT id FROM sales.orders WHERE total = 100").unwrap();
+    assert!(r.contains("1 rows"), "qualified table failed: {}", r);
+}
+
+#[test]
+fn test_qualified_table_requires_schema() {
+    let db = TestDb::new();
+    let r = execute(&db.storage, "CREATE TABLE nosuch.t (id INT)");
+    assert!(r.is_err(), "expected error creating table in missing schema");
+}
+
+#[test]
+fn test_public_prefix_is_default_namespace() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE public.t (id INT)").unwrap();
+    execute(&db.storage, "INSERT INTO t VALUES (1)").unwrap();
+    let r = execute(&db.storage, "SELECT id FROM public.t").unwrap();
+    assert!(r.contains("1 rows"), "public.t should equal t: {}", r);
+}
+
+#[test]
+fn test_same_table_name_in_two_schemas() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE SCHEMA a").unwrap();
+    execute(&db.storage, "CREATE SCHEMA b").unwrap();
+    execute(&db.storage, "CREATE TABLE a.t (x INT)").unwrap();
+    execute(&db.storage, "CREATE TABLE b.t (x INT)").unwrap();
+    execute(&db.storage, "INSERT INTO a.t VALUES (1)").unwrap();
+    execute(&db.storage, "INSERT INTO b.t VALUES (2), (3)").unwrap();
+    let ra = execute(&db.storage, "SELECT x FROM a.t").unwrap();
+    let rb = execute(&db.storage, "SELECT x FROM b.t").unwrap();
+    assert!(ra.contains("1 rows"), "a.t wrong: {}", ra);
+    assert!(rb.contains("2 rows"), "b.t wrong: {}", rb);
+}
+
+#[test]
+fn test_create_schema_duplicate_fails() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE SCHEMA s").unwrap();
+    assert!(execute(&db.storage, "CREATE SCHEMA s").is_err(), "duplicate schema accepted");
+    assert!(execute(&db.storage, "CREATE SCHEMA public").is_err(), "reserved schema accepted");
+}
+
+#[test]
+fn test_drop_schema_restrict_and_cascade() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE SCHEMA s").unwrap();
+    execute(&db.storage, "CREATE TABLE s.t (id INT)").unwrap();
+    assert!(execute(&db.storage, "DROP SCHEMA s").is_err(), "non-empty schema dropped without CASCADE");
+    execute(&db.storage, "DROP SCHEMA s CASCADE").unwrap();
+    assert!(execute(&db.storage, "SELECT * FROM s.t").is_err(), "table survived schema cascade");
+    assert!(execute(&db.storage, "DROP SCHEMA s").is_err(), "dropping twice should fail");
+}
+
+#[test]
+fn test_schemata_lists_created_schemas() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE SCHEMA reporting").unwrap();
+    let r = execute(&db.storage, "SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'reporting'").unwrap();
+    assert!(r.contains("1 rows"), "created schema missing from schemata: {}", r);
+}
+
+#[test]
+fn test_qualified_dml_statements() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE SCHEMA s").unwrap();
+    execute(&db.storage, "CREATE TABLE s.t (id INT, v INT)").unwrap();
+    execute(&db.storage, "INSERT INTO s.t VALUES (1, 10), (2, 20)").unwrap();
+    execute(&db.storage, "UPDATE s.t SET v = 99 WHERE id = 1").unwrap();
+    let r = execute(&db.storage, "SELECT id FROM s.t WHERE v = 99").unwrap();
+    assert!(r.contains("1 rows"), "qualified UPDATE failed: {}", r);
+    execute(&db.storage, "DELETE FROM s.t WHERE id = 2").unwrap();
+    let r2 = execute(&db.storage, "SELECT id FROM s.t").unwrap();
+    assert!(r2.contains("1 rows"), "qualified DELETE failed: {}", r2);
+    execute(&db.storage, "ALTER TABLE s.t ADD COLUMN note VARCHAR").unwrap();
+    execute(&db.storage, "DROP TABLE s.t").unwrap();
+}

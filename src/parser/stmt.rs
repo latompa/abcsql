@@ -37,10 +37,21 @@ pub fn parse_create(input: &str) -> IResult<&str, SqlStatement> {
     nom::branch::alt((
         parse_create_function_inner,
         parse_create_view_inner,
+        parse_create_schema_inner,
         parse_create_table_inner,
         parse_create_unique_index_inner,
         parse_create_index_inner,
     ))(input)
+}
+
+// CREATE SCHEMA name
+fn parse_create_schema_inner(input: &str) -> IResult<&str, SqlStatement> {
+    let (input, _) = tag_no_case("SCHEMA")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, name) = parse_identifier(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
+    Ok((input, SqlStatement::CreateSchema(name.to_string())))
 }
 
 fn parse_create_function_inner(input: &str) -> IResult<&str, SqlStatement> {
@@ -115,7 +126,7 @@ enum TableItem {
 fn parse_create_table_inner(input: &str) -> IResult<&str, SqlStatement> {
     let (input, _) = tag_no_case("TABLE")(input)?;
     let (input, _) = multispace1(input)?;
-    let (input, table_name) = parse_identifier(input)?;
+    let (input, table_name) = parse_table_name(input)?;
     let (input, _) = multispace0(input)?;
     let (input, items) = delimited(
         nom_char('('),
@@ -213,7 +224,7 @@ fn parse_create_unique_index_inner(input: &str) -> IResult<&str, SqlStatement> {
     let (input, _) = multispace1(input)?;
     let (input, _) = tag_no_case("ON")(input)?;
     let (input, _) = multispace1(input)?;
-    let (input, table_name) = parse_identifier(input)?;
+    let (input, table_name) = parse_table_name(input)?;
     let (input, _) = multispace0(input)?;
     let (input, _) = nom_char('(')(input)?;
     let (input, column_name) = parse_identifier(input)?;
@@ -237,7 +248,7 @@ fn parse_create_index_inner(input: &str) -> IResult<&str, SqlStatement> {
     let (input, _) = multispace1(input)?;
     let (input, _) = tag_no_case("ON")(input)?;
     let (input, _) = multispace1(input)?;
-    let (input, table_name) = parse_identifier(input)?;
+    let (input, table_name) = parse_table_name(input)?;
     let (input, _) = multispace0(input)?;
     let (input, _) = nom_char('(')(input)?;
     let (input, column_name) = parse_identifier(input)?;
@@ -321,7 +332,7 @@ fn parse_default_clause(input: &str) -> IResult<&str, (Expression, String)> {
 fn parse_references(input: &str) -> IResult<&str, ForeignKeyRef> {
     let (input, _) = tag_no_case("REFERENCES")(input)?;
     let (input, _) = multispace1(input)?;
-    let (input, table) = parse_identifier(input)?;
+    let (input, table) = parse_table_name(input)?;
     let (input, _) = nom_char('(')(input)?;
     let (input, column) = parse_identifier(input)?;
     let (input, _) = nom_char(')')(input)?;
@@ -638,7 +649,7 @@ pub fn parse_insert(input: &str) -> IResult<&str, SqlStatement> {
     let (input, _) = multispace1(input)?;
     let (input, _) = tag_no_case("INTO")(input)?;
     let (input, _) = multispace1(input)?;
-    let (input, table_name) = parse_identifier(input)?;
+    let (input, table_name) = parse_table_name(input)?;
 
     // Parse optional column list: (col1, col2, ...)
     let (input, columns) = nom::combinator::opt(|input| {
@@ -784,7 +795,7 @@ fn parse_returning(input: &str) -> IResult<&str, Option<Vec<SelectColumn>>> {
 pub fn parse_update(input: &str) -> IResult<&str, SqlStatement> {
     let (input, _) = tag_no_case("UPDATE")(input)?;
     let (input, _) = multispace1(input)?;
-    let (input, table_name) = parse_identifier(input)?;
+    let (input, table_name) = parse_table_name(input)?;
     let (input, _) = multispace1(input)?;
     let (input, _) = tag_no_case("SET")(input)?;
     let (input, _) = multispace1(input)?;
@@ -798,7 +809,7 @@ pub fn parse_update(input: &str) -> IResult<&str, SqlStatement> {
         let (input, _) = multispace1(input)?;
         let (input, _) = tag_no_case("FROM")(input)?;
         let (input, _) = multispace1(input)?;
-        let (input, tbl) = parse_identifier(input)?;
+        let (input, tbl) = parse_table_name(input)?;
         let (input, alias) = nom::combinator::opt(parse_table_alias)(input)?;
         Ok((input, (tbl.to_string(), alias)))
     })(input)?;
@@ -878,13 +889,13 @@ pub fn parse_delete(input: &str) -> IResult<&str, SqlStatement> {
     let (input, _) = multispace1(input)?;
     let (input, _) = tag_no_case("FROM")(input)?;
     let (input, _) = multispace1(input)?;
-    let (input, table_name) = parse_identifier(input)?;
+    let (input, table_name) = parse_table_name(input)?;
     // Optional USING clause for join-based deletes
     let (input, using) = nom::combinator::opt(|input| {
         let (input, _) = multispace1(input)?;
         let (input, _) = tag_no_case("USING")(input)?;
         let (input, _) = multispace1(input)?;
-        let (input, tbl) = parse_identifier(input)?;
+        let (input, tbl) = parse_table_name(input)?;
         let (input, alias) = nom::combinator::opt(parse_table_alias)(input)?;
         Ok((input, (tbl.to_string(), alias)))
     })(input)?;
@@ -907,7 +918,7 @@ pub fn parse_truncate(input: &str) -> IResult<&str, SqlStatement> {
     let (input, _) = multispace1(input)?;
     // Optional TABLE keyword
     let (input, _) = nom::combinator::opt(nom::sequence::terminated(tag_no_case("TABLE"), multispace1))(input)?;
-    let (input, table_name) = parse_identifier(input)?;
+    let (input, table_name) = parse_table_name(input)?;
     let (input, _) = multispace0(input)?;
     let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
     Ok((input, SqlStatement::Truncate(TruncateStatement { table_name: table_name.to_string() })))
@@ -919,7 +930,7 @@ pub fn parse_merge(input: &str) -> IResult<&str, SqlStatement> {
     let (input, _) = multispace1(input)?;
     // Optional INTO keyword
     let (input, _) = nom::combinator::opt(nom::sequence::terminated(tag_no_case("INTO"), multispace1))(input)?;
-    let (input, target) = parse_identifier(input)?;
+    let (input, target) = parse_table_name(input)?;
     let (input, target_alias) = nom::combinator::opt(parse_table_alias)(input)?;
     let (input, _) = multispace1(input)?;
     let (input, _) = tag_no_case("USING")(input)?;
@@ -943,7 +954,7 @@ pub fn parse_merge(input: &str) -> IResult<&str, SqlStatement> {
             (input, MergeSource::Subquery(Box::new(subquery)), alias)
         }
     } else {
-        let (input, tbl) = parse_identifier(input)?;
+        let (input, tbl) = parse_table_name(input)?;
         let (input, alias) = nom::combinator::opt(parse_table_alias)(input)?;
         (input, MergeSource::Table(tbl.to_string()), alias)
     };
@@ -1131,7 +1142,25 @@ pub fn parse_release(input: &str) -> IResult<&str, SqlStatement> {
 pub fn parse_drop(input: &str) -> IResult<&str, SqlStatement> {
     let (input, _) = tag_no_case("DROP")(input)?;
     let (input, _) = multispace1(input)?;
-    nom::branch::alt((parse_drop_function_inner, parse_drop_view_inner, parse_drop_index_inner, parse_drop_table_inner))(input)
+    nom::branch::alt((parse_drop_function_inner, parse_drop_view_inner, parse_drop_schema_inner, parse_drop_index_inner, parse_drop_table_inner))(input)
+}
+
+// DROP SCHEMA name [CASCADE | RESTRICT]
+fn parse_drop_schema_inner(input: &str) -> IResult<&str, SqlStatement> {
+    let (input, _) = tag_no_case("SCHEMA")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, name) = parse_identifier(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, cascade) = nom::combinator::opt(nom::branch::alt((
+        nom::combinator::map(tag_no_case("CASCADE"), |_| true),
+        nom::combinator::map(tag_no_case("RESTRICT"), |_| false),
+    )))(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
+    Ok((input, SqlStatement::DropSchema {
+        name: name.to_string(),
+        cascade: cascade.unwrap_or(false),
+    }))
 }
 
 fn parse_drop_function_inner(input: &str) -> IResult<&str, SqlStatement> {
@@ -1182,7 +1211,7 @@ fn parse_drop_table_inner(input: &str) -> IResult<&str, SqlStatement> {
     let (input, if_exists) = nom::combinator::opt(
         nom::sequence::terminated(tag_no_case("IF EXISTS"), multispace1)
     )(input)?;
-    let (input, table_name) = parse_identifier(input)?;
+    let (input, table_name) = parse_table_name(input)?;
     let (input, _) = multispace0(input)?;
     let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
 
@@ -1201,7 +1230,7 @@ pub fn parse_alter(input: &str) -> IResult<&str, SqlStatement> {
     let (input, _) = multispace1(input)?;
     let (input, _) = tag_no_case("TABLE")(input)?;
     let (input, _) = multispace1(input)?;
-    let (input, table_name) = parse_identifier(input)?;
+    let (input, table_name) = parse_table_name(input)?;
     let (input, _) = multispace1(input)?;
     let (input, action) = nom::branch::alt((
         parse_alter_add_column,

@@ -8,6 +8,8 @@ pub enum SqlStatement {
     CreateIndex(CreateIndexStatement),
     CreateView(CreateViewStatement),
     CreateFunction(CreateFunctionStatement),
+    CreateSchema(String),
+    DropSchema { name: String, cascade: bool },
     DropIndex(DropIndexStatement),
     DropTable(DropTableStatement),
     DropView(DropViewStatement),

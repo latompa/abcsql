@@ -330,6 +330,18 @@ fn execute_sql(sql: &str, storage: &Storage) {
                 Err(e) => eprintln!("Error: {}", e),
             }
         }
+        SqlStatement::CreateSchema(name) => {
+            match storage.create_schema_ns(&name) {
+                Ok(_) => println!("Created schema '{}'", name),
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        }
+        SqlStatement::DropSchema { name, cascade } => {
+            match storage.drop_schema_ns(&name, cascade) {
+                Ok(_) => println!("Dropped schema '{}'", name),
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        }
         SqlStatement::Insert(insert_stmt) => {
             match &insert_stmt.source {
                 parser::InsertSource::Values(_) | parser::InsertSource::DefaultValues => {

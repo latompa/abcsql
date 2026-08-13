@@ -2088,6 +2088,8 @@ pub(crate) fn parse_table_name(input: &str) -> IResult<&str, String> {
         parse_identifier,
     ))(input)?;
     let name = match qualifier {
+        // public is the default namespace: public.t and t are the same table
+        Some(second) if first.eq_ignore_ascii_case("public") => second.to_string(),
         Some(second) => format!("{}.{}", first, second),
         None => first.to_string(),
     };

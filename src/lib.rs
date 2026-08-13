@@ -25,6 +25,16 @@ pub fn execute(storage: &Storage, sql: &str) -> Result<String, String> {
                 .map(|_| format!("Created table '{}'", name))
                 .map_err(|e| e.to_string())
         }
+        SqlStatement::CreateSchema(name) => {
+            storage.create_schema_ns(&name)
+                .map(|_| format!("Created schema '{}'", name))
+                .map_err(|e| e.to_string())
+        }
+        SqlStatement::DropSchema { name, cascade } => {
+            storage.drop_schema_ns(&name, cascade)
+                .map(|_| format!("Dropped schema '{}'", name))
+                .map_err(|e| e.to_string())
+        }
         SqlStatement::Insert(insert_stmt) => {
             storage.insert_row(&insert_stmt)
                 .map(|(n, ret)| {

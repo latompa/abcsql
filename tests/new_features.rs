@@ -2489,3 +2489,109 @@ fn test_translate() {
     let r = with_db(&setup, "SELECT s FROM t WHERE TRANSLATE(s, '123', 'ab') = 'ab45'");
     assert!(r.as_ref().unwrap().contains("1 rows"), "TRANSLATE failed: {:?}", r);
 }
+
+// ---- New data types: TIME, TIME ZONE variants, INTERVAL, NCHAR, BIT ----
+
+#[test]
+fn test_time_type() {
+    let setup = [
+        "CREATE TABLE t (id INT, at TIME)",
+        "INSERT INTO t VALUES (1, '09:30:00'), (2, '17:45:10')",
+    ];
+    let r = with_db(&setup, "SELECT id FROM t WHERE at = '09:30:00'");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "TIME failed: {:?}", r);
+}
+
+#[test]
+fn test_time_type_rejects_invalid() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (at TIME)").unwrap();
+    assert!(execute(&db.storage, "INSERT INTO t VALUES ('25:00:00')").is_err(), "invalid hour accepted");
+    assert!(execute(&db.storage, "INSERT INTO t VALUES ('not a time')").is_err(), "junk accepted");
+}
+
+#[test]
+fn test_time_literal_keyword() {
+    let setup = [
+        "CREATE TABLE t (at TIME)",
+        "INSERT INTO t VALUES (TIME '09:30:00')",
+    ];
+    let r = with_db(&setup, "SELECT at FROM t WHERE at = TIME '09:30:00'");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "TIME literal failed: {:?}", r);
+}
+
+#[test]
+fn test_timestamp_with_time_zone_parses() {
+    let setup = [
+        "CREATE TABLE t (ts TIMESTAMP WITH TIME ZONE, ts2 TIMESTAMP WITHOUT TIME ZONE, at TIME WITH TIME ZONE)",
+        "INSERT INTO t VALUES ('2024-01-15 10:30:00', '2024-01-15 10:30:00', '10:30:00')",
+    ];
+    let r = with_db(&setup, "SELECT ts FROM t");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "WITH TIME ZONE failed: {:?}", r);
+}
+
+#[test]
+fn test_interval_column_type() {
+    let setup = [
+        "CREATE TABLE t (id INT, dur INTERVAL)",
+        "INSERT INTO t VALUES (1, INTERVAL '2' HOUR)",
+    ];
+    // intervals are stored as seconds
+    let r = with_db(&setup, "SELECT id FROM t WHERE dur = 7200");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "INTERVAL column failed: {:?}", r);
+}
+
+#[test]
+fn test_nchar_nvarchar_national() {
+    let setup = [
+        "CREATE TABLE t (a NCHAR(3), b NVARCHAR(10), c NATIONAL CHARACTER VARYING(10), d NATIONAL CHAR(2))",
+        "INSERT INTO t VALUES ('abc', 'hello', 'world', 'xy')",
+    ];
+    let r = with_db(&setup, "SELECT a FROM t WHERE b = 'hello'");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "national char types failed: {:?}", r);
+}
+
+#[test]
+fn test_character_varying() {
+    let setup = [
+        "CREATE TABLE t (a CHARACTER VARYING(20), b CHARACTER(2), c CHAR VARYING(5))",
+        "INSERT INTO t VALUES ('hello', 'xy', 'abc')",
+    ];
+    let r = with_db(&setup, "SELECT a FROM t WHERE a = 'hello' AND b = 'xy' AND c = 'abc'");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "CHARACTER VARYING failed: {:?}", r);
+}
+
+#[test]
+fn test_bit_type() {
+    let setup = [
+        "CREATE TABLE t (flags BIT(4))",
+        "INSERT INTO t VALUES (B'1010')",
+    ];
+    let r = with_db(&setup, "SELECT flags FROM t WHERE flags = '1010'");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "BIT failed: {:?}", r);
+}
+
+#[test]
+fn test_bit_type_rejects_bad_values() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (flags BIT(4))").unwrap();
+    assert!(execute(&db.storage, "INSERT INTO t VALUES ('10')").is_err(), "wrong length accepted");
+    assert!(execute(&db.storage, "INSERT INTO t VALUES ('12ab')").is_err(), "non-bits accepted");
+}
+
+#[test]
+fn test_bit_varying() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (flags BIT VARYING(8))").unwrap();
+    execute(&db.storage, "INSERT INTO t VALUES (B'101')").unwrap();
+    assert!(execute(&db.storage, "INSERT INTO t VALUES (B'101010101')").is_err(), "overlong bit varying accepted");
+}
+
+#[test]
+fn test_new_types_survive_reload() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (at TIME, dur INTERVAL, flags BIT VARYING(8))").unwrap();
+    execute(&db.storage, "INSERT INTO t VALUES ('10:00:00', 60, B'11')").unwrap();
+    // schema is re-read per statement — round-trip must preserve types
+    assert!(execute(&db.storage, "INSERT INTO t VALUES ('bad', 60, B'11')").is_err(), "TIME validation lost after reload");
+}

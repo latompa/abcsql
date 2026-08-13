@@ -1845,6 +1845,9 @@ pub(crate) fn parse_value(input: &str) -> IResult<&str, Value> {
     let (input, value) = nom::branch::alt((
         parse_date_value,
         parse_timestamp_value,
+        parse_time_value,
+        parse_interval_value,
+        parse_bit_string_value,
         parse_string_value,
         parse_null_value,
         parse_bool_value,
@@ -1852,6 +1855,28 @@ pub(crate) fn parse_value(input: &str) -> IResult<&str, Value> {
         parse_int_value,
     ))(input)?;
     Ok((input, value))
+}
+
+/// Parse TIME 'HH:MM:SS' as a plain string value (TIME columns store strings)
+fn parse_time_value(input: &str) -> IResult<&str, Value> {
+    let (input, _) = tag_no_case("TIME")(input)?;
+    let (input, _) = multispace1(input)?;
+    parse_string_value(input)
+}
+
+/// Parse INTERVAL 'n' UNIT as its integer number of seconds
+fn parse_interval_value(input: &str) -> IResult<&str, Value> {
+    let (input, expr) = parse_expression_interval(input)?;
+    match expr {
+        Expression::Literal(v) => Ok((input, v)),
+        _ => Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag))),
+    }
+}
+
+/// Parse B'1010' bit-string literal as a plain string value
+fn parse_bit_string_value(input: &str) -> IResult<&str, Value> {
+    let (input, _) = tag_no_case("B")(input)?;
+    parse_string_value(input)
 }
 
 /// Parse DATE 'YYYY-MM-DD' as Value::Date

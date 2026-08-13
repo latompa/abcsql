@@ -231,6 +231,10 @@ pub enum DataType {
     Boolean,
     Date,
     Timestamp,
+    Time,                              // TIME — stored as 'HH:MM:SS' string
+    Interval,                          // INTERVAL — stored as integer seconds
+    Bit(Option<usize>),                // BIT(n) — fixed-length string of 0/1
+    BitVarying(Option<usize>),         // BIT VARYING(n) — variable-length string of 0/1
     Varchar(Option<usize>),            // VARCHAR(255) or VARCHAR
     Char(Option<usize>),               // CHAR(n) or CHAR
     Text,                              // unlimited text

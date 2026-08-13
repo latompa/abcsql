@@ -2418,6 +2418,12 @@ fn data_type_to_string(data_type: &DataType) -> String {
         DataType::Boolean => "BOOLEAN".to_string(),
         DataType::Date => "DATE".to_string(),
         DataType::Timestamp => "TIMESTAMP".to_string(),
+        DataType::Time => "TIME".to_string(),
+        DataType::Interval => "INTERVAL".to_string(),
+        DataType::Bit(Some(n)) => format!("BIT({})", n),
+        DataType::Bit(None) => "BIT".to_string(),
+        DataType::BitVarying(Some(n)) => format!("BIT_VARYING({})", n),
+        DataType::BitVarying(None) => "BIT_VARYING".to_string(),
         DataType::Varchar(Some(size)) => format!("VARCHAR({})", size),
         DataType::Varchar(None) => "VARCHAR".to_string(),
         DataType::Char(Some(size)) => format!("CHAR({})", size),
@@ -2443,6 +2449,20 @@ fn parse_data_type(s: &str) -> Result<DataType, StorageError> {
     if s == "BOOLEAN" || s == "BOOL" { return Ok(DataType::Boolean); }
     if s == "DATE" { return Ok(DataType::Date); }
     if s == "TIMESTAMP" { return Ok(DataType::Timestamp); }
+    if s == "TIME" { return Ok(DataType::Time); }
+    if s == "INTERVAL" { return Ok(DataType::Interval); }
+    if s == "BIT" { return Ok(DataType::Bit(None)); }
+    if s.starts_with("BIT(") && s.ends_with(')') {
+        let size = s[4..s.len()-1].parse::<usize>()
+            .map_err(|_| StorageError::InvalidSchema(format!("Invalid BIT size: {}", s)))?;
+        return Ok(DataType::Bit(Some(size)));
+    }
+    if s == "BIT_VARYING" { return Ok(DataType::BitVarying(None)); }
+    if s.starts_with("BIT_VARYING(") && s.ends_with(')') {
+        let size = s[12..s.len()-1].parse::<usize>()
+            .map_err(|_| StorageError::InvalidSchema(format!("Invalid BIT VARYING size: {}", s)))?;
+        return Ok(DataType::BitVarying(Some(size)));
+    }
     if s == "TEXT" { return Ok(DataType::Text); }
     if s == "UUID" { return Ok(DataType::Uuid); }
     if s == "JSON" { return Ok(DataType::Json); }
@@ -2487,6 +2507,10 @@ fn validate_value_type(value: &Value, data_type: &DataType, column_name: &str) -
         (Value::Timestamp(_), DataType::Timestamp) => Ok(()),
         (Value::String(s), DataType::Date) => validate_date_format(s, column_name),
         (Value::String(s), DataType::Timestamp) => validate_timestamp_format(s, column_name),
+        (Value::String(s), DataType::Time) => validate_time_format(s, column_name),
+        (Value::Int(_), DataType::Interval) => Ok(()),
+        (Value::String(s), DataType::Bit(n)) => validate_bit_string(s, *n, true, column_name),
+        (Value::String(s), DataType::BitVarying(n)) => validate_bit_string(s, *n, false, column_name),
         (Value::String(_), DataType::Varchar(_) | DataType::Char(_) | DataType::Text) => Ok(()),
         (Value::Json(_) | Value::String(_), DataType::Json | DataType::Jsonb) => Ok(()),
         (Value::String(_), DataType::Uuid) => Ok(()), // UUID stored as string
@@ -2495,6 +2519,39 @@ fn validate_value_type(value: &Value, data_type: &DataType, column_name: &str) -
             expected: format!("{:?}", data_type),
             got: format!("{:?}", value),
         }),
+    }
+}
+
+// Validate HH:MM:SS format with valid ranges
+fn validate_time_format(s: &str, column_name: &str) -> Result<(), StorageError> {
+    let err = || StorageError::TypeMismatch {
+        column: column_name.to_string(),
+        expected: "TIME 'HH:MM:SS'".to_string(),
+        got: s.to_string(),
+    };
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 3 { return Err(err()); }
+    let h: u32 = parts[0].parse().map_err(|_| err())?;
+    let m: u32 = parts[1].parse().map_err(|_| err())?;
+    let sec: u32 = parts[2].parse().map_err(|_| err())?;
+    if h > 23 || m > 59 || sec > 59 { return Err(err()); }
+    Ok(())
+}
+
+// Validate a bit string: only 0/1 chars; exact length for BIT(n), max length for BIT VARYING(n)
+fn validate_bit_string(s: &str, size: Option<usize>, fixed: bool, column_name: &str) -> Result<(), StorageError> {
+    let err = |expected: String| StorageError::TypeMismatch {
+        column: column_name.to_string(),
+        expected,
+        got: s.to_string(),
+    };
+    if !s.chars().all(|c| c == '0' || c == '1') {
+        return Err(err("bit string of 0/1".to_string()));
+    }
+    match (size, fixed) {
+        (Some(n), true) if s.len() != n => Err(err(format!("BIT({})", n))),
+        (Some(n), false) if s.len() > n => Err(err(format!("BIT VARYING({})", n))),
+        _ => Ok(()),
     }
 }
 

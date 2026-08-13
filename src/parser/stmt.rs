@@ -403,7 +403,9 @@ fn parse_check_constraint(input: &str) -> IResult<&str, (Condition, String)> {
 fn parse_data_type(input: &str) -> IResult<&str, DataType> {
     nom::branch::alt((
         nom::branch::alt((
-            parse_timestamp_type,  // before DATE
+            parse_timestamp_type,  // before TIME
+            parse_time_type,
+            parse_interval_type,
             parse_double_type,     // before generic identifiers
             parse_smallint_type,   // before INT
             parse_bigint_type,     // before INT
@@ -415,7 +417,10 @@ fn parse_data_type(input: &str) -> IResult<&str, DataType> {
         nom::branch::alt((
             parse_boolean_type,
             parse_date_type,
+            parse_national_type,   // NATIONAL CHAR / NCHAR / NVARCHAR before CHAR
+            parse_bit_type,
             parse_varchar_type,
+            parse_character_type,  // CHARACTER [VARYING] / CHAR VARYING before CHAR
             parse_char_type,
             parse_text_type,
             parse_numeric_type,    // NUMERIC before anything shorter
@@ -427,6 +432,84 @@ fn parse_data_type(input: &str) -> IResult<&str, DataType> {
     ))(input)
 }
 
+/// Parse optional WITH/WITHOUT TIME ZONE suffix (accepted and ignored; values are
+/// stored without zone information)
+fn parse_time_zone_suffix(input: &str) -> &str {
+    let attempt = (|| -> IResult<&str, ()> {
+        let (i, _) = multispace1(input)?;
+        let (i, _) = nom::branch::alt((tag_no_case("WITHOUT"), tag_no_case("WITH")))(i)?;
+        let (i, _) = multispace1(i)?;
+        let (i, _) = tag_no_case("TIME")(i)?;
+        let (i, _) = multispace1(i)?;
+        let (i, _) = tag_no_case("ZONE")(i)?;
+        Ok((i, ()))
+    })();
+    match attempt {
+        Ok((rest, _)) => rest,
+        Err(_) => input,
+    }
+}
+
+/// Parse optional (n) size suffix
+fn parse_size_suffix(input: &str) -> IResult<&str, Option<usize>> {
+    let (input, size) = nom::combinator::opt(delimited(
+        nom_char('('),
+        nom::sequence::delimited(multispace0, nom::character::complete::u64, multispace0),
+        nom_char(')'),
+    ))(input)?;
+    Ok((input, size.map(|s| s as usize)))
+}
+
+fn parse_time_type(input: &str) -> IResult<&str, DataType> {
+    let (input, _) = tag_no_case("TIME")(input)?;
+    let input = parse_time_zone_suffix(input);
+    Ok((input, DataType::Time))
+}
+
+fn parse_interval_type(input: &str) -> IResult<&str, DataType> {
+    let (input, _) = tag_no_case("INTERVAL")(input)?;
+    Ok((input, DataType::Interval))
+}
+
+/// NCHAR / NVARCHAR / NATIONAL CHAR[ACTER] [VARYING] — mapped to CHAR/VARCHAR
+fn parse_national_type(input: &str) -> IResult<&str, DataType> {
+    if let Ok((i, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("NVARCHAR")(input) {
+        let (i, size) = parse_size_suffix(i)?;
+        return Ok((i, DataType::Varchar(size)));
+    }
+    if let Ok((i, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("NCHAR")(input) {
+        let (i, size) = parse_size_suffix(i)?;
+        return Ok((i, DataType::Char(size)));
+    }
+    let (input, _) = tag_no_case("NATIONAL")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, _) = nom::branch::alt((tag_no_case("CHARACTER"), tag_no_case("CHAR")))(input)?;
+    let (input, varying) = nom::combinator::opt(nom::sequence::preceded(multispace1, tag_no_case("VARYING")))(input)?;
+    let (input, size) = parse_size_suffix(input)?;
+    Ok((input, if varying.is_some() { DataType::Varchar(size) } else { DataType::Char(size) }))
+}
+
+/// CHARACTER [VARYING] and CHAR VARYING — spec names for CHAR/VARCHAR
+fn parse_character_type(input: &str) -> IResult<&str, DataType> {
+    if let Ok((i, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("CHARACTER")(input) {
+        let (i, varying) = nom::combinator::opt(nom::sequence::preceded(multispace1, tag_no_case("VARYING")))(i)?;
+        let (i, size) = parse_size_suffix(i)?;
+        return Ok((i, if varying.is_some() { DataType::Varchar(size) } else { DataType::Char(size) }));
+    }
+    let (input, _) = tag_no_case("CHAR")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, _) = tag_no_case("VARYING")(input)?;
+    let (input, size) = parse_size_suffix(input)?;
+    Ok((input, DataType::Varchar(size)))
+}
+
+fn parse_bit_type(input: &str) -> IResult<&str, DataType> {
+    let (input, _) = tag_no_case("BIT")(input)?;
+    let (input, varying) = nom::combinator::opt(nom::sequence::preceded(multispace1, tag_no_case("VARYING")))(input)?;
+    let (input, size) = parse_size_suffix(input)?;
+    Ok((input, if varying.is_some() { DataType::BitVarying(size) } else { DataType::Bit(size) }))
+}
+
 fn parse_date_type(input: &str) -> IResult<&str, DataType> {
     let (input, _) = tag_no_case("DATE")(input)?;
     Ok((input, DataType::Date))
@@ -434,6 +517,7 @@ fn parse_date_type(input: &str) -> IResult<&str, DataType> {
 
 fn parse_timestamp_type(input: &str) -> IResult<&str, DataType> {
     let (input, _) = tag_no_case("TIMESTAMP")(input)?;
+    let input = parse_time_zone_suffix(input);
     Ok((input, DataType::Timestamp))
 }
 

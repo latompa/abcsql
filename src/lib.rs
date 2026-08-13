@@ -1158,6 +1158,14 @@ fn resolve_expr(expr: &parser::Expression, row: &[Value], cols: &[(String, Strin
         // Date/time expressions
         parser::Expression::CurrentDate => Some(Value::Date(parser::current_epoch_days())),
         parser::Expression::CurrentTimestamp => Some(Value::Timestamp(parser::current_epoch_secs())),
+        parser::Expression::CurrentTime => Some(Value::String(parser::current_time_string())),
+        parser::Expression::CurrentUser => Some(Value::String(parser::current_user_name())),
+        parser::Expression::AtTimeZone(inner, offset) => {
+            match resolve_expr(inner, row, cols, storage)? {
+                Value::Timestamp(ts) => Some(Value::Timestamp(ts + offset)),
+                other => Some(other),
+            }
+        }
         parser::Expression::Extract(field, expr) => {
             let v = resolve_expr(expr, row, cols, storage)?;
             lib_eval_extract(field, v)

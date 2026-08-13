@@ -3298,6 +3298,14 @@ fn resolve_expression(expr: &Expression, row: &[Value], schema: &[ColumnDefiniti
         }
         Expression::CurrentDate => Some(Value::Date(crate::parser::current_epoch_days())),
         Expression::CurrentTimestamp => Some(Value::Timestamp(crate::parser::current_epoch_secs())),
+        Expression::CurrentTime => Some(Value::String(crate::parser::current_time_string())),
+        Expression::CurrentUser => Some(Value::String(crate::parser::current_user_name())),
+        Expression::AtTimeZone(inner, offset) => {
+            match resolve_expression(inner, row, schema, storage)? {
+                Value::Timestamp(ts) => Some(Value::Timestamp(ts + offset)),
+                other => Some(other),
+            }
+        }
         Expression::Extract(field, inner) => {
             let v = resolve_expression(inner, row, schema, storage)?;
             storage_eval_extract(field, v)

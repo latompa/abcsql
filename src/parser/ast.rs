@@ -577,6 +577,10 @@ pub enum Expression {
     // Date/time expressions
     CurrentDate,
     CurrentTimestamp,
+    CurrentTime,  // CURRENT_TIME / LOCALTIME — evaluates to an 'HH:MM:SS' string
+    CurrentUser,  // CURRENT_USER / SESSION_USER / USER
+    // expr AT TIME ZONE 'UTC'/'+HH:MM' — shifts a timestamp by a fixed offset in seconds
+    AtTimeZone(Box<Expression>, i64),
     // EXTRACT(field FROM expr) or DATE_PART('field', expr)
     Extract(String, Box<Expression>),
     // DATE_TRUNC('unit', expr)

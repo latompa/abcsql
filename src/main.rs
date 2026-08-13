@@ -2643,6 +2643,9 @@ fn format_expr(expr: &parser::Expression) -> String {
         parser::Expression::Repeat(s, n) => format!("repeat({}, {})", format_expr(s), format_expr(n)),
         parser::Expression::CurrentDate => "CURRENT_DATE".to_string(),
         parser::Expression::CurrentTimestamp => "CURRENT_TIMESTAMP".to_string(),
+        parser::Expression::CurrentTime => "CURRENT_TIME".to_string(),
+        parser::Expression::CurrentUser => "CURRENT_USER".to_string(),
+        parser::Expression::AtTimeZone(inner, _) => format!("{} AT TIME ZONE", format_expr(inner)),
         parser::Expression::Extract(field, expr) => format!("EXTRACT({} FROM {})", field, format_expr(expr)),
         parser::Expression::DateTrunc(field, expr) => format!("DATE_TRUNC('{}', {})", field.to_lowercase(), format_expr(expr)),
         parser::Expression::DateDiff(unit, e1, e2) => format!("DATEDIFF({}, {}, {})", unit.to_lowercase(), format_expr(e1), format_expr(e2)),
@@ -3411,6 +3414,14 @@ fn resolve_join_expression(
         // Date/time expressions
         parser::Expression::CurrentDate => Some(Value::Date(parser::current_epoch_days())),
         parser::Expression::CurrentTimestamp => Some(Value::Timestamp(parser::current_epoch_secs())),
+        parser::Expression::CurrentTime => Some(Value::String(parser::current_time_string())),
+        parser::Expression::CurrentUser => Some(Value::String(parser::current_user_name())),
+        parser::Expression::AtTimeZone(inner, offset) => {
+            match resolve_join_expression(inner, row, cols, storage)? {
+                Value::Timestamp(ts) => Some(Value::Timestamp(ts + offset)),
+                other => Some(other),
+            }
+        }
         parser::Expression::Extract(field, expr) => {
             let v = resolve_join_expression(expr, row, cols, storage)?;
             eval_extract(field, v)

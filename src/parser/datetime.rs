@@ -82,6 +82,17 @@ pub fn current_epoch_secs() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
 }
 
+/// Current UTC time of day as 'HH:MM:SS'
+pub fn current_time_string() -> String {
+    let secs = current_epoch_secs().rem_euclid(86400);
+    format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
+}
+
+/// Session user name: the OS user, falling back to "abcsql"
+pub fn current_user_name() -> String {
+    std::env::var("USER").unwrap_or_else(|_| "abcsql".to_string())
+}
+
 pub fn interval_unit_secs(unit: &str) -> Option<i64> {
     match unit.to_uppercase().as_str() {
         "SECOND" | "SECONDS" => Some(1),

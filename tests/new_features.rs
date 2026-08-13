@@ -2595,3 +2595,65 @@ fn test_new_types_survive_reload() {
     // schema is re-read per statement — round-trip must preserve types
     assert!(execute(&db.storage, "INSERT INTO t VALUES ('bad', 60, B'11')").is_err(), "TIME validation lost after reload");
 }
+
+// ---- Datetime/session value functions ----
+
+#[test]
+fn test_current_time_shape() {
+    let setup = ["CREATE TABLE t (id INT)", "INSERT INTO t VALUES (1)"];
+    // HH:MM:SS is 8 chars
+    let r = with_db(&setup, "SELECT id FROM t WHERE CHAR_LENGTH(CURRENT_TIME) = 8");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "CURRENT_TIME failed: {:?}", r);
+}
+
+#[test]
+fn test_localtime_and_localtimestamp() {
+    let setup = ["CREATE TABLE t (id INT)", "INSERT INTO t VALUES (1)"];
+    let r = with_db(&setup, "SELECT id FROM t WHERE LOCALTIME = CURRENT_TIME AND LOCALTIMESTAMP IS NOT NULL");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "LOCALTIME/LOCALTIMESTAMP failed: {:?}", r);
+}
+
+#[test]
+fn test_current_user_and_aliases() {
+    let setup = ["CREATE TABLE t (id INT)", "INSERT INTO t VALUES (1)"];
+    let r = with_db(&setup, "SELECT id FROM t WHERE CURRENT_USER = SESSION_USER AND USER = CURRENT_USER AND CHAR_LENGTH(CURRENT_USER) > 0");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "CURRENT_USER family failed: {:?}", r);
+}
+
+#[test]
+fn test_current_user_in_default() {
+    let setup = [
+        "CREATE TABLE audit (id INT, who VARCHAR DEFAULT CURRENT_USER)",
+        "INSERT INTO audit (id) VALUES (1)",
+    ];
+    let r = with_db(&setup, "SELECT id FROM audit WHERE who = CURRENT_USER");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "CURRENT_USER default failed: {:?}", r);
+}
+
+#[test]
+fn test_at_time_zone() {
+    let setup = [
+        "CREATE TABLE t (ts TIMESTAMP)",
+        "INSERT INTO t VALUES ('2024-01-15 10:00:00')",
+    ];
+    // +02:00 shifts forward two hours
+    let r = with_db(&setup, "SELECT ts FROM t WHERE ts AT TIME ZONE '+02:00' = TIMESTAMP '2024-01-15 12:00:00'");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "AT TIME ZONE offset failed: {:?}", r);
+}
+
+#[test]
+fn test_at_time_zone_utc_identity() {
+    let setup = [
+        "CREATE TABLE t (ts TIMESTAMP)",
+        "INSERT INTO t VALUES ('2024-01-15 10:00:00')",
+    ];
+    let r = with_db(&setup, "SELECT ts FROM t WHERE ts AT TIME ZONE 'UTC' = ts");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "AT TIME ZONE UTC failed: {:?}", r);
+}
+
+#[test]
+fn test_column_named_at_still_works() {
+    let setup = ["CREATE TABLE t (at TIME)", "INSERT INTO t VALUES ('10:00:00')"];
+    let r = with_db(&setup, "SELECT at FROM t WHERE at = '10:00:00'");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "column named 'at' broken: {:?}", r);
+}

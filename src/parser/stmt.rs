@@ -1549,6 +1549,7 @@ fn parse_arith_select_column(input: &str) -> IResult<&str, SelectColumn> {
         | Expression::Power(_, _) | Expression::Position(_, _) | Expression::Repeat(_, _)
         | Expression::Literal(_) | Expression::Subquery(_)
         | Expression::CurrentDate | Expression::CurrentTimestamp
+        | Expression::CurrentTime | Expression::CurrentUser | Expression::AtTimeZone(_, _)
         | Expression::Extract(_, _) | Expression::DateTrunc(_, _)
         | Expression::DateDiff(_, _, _) | Expression::DateAdd(_, _, _)
         | Expression::JsonTypeOf(_) | Expression::JsonArrayLength(_)

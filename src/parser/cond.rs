@@ -573,7 +573,49 @@ pub fn parse_expression(input: &str) -> IResult<&str, Expression> {
         left = Expression::BinaryOp(Box::new(left), ArithOp::Concat, Box::new(right));
         input = remaining;
     }
+
+    // Postfix AT TIME ZONE 'UTC' / '+HH:MM' — shifts a timestamp by a fixed offset
+    if let Ok((rest, offset)) = parse_at_time_zone(input) {
+        return Ok((rest, Expression::AtTimeZone(Box::new(left), offset)));
+    }
+
     Ok((input, left))
+}
+
+/// Parse AT TIME ZONE 'zone' and return the zone's offset in seconds.
+/// Supported zones: 'UTC' and fixed offsets like '+05:30' or '-08:00'.
+fn parse_at_time_zone(input: &str) -> IResult<&str, i64> {
+    let (input, _) = multispace1(input)?;
+    let (input, _) = tag_no_case("AT")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, _) = tag_no_case("TIME")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, _) = tag_no_case("ZONE")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, zone) = parse_string_value(input)?;
+    let zone = match zone {
+        Value::String(s) => s,
+        _ => return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag))),
+    };
+    let offset = parse_zone_offset(&zone)
+        .ok_or_else(|| nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Verify)))?;
+    Ok((input, offset))
+}
+
+/// Convert a zone string to its offset in seconds: 'UTC' => 0, '+HH:MM' / '-HH:MM' => signed offset
+fn parse_zone_offset(zone: &str) -> Option<i64> {
+    let z = zone.trim().to_uppercase();
+    if z == "UTC" || z == "Z" || z == "GMT" { return Some(0); }
+    let (sign, rest) = match z.strip_prefix('+') {
+        Some(r) => (1, r),
+        None => (-1, z.strip_prefix('-')?),
+    };
+    let (h, m) = match rest.split_once(':') {
+        Some((h, m)) => (h.parse::<i64>().ok()?, m.parse::<i64>().ok()?),
+        None => (rest.parse::<i64>().ok()?, 0),
+    };
+    if h > 14 || m > 59 { return None; }
+    Some(sign * (h * 3600 + m * 60))
 }
 
 /// Parse JSON field access: expr -> key  or  expr ->> key  (higher precedence than ||)
@@ -649,9 +691,13 @@ fn parse_atom(input: &str) -> IResult<&str, Expression> {
             parse_expression_overlay,
             parse_expression_lpad,
             parse_expression_rpad,
+        )),
+        nom::branch::alt((
             // Date/time expressions (try before window and scalar to catch keywords)
             parse_expression_current_date,
             parse_expression_current_timestamp,
+            parse_expression_current_time,
+            parse_expression_current_user,
             parse_expression_extract,
             parse_expression_date_trunc,
             parse_expression_datediff,
@@ -1105,10 +1151,13 @@ fn parse_expression_current_date(input: &str) -> IResult<&str, Expression> {
     Ok((input, Expression::CurrentDate))
 }
 
-/// Parse CURRENT_TIMESTAMP or NOW() — both return the current timestamp
+/// Parse CURRENT_TIMESTAMP, LOCALTIMESTAMP or NOW() — all return the current timestamp
 fn parse_expression_current_timestamp(input: &str) -> IResult<&str, Expression> {
-    // Try CURRENT_TIMESTAMP first (no parens)
-    if let Ok((rest, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("CURRENT_TIMESTAMP")(input) {
+    // Try CURRENT_TIMESTAMP / LOCALTIMESTAMP first (no parens)
+    if let Ok((rest, _)) = nom::branch::alt((
+        tag_no_case::<&str, &str, nom::error::Error<&str>>("CURRENT_TIMESTAMP"),
+        tag_no_case::<&str, &str, nom::error::Error<&str>>("LOCALTIMESTAMP"),
+    ))(input) {
         // optionally consume empty parentheses
         let rest2 = rest.trim_start();
         if rest2.starts_with("()") {
@@ -1123,6 +1172,32 @@ fn parse_expression_current_timestamp(input: &str) -> IResult<&str, Expression> 
     let (input, _) = multispace0(input)?;
     let (input, _) = nom_char(')')(input)?;
     Ok((input, Expression::CurrentTimestamp))
+}
+
+/// Parse CURRENT_TIME or LOCALTIME — the current time of day
+fn parse_expression_current_time(input: &str) -> IResult<&str, Expression> {
+    let (rest, _) = nom::branch::alt((
+        tag_no_case("CURRENT_TIME"),
+        tag_no_case("LOCALTIME"),
+    ))(input)?;
+    // Reject when part of a longer word (e.g. LOCALTIMEZONE-ish identifiers)
+    if rest.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+        return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)));
+    }
+    Ok((rest, Expression::CurrentTime))
+}
+
+/// Parse CURRENT_USER, SESSION_USER or USER — the session user name
+fn parse_expression_current_user(input: &str) -> IResult<&str, Expression> {
+    let (rest, _) = nom::branch::alt((
+        tag_no_case("CURRENT_USER"),
+        tag_no_case("SESSION_USER"),
+        tag_no_case("USER"),
+    ))(input)?;
+    if rest.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+        return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)));
+    }
+    Ok((rest, Expression::CurrentUser))
 }
 
 /// Parse DATE 'YYYY-MM-DD' literal

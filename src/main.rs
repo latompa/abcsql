@@ -2543,6 +2543,9 @@ fn format_expr(expr: &parser::Expression) -> String {
                 parser::ScalarFunc::Second => "second",
                 parser::ScalarFunc::DayOfWeek => "dayofweek",
                 parser::ScalarFunc::DayOfYear => "dayofyear",
+                parser::ScalarFunc::CharLength => "char_length",
+                parser::ScalarFunc::OctetLength => "octet_length",
+                parser::ScalarFunc::TrimChars(_, _) => "trim",
             };
             format!("{}({})", name, format_expr(inner))
         }
@@ -2564,6 +2567,7 @@ fn format_expr(expr: &parser::Expression) -> String {
             None => format!("substr({}, {})", format_expr(s), format_expr(start)),
         },
         parser::Expression::Replace(s, from, to) => format!("replace({}, {}, {})", format_expr(s), format_expr(from), format_expr(to)),
+        parser::Expression::Translate(s, from, to) => format!("translate({}, {}, {})", format_expr(s), format_expr(from), format_expr(to)),
         parser::Expression::LPad(s, len, pad) => format!("lpad({}, {}, {})", format_expr(s), format_expr(len), format_expr(pad)),
         parser::Expression::RPad(s, len, pad) => format!("rpad({}, {}, {})", format_expr(s), format_expr(len), format_expr(pad)),
         parser::Expression::Cast(inner, type_name) => format!("cast({} as {})", format_expr(inner), type_name.to_lowercase()),
@@ -3340,6 +3344,12 @@ fn resolve_join_expression(
             let fv = resolve_join_expression(from, row, cols, storage)?;
             let tv = resolve_join_expression(to, row, cols, storage)?;
             parser::apply_replace(sv, fv, tv)
+        }
+        parser::Expression::Translate(s, from, to) => {
+            let sv = resolve_join_expression(s, row, cols, storage)?;
+            let fv = resolve_join_expression(from, row, cols, storage)?;
+            let tv = resolve_join_expression(to, row, cols, storage)?;
+            parser::apply_translate(sv, fv, tv)
         }
         parser::Expression::LPad(s, len, pad) => {
             let sv = resolve_join_expression(s, row, cols, storage)?;

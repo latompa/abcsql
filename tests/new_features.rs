@@ -2401,3 +2401,91 @@ fn test_paren_condition_not_broken_by_rows() {
     let r = with_db(&setup, "SELECT a FROM t WHERE (a = 1 OR b = 4) AND b > 0");
     assert!(r.as_ref().unwrap().contains("2 rows"), "paren conditions regressed: {:?}", r);
 }
+
+// ---- Spec-form string functions ----
+
+#[test]
+fn test_trim_leading_chars() {
+    let setup = ["CREATE TABLE t (s VARCHAR)", "INSERT INTO t VALUES ('xxhixx')"];
+    let r = with_db(&setup, "SELECT s FROM t WHERE TRIM(LEADING 'x' FROM s) = 'hixx'");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "TRIM LEADING failed: {:?}", r);
+}
+
+#[test]
+fn test_trim_trailing_chars() {
+    let setup = ["CREATE TABLE t (s VARCHAR)", "INSERT INTO t VALUES ('xxhixx')"];
+    let r = with_db(&setup, "SELECT s FROM t WHERE TRIM(TRAILING 'x' FROM s) = 'xxhi'");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "TRIM TRAILING failed: {:?}", r);
+}
+
+#[test]
+fn test_trim_both_chars() {
+    let setup = ["CREATE TABLE t (s VARCHAR)", "INSERT INTO t VALUES ('xxhixx')"];
+    let r = with_db(&setup, "SELECT s FROM t WHERE TRIM(BOTH 'x' FROM s) = 'hi'");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "TRIM BOTH failed: {:?}", r);
+}
+
+#[test]
+fn test_trim_chars_no_mode() {
+    let setup = ["CREATE TABLE t (s VARCHAR)", "INSERT INTO t VALUES ('zzhizz')"];
+    let r = with_db(&setup, "SELECT s FROM t WHERE TRIM('z' FROM s) = 'hi'");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "TRIM chars-only failed: {:?}", r);
+}
+
+#[test]
+fn test_trim_from_whitespace_mode_only() {
+    let setup = ["CREATE TABLE t (s VARCHAR)", "INSERT INTO t VALUES ('  hi  ')"];
+    let r = with_db(&setup, "SELECT s FROM t WHERE TRIM(LEADING FROM s) = 'hi  '");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "TRIM(LEADING FROM s) failed: {:?}", r);
+}
+
+#[test]
+fn test_plain_trim_still_works() {
+    let setup = ["CREATE TABLE t (s VARCHAR)", "INSERT INTO t VALUES ('  hi ')"];
+    let r = with_db(&setup, "SELECT s FROM t WHERE TRIM(s) = 'hi'");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "plain TRIM regressed: {:?}", r);
+}
+
+#[test]
+fn test_substring_from_for() {
+    let setup = ["CREATE TABLE t (s VARCHAR)", "INSERT INTO t VALUES ('abcdef')"];
+    let r = with_db(&setup, "SELECT s FROM t WHERE SUBSTRING(s FROM 2 FOR 3) = 'bcd'");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "SUBSTRING FROM/FOR failed: {:?}", r);
+}
+
+#[test]
+fn test_substring_from_only() {
+    let setup = ["CREATE TABLE t (s VARCHAR)", "INSERT INTO t VALUES ('abcdef')"];
+    let r = with_db(&setup, "SELECT s FROM t WHERE SUBSTRING(s FROM 4) = 'def'");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "SUBSTRING FROM failed: {:?}", r);
+}
+
+#[test]
+fn test_char_length_and_octet_length() {
+    let setup = ["CREATE TABLE t (s VARCHAR)", "INSERT INTO t VALUES ('hello')"];
+    let r = with_db(&setup, "SELECT s FROM t WHERE CHAR_LENGTH(s) = 5 AND CHARACTER_LENGTH(s) = 5 AND OCTET_LENGTH(s) = 5");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "length functions failed: {:?}", r);
+}
+
+#[test]
+fn test_overlay() {
+    let setup = ["CREATE TABLE t (s VARCHAR)", "INSERT INTO t VALUES ('Txxxxas')"];
+    let r = with_db(&setup, "SELECT s FROM t WHERE OVERLAY(s PLACING 'hom' FROM 2 FOR 4) = 'Thomas'");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "OVERLAY failed: {:?}", r);
+}
+
+#[test]
+fn test_overlay_default_length() {
+    let setup = ["CREATE TABLE t (s VARCHAR)", "INSERT INTO t VALUES ('abcdef')"];
+    // Without FOR, replaced span = replacement length (2)
+    let r = with_db(&setup, "SELECT s FROM t WHERE OVERLAY(s PLACING 'XY' FROM 3) = 'abXYef'");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "OVERLAY default length failed: {:?}", r);
+}
+
+#[test]
+fn test_translate() {
+    let setup = ["CREATE TABLE t (s VARCHAR)", "INSERT INTO t VALUES ('12345')"];
+    // 1→a, 2→b, 3 dropped (to shorter than from)
+    let r = with_db(&setup, "SELECT s FROM t WHERE TRANSLATE(s, '123', 'ab') = 'ab45'");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "TRANSLATE failed: {:?}", r);
+}

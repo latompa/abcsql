@@ -421,12 +421,19 @@ pub enum WindowFunc {
     NthValue(Box<Expression>, Box<Expression>), // NTH_VALUE(expr, n)
 }
 
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum TrimMode { Leading, Trailing, Both }
+
 #[derive(Debug, PartialEq, Clone)]
 pub enum ScalarFunc {
     Upper,
     Lower,
     Length,
+    CharLength,   // CHAR_LENGTH / CHARACTER_LENGTH — counts characters
+    OctetLength,  // OCTET_LENGTH — counts bytes
     Trim,
+    // Spec-form TRIM([LEADING|TRAILING|BOTH] [chars] FROM str); None = whitespace
+    TrimChars(TrimMode, Option<String>),
     LTrim,
     RTrim,
     Abs,
@@ -547,6 +554,8 @@ pub enum Expression {
     Cast(Box<Expression>, String),
     // REPLACE(str, from, to)
     Replace(Box<Expression>, Box<Expression>, Box<Expression>),
+    // TRANSLATE(str, from_chars, to_chars)
+    Translate(Box<Expression>, Box<Expression>, Box<Expression>),
     // LPAD(str, len, pad) / RPAD(str, len, pad)
     LPad(Box<Expression>, Box<Expression>, Box<Expression>),
     RPad(Box<Expression>, Box<Expression>, Box<Expression>),

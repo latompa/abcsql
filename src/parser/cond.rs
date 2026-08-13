@@ -644,6 +644,9 @@ fn parse_atom(input: &str) -> IResult<&str, Expression> {
         nom::branch::alt((
             parse_expression_cast,
             parse_expression_replace,
+            parse_expression_translate,
+            parse_expression_trim_spec,
+            parse_expression_overlay,
             parse_expression_lpad,
             parse_expression_rpad,
             // Date/time expressions (try before window and scalar to catch keywords)
@@ -766,6 +769,9 @@ fn parse_expression_scalar_func(input: &str) -> IResult<&str, Expression> {
         nom::branch::alt((
             tag_no_case("UPPER"),
             tag_no_case("LOWER"),
+            tag_no_case("CHARACTER_LENGTH"),
+            tag_no_case("CHAR_LENGTH"),
+            tag_no_case("OCTET_LENGTH"),
             tag_no_case("LENGTH"),
             tag_no_case("LTRIM"),
             tag_no_case("RTRIM"),
@@ -795,6 +801,8 @@ fn parse_expression_scalar_func(input: &str) -> IResult<&str, Expression> {
         "UPPER"   => ScalarFunc::Upper,
         "LOWER"   => ScalarFunc::Lower,
         "LENGTH"  => ScalarFunc::Length,
+        "CHAR_LENGTH" | "CHARACTER_LENGTH" => ScalarFunc::CharLength,
+        "OCTET_LENGTH" => ScalarFunc::OctetLength,
         "LTRIM"   => ScalarFunc::LTrim,
         "RTRIM"   => ScalarFunc::RTrim,
         "TRIM"    => ScalarFunc::Trim,
@@ -852,6 +860,23 @@ fn parse_expression_substr(input: &str) -> IResult<&str, Expression> {
     let (input, _) = multispace0(input)?;
     let (input, s) = parse_expression(input)?;
     let (input, _) = multispace0(input)?;
+
+    // Spec form: SUBSTRING(str FROM start [FOR len])
+    if let Ok((i, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("FROM")(input) {
+        let (i, _) = multispace1(i)?;
+        let (i, start) = parse_expression(i)?;
+        let (i, _) = multispace0(i)?;
+        let (i, len) = nom::combinator::opt(|i| {
+            let (i, _) = tag_no_case("FOR")(i)?;
+            let (i, _) = multispace1(i)?;
+            let (i, len) = parse_expression(i)?;
+            let (i, _) = multispace0(i)?;
+            Ok((i, len))
+        })(i)?;
+        let (i, _) = nom_char(')')(i)?;
+        return Ok((i, Expression::Substr(Box::new(s), Box::new(start), len.map(Box::new))));
+    }
+
     let (input, _) = nom_char(',')(input)?;
     let (input, _) = multispace0(input)?;
     let (input, start) = parse_expression(input)?;
@@ -894,6 +919,101 @@ fn parse_expression_replace(input: &str) -> IResult<&str, Expression> {
     let (input, _) = multispace0(input)?;
     let (input, _) = nom_char(')')(input)?;
     Ok((input, Expression::Replace(Box::new(s), Box::new(from), Box::new(to))))
+}
+
+/// Parse TRANSLATE(str, from_chars, to_chars)
+fn parse_expression_translate(input: &str) -> IResult<&str, Expression> {
+    let (input, _) = tag_no_case("TRANSLATE")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, s) = parse_expression(input)?;
+    let (input, _) = nom::sequence::delimited(multispace0, nom_char(','), multispace0)(input)?;
+    let (input, from) = parse_expression(input)?;
+    let (input, _) = nom::sequence::delimited(multispace0, nom_char(','), multispace0)(input)?;
+    let (input, to) = parse_expression(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, Expression::Translate(Box::new(s), Box::new(from), Box::new(to))))
+}
+
+/// Parse spec-form TRIM([LEADING|TRAILING|BOTH] ['chars'] FROM str).
+/// Plain TRIM(str) is handled by the generic scalar function parser.
+fn parse_expression_trim_spec(input: &str) -> IResult<&str, Expression> {
+    let (input, _) = tag_no_case("TRIM")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+
+    let (input, mode) = nom::combinator::opt(nom::branch::alt((
+        nom::combinator::map(tag_no_case("LEADING"), |_| TrimMode::Leading),
+        nom::combinator::map(tag_no_case("TRAILING"), |_| TrimMode::Trailing),
+        nom::combinator::map(tag_no_case("BOTH"), |_| TrimMode::Both),
+    )))(input)?;
+    let (input, _) = multispace0(input)?;
+
+    let (input, chars) = nom::combinator::opt(parse_string_value)(input)?;
+    let chars = match chars {
+        Some(Value::String(s)) => Some(s),
+        _ => None,
+    };
+    let (input, _) = multispace0(input)?;
+
+    // Without FROM this is a plain TRIM(expr) — let the generic parser handle it
+    let (input, _) = tag_no_case("FROM")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, s) = parse_expression(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    Ok((input, Expression::ScalarFunc(
+        ScalarFunc::TrimChars(mode.unwrap_or(TrimMode::Both), chars),
+        Box::new(s),
+    )))
+}
+
+/// Parse OVERLAY(str PLACING replacement FROM start [FOR len]).
+/// Desugars into SUBSTR(str, 1, start-1) || replacement || SUBSTR(str, start+len).
+fn parse_expression_overlay(input: &str) -> IResult<&str, Expression> {
+    let (input, _) = tag_no_case("OVERLAY")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, s) = parse_expression(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, _) = tag_no_case("PLACING")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, replacement) = parse_expression(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, _) = tag_no_case("FROM")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, start) = parse_expression(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, len) = nom::combinator::opt(|i| {
+        let (i, _) = tag_no_case("FOR")(i)?;
+        let (i, _) = multispace1(i)?;
+        let (i, len) = parse_expression(i)?;
+        let (i, _) = multispace0(i)?;
+        Ok((i, len))
+    })(input)?;
+    let (input, _) = nom_char(')')(input)?;
+
+    // Replaced span length defaults to the replacement's character length
+    let len = len.unwrap_or_else(|| Expression::ScalarFunc(ScalarFunc::CharLength, Box::new(replacement.clone())));
+    let prefix = Expression::Substr(
+        Box::new(s.clone()),
+        Box::new(Expression::Literal(Value::Int(1))),
+        Some(Box::new(Expression::BinaryOp(
+            Box::new(start.clone()),
+            ArithOp::Sub,
+            Box::new(Expression::Literal(Value::Int(1))),
+        ))),
+    );
+    let suffix = Expression::Substr(
+        Box::new(s),
+        Box::new(Expression::BinaryOp(Box::new(start), ArithOp::Add, Box::new(len))),
+        None,
+    );
+    Ok((input, Expression::Concat(vec![prefix, replacement, suffix])))
 }
 
 fn parse_expression_lpad(input: &str) -> IResult<&str, Expression> {

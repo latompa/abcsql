@@ -323,6 +323,24 @@ pub fn apply_replace(s: Value, from: Value, to: Value) -> Option<Value> {
     }
 }
 
+/// Evaluate TRANSLATE(str, from_chars, to_chars): each char found in from_chars is
+/// replaced by the char at the same position in to_chars, or dropped if to_chars is shorter.
+pub fn apply_translate(s: Value, from: Value, to: Value) -> Option<Value> {
+    match (s, from, to) {
+        (Value::String(s), Value::String(f), Value::String(t)) => {
+            let to_chars: Vec<char> = t.chars().collect();
+            let result: String = s.chars()
+                .filter_map(|c| match f.chars().position(|fc| fc == c) {
+                    Some(i) => to_chars.get(i).copied(),
+                    None => Some(c),
+                })
+                .collect();
+            Some(Value::String(result))
+        }
+        _ => None,
+    }
+}
+
 /// Evaluate LPAD(str, len, pad)
 pub fn apply_lpad(s: Value, len: Value, pad: Value) -> Option<Value> {
     let s = match s { Value::String(s) => s, _ => return None };
@@ -478,7 +496,27 @@ pub fn apply_scalar_func(func: &ScalarFunc, val: Value) -> Option<Value> {
         (ScalarFunc::Upper,  Value::String(s)) => Some(Value::String(s.to_uppercase())),
         (ScalarFunc::Lower,  Value::String(s)) => Some(Value::String(s.to_lowercase())),
         (ScalarFunc::Length, Value::String(s)) => Some(Value::Int(s.len() as i64)),
+        (ScalarFunc::CharLength, Value::String(s)) => Some(Value::Int(s.chars().count() as i64)),
+        (ScalarFunc::OctetLength, Value::String(s)) => Some(Value::Int(s.len() as i64)),
         (ScalarFunc::Trim,   Value::String(s)) => Some(Value::String(s.trim().to_string())),
+        (ScalarFunc::TrimChars(mode, chars), Value::String(s)) => {
+            let trimmed = match chars {
+                Some(set) => {
+                    let pred = |c: char| set.contains(c);
+                    match mode {
+                        TrimMode::Leading => s.trim_start_matches(pred).to_string(),
+                        TrimMode::Trailing => s.trim_end_matches(pred).to_string(),
+                        TrimMode::Both => s.trim_matches(pred).to_string(),
+                    }
+                }
+                None => match mode {
+                    TrimMode::Leading => s.trim_start().to_string(),
+                    TrimMode::Trailing => s.trim_end().to_string(),
+                    TrimMode::Both => s.trim().to_string(),
+                },
+            };
+            Some(Value::String(trimmed))
+        }
         (ScalarFunc::LTrim,  Value::String(s)) => Some(Value::String(s.trim_start().to_string())),
         (ScalarFunc::RTrim,  Value::String(s)) => Some(Value::String(s.trim_end().to_string())),
         (ScalarFunc::Abs, Value::Int(n))    => Some(Value::Int(n.abs())),

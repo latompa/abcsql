@@ -1095,6 +1095,12 @@ fn resolve_expr(expr: &parser::Expression, row: &[Value], cols: &[(String, Strin
             let tv = resolve_expr(to, row, cols, storage)?;
             parser::apply_replace(sv, fv, tv)
         }
+        parser::Expression::Translate(s, from, to) => {
+            let sv = resolve_expr(s, row, cols, storage)?;
+            let fv = resolve_expr(from, row, cols, storage)?;
+            let tv = resolve_expr(to, row, cols, storage)?;
+            parser::apply_translate(sv, fv, tv)
+        }
         parser::Expression::LPad(s, len, pad) => {
             let sv = resolve_expr(s, row, cols, storage)?;
             let lv = resolve_expr(len, row, cols, storage)?;

@@ -10,6 +10,10 @@ pub enum SqlStatement {
     CreateFunction(CreateFunctionStatement),
     CreateSchema(String),
     DropSchema { name: String, cascade: bool },
+    Grant { privileges: Vec<Privilege>, table: String, grantees: Vec<String> },
+    Revoke { privileges: Vec<Privilege>, table: String, grantees: Vec<String> },
+    /// SET SESSION AUTHORIZATION name — None restores the default (OS) user
+    SetSessionAuthorization(Option<String>),
     DropIndex(DropIndexStatement),
     DropTable(DropTableStatement),
     DropView(DropViewStatement),
@@ -28,6 +32,42 @@ pub enum SqlStatement {
     Savepoint(String),
     RollbackToSavepoint(String),
     ReleaseSavepoint(String),
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum Privilege {
+    Select,
+    Insert,
+    Update,
+    Delete,
+    References,
+}
+
+impl Privilege {
+    pub fn as_sql(&self) -> &'static str {
+        match self {
+            Privilege::Select => "SELECT",
+            Privilege::Insert => "INSERT",
+            Privilege::Update => "UPDATE",
+            Privilege::Delete => "DELETE",
+            Privilege::References => "REFERENCES",
+        }
+    }
+
+    pub fn all() -> Vec<Privilege> {
+        vec![Privilege::Select, Privilege::Insert, Privilege::Update, Privilege::Delete, Privilege::References]
+    }
+
+    pub fn from_sql(s: &str) -> Option<Privilege> {
+        match s.to_uppercase().as_str() {
+            "SELECT" => Some(Privilege::Select),
+            "INSERT" => Some(Privilege::Insert),
+            "UPDATE" => Some(Privilege::Update),
+            "DELETE" => Some(Privilege::Delete),
+            "REFERENCES" => Some(Privilege::References),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]

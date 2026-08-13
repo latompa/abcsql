@@ -356,8 +356,31 @@ fn execute_sql(sql: &str, storage: &Storage) {
             }
         }
         SqlStatement::Select(select_stmt) => {
+            if let parser::FromClause::Table(t) = &select_stmt.from {
+                if let Err(e) = storage.check_privilege(t, parser::Privilege::Select) {
+                    eprintln!("Error: {}", e);
+                    return;
+                }
+            }
             let (headers, rows) = execute_select(&select_stmt, storage);
             print_table(&headers, &rows);
+        }
+        SqlStatement::Grant { privileges, table, grantees } => {
+            match storage.grant_privileges(&table, &privileges, &grantees) {
+                Ok(()) => println!("GRANT"),
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        }
+        SqlStatement::Revoke { privileges, table, grantees } => {
+            match storage.revoke_privileges(&table, &privileges, &grantees) {
+                Ok(()) => println!("REVOKE"),
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        }
+        SqlStatement::SetSessionAuthorization(user) => {
+            let label = user.clone().unwrap_or_else(|| "DEFAULT".to_string());
+            storage.set_session_authorization(user);
+            println!("SET SESSION AUTHORIZATION {}", label);
         }
         SqlStatement::Update(update_stmt) => {
             match storage.update_rows(&update_stmt) {
@@ -3439,7 +3462,7 @@ fn resolve_join_expression(
         parser::Expression::CurrentDate => Some(Value::Date(parser::current_epoch_days())),
         parser::Expression::CurrentTimestamp => Some(Value::Timestamp(parser::current_epoch_secs())),
         parser::Expression::CurrentTime => Some(Value::String(parser::current_time_string())),
-        parser::Expression::CurrentUser => Some(Value::String(parser::current_user_name())),
+        parser::Expression::CurrentUser => Some(Value::String(storage.current_session_user())),
         parser::Expression::AtTimeZone(inner, offset) => {
             match resolve_join_expression(inner, row, cols, storage)? {
                 Value::Timestamp(ts) => Some(Value::Timestamp(ts + offset)),

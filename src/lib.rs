@@ -47,7 +47,30 @@ pub fn execute(storage: &Storage, sql: &str) -> Result<String, String> {
                 .map_err(|e| e.to_string())
         }
         SqlStatement::Select(select_stmt) => {
+            if let parser::FromClause::Table(t) = &select_stmt.from {
+                storage.check_privilege(t, parser::Privilege::Select).map_err(|e| e.to_string())?;
+            }
+            for join in &select_stmt.joins {
+                if join.lateral.is_none() {
+                    storage.check_privilege(&join.table, parser::Privilege::Select).map_err(|e| e.to_string())?;
+                }
+            }
             execute_select_to_string(&select_stmt, storage)
+        }
+        SqlStatement::Grant { privileges, table, grantees } => {
+            storage.grant_privileges(&table, &privileges, &grantees)
+                .map(|_| "GRANT".to_string())
+                .map_err(|e| e.to_string())
+        }
+        SqlStatement::Revoke { privileges, table, grantees } => {
+            storage.revoke_privileges(&table, &privileges, &grantees)
+                .map(|_| "REVOKE".to_string())
+                .map_err(|e| e.to_string())
+        }
+        SqlStatement::SetSessionAuthorization(user) => {
+            let label = user.clone().unwrap_or_else(|| "DEFAULT".to_string());
+            storage.set_session_authorization(user);
+            Ok(format!("SET SESSION AUTHORIZATION {}", label))
         }
         SqlStatement::Update(update_stmt) => {
             storage.update_rows(&update_stmt)
@@ -1184,7 +1207,7 @@ fn resolve_expr(expr: &parser::Expression, row: &[Value], cols: &[(String, Strin
         parser::Expression::CurrentDate => Some(Value::Date(parser::current_epoch_days())),
         parser::Expression::CurrentTimestamp => Some(Value::Timestamp(parser::current_epoch_secs())),
         parser::Expression::CurrentTime => Some(Value::String(parser::current_time_string())),
-        parser::Expression::CurrentUser => Some(Value::String(parser::current_user_name())),
+        parser::Expression::CurrentUser => Some(Value::String(storage.current_session_user())),
         parser::Expression::AtTimeZone(inner, offset) => {
             match resolve_expr(inner, row, cols, storage)? {
                 Value::Timestamp(ts) => Some(Value::Timestamp(ts + offset)),

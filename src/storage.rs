@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::fmt;
 use std::collections::HashMap;
 use regex::Regex;
-use crate::parser::{RefAction, WhereClause, TransactionOptions, IsolationLevel, CreateTableStatement, CreateIndexStatement, CreateFunctionStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, InsertSource, OnConflict, UpdateStatement, DeleteStatement, TruncateStatement, MergeStatement, MergeSource, MergeAction, AlterTableStatement, AlterAction, Value, Condition, Expression, Operator, ArithOp, SelectStatement, SelectColumn, FromClause, TableConstraint, TableConstraintKind, apply_scalar_func, apply_round, apply_concat, apply_substr, apply_replace, apply_translate, eval_boolean_test, apply_lpad, apply_rpad, apply_cast, apply_greatest, apply_least, apply_power, apply_position, apply_repeat, apply_json_typeof, apply_json_array_length, apply_json_build_object, apply_json_build_array};
+use crate::parser::{RefAction, WhereClause, TransactionOptions, IsolationLevel, Privilege, CreateTableStatement, CreateIndexStatement, CreateFunctionStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, InsertSource, OnConflict, UpdateStatement, DeleteStatement, TruncateStatement, MergeStatement, MergeSource, MergeAction, AlterTableStatement, AlterAction, Value, Condition, Expression, Operator, ArithOp, SelectStatement, SelectColumn, FromClause, TableConstraint, TableConstraintKind, apply_scalar_func, apply_round, apply_concat, apply_substr, apply_replace, apply_translate, eval_boolean_test, apply_lpad, apply_rpad, apply_cast, apply_greatest, apply_least, apply_power, apply_position, apply_repeat, apply_json_typeof, apply_json_array_length, apply_json_build_object, apply_json_build_array};
 
 /// Before-image snapshot for a single transaction
 struct TransactionState {
@@ -22,6 +22,8 @@ pub struct Storage {
     txn: std::sync::Mutex<Option<TransactionState>>,
     // Options set by SET TRANSACTION outside a transaction, applied to the next BEGIN
     next_txn_options: std::sync::Mutex<TransactionOptions>,
+    // SET SESSION AUTHORIZATION user; None = the default (OS) user, which is superuser
+    session_user: std::sync::Mutex<Option<String>>,
 }
 
 #[derive(Debug)]
@@ -41,6 +43,7 @@ pub enum StorageError {
     IndexAlreadyExists(String),
     IndexNotFound(String),
     TransactionError(String),
+    PermissionDenied { user: String, table: String, privilege: String },
 }
 
 impl From<io::Error> for StorageError {
@@ -79,6 +82,7 @@ impl fmt::Display for StorageError {
             StorageError::IndexAlreadyExists(name) => write!(f, "Index '{}' already exists", name),
             StorageError::IndexNotFound(name) => write!(f, "Index '{}' not found", name),
             StorageError::TransactionError(msg) => write!(f, "Transaction error: {}", msg),
+            StorageError::PermissionDenied { user, table, privilege } => write!(f, "Permission denied: user '{}' lacks {} on '{}'", user, privilege, table),
         }
     }
 }
@@ -95,7 +99,7 @@ impl std::error::Error for StorageError {
 impl Storage {
     /// Create a no-op Storage for expression evaluation contexts that don't touch files
     fn noop() -> Self {
-        Storage { data_dir: PathBuf::new(), txn: std::sync::Mutex::new(None), next_txn_options: std::sync::Mutex::new(TransactionOptions::default()) }
+        Storage { data_dir: PathBuf::new(), txn: std::sync::Mutex::new(None), next_txn_options: std::sync::Mutex::new(TransactionOptions::default()), session_user: std::sync::Mutex::new(None) }
     }
 
     /// Create a new Storage instance with the specified data directory
@@ -107,7 +111,7 @@ impl Storage {
             fs::create_dir_all(&data_dir)?;
         }
 
-        Ok(Storage { data_dir, txn: std::sync::Mutex::new(None), next_txn_options: std::sync::Mutex::new(TransactionOptions::default()) })
+        Ok(Storage { data_dir, txn: std::sync::Mutex::new(None), next_txn_options: std::sync::Mutex::new(TransactionOptions::default()), session_user: std::sync::Mutex::new(None) })
     }
 
     /// Return a reference to the data directory path
@@ -267,6 +271,102 @@ impl Storage {
     /// Create a new table by persisting its schema to disk
     fn schemas_file(&self) -> PathBuf {
         self.data_dir.join("_schemas")
+    }
+
+    fn grants_file(&self) -> PathBuf {
+        self.data_dir.join("_grants")
+    }
+
+    // --- Session authorization and privileges ---
+
+    pub fn set_session_authorization(&self, user: Option<String>) {
+        *self.session_user.lock().unwrap() = user;
+    }
+
+    /// The effective user: SET SESSION AUTHORIZATION user, or the OS user
+    pub fn current_session_user(&self) -> String {
+        self.session_user.lock().unwrap().clone()
+            .unwrap_or_else(crate::parser::current_user_name)
+    }
+
+    /// True when no SET SESSION AUTHORIZATION is in effect — the default user
+    /// owns the database files and bypasses privilege checks.
+    fn is_superuser(&self) -> bool {
+        self.session_user.lock().unwrap().is_none()
+    }
+
+    /// All recorded grants as (table, grantee, privilege)
+    pub fn list_grants(&self) -> Vec<(String, String, Privilege)> {
+        let content = fs::read_to_string(self.grants_file()).unwrap_or_default();
+        content.lines()
+            .filter_map(|line| {
+                let mut parts = line.split('|');
+                let table = parts.next()?;
+                let grantee = parts.next()?;
+                let priv_name = parts.next()?;
+                Privilege::from_sql(priv_name).map(|p| (table.to_string(), grantee.to_string(), p))
+            })
+            .collect()
+    }
+
+    fn write_grants(&self, grants: &[(String, String, Privilege)]) -> Result<(), StorageError> {
+        let path = self.grants_file();
+        self.snapshot_before_write(&path);
+        let content: String = grants.iter()
+            .map(|(t, g, p)| format!("{}|{}|{}\n", t, g, p.as_sql()))
+            .collect();
+        fs::write(&path, content).map_err(StorageError::IoError)
+    }
+
+    pub fn grant_privileges(&self, table: &str, privileges: &[Privilege], grantees: &[String]) -> Result<(), StorageError> {
+        self.check_writable()?;
+        if !self.table_exists(table) && self.load_view(table)?.is_none() {
+            return Err(StorageError::TableNotFound(table.to_string()));
+        }
+        let mut grants = self.list_grants();
+        for grantee in grantees {
+            for p in privileges {
+                let entry = (table.to_string(), grantee.clone(), *p);
+                if !grants.contains(&entry) {
+                    grants.push(entry);
+                }
+            }
+        }
+        self.write_grants(&grants)
+    }
+
+    pub fn revoke_privileges(&self, table: &str, privileges: &[Privilege], grantees: &[String]) -> Result<(), StorageError> {
+        self.check_writable()?;
+        let mut grants = self.list_grants();
+        grants.retain(|(t, g, p)| {
+            !(t.eq_ignore_ascii_case(table)
+                && grantees.iter().any(|gr| gr.eq_ignore_ascii_case(g))
+                && privileges.contains(p))
+        });
+        self.write_grants(&grants)
+    }
+
+    /// Reject access unless the session user is the superuser or holds the
+    /// privilege (directly or via PUBLIC) on the table.
+    pub fn check_privilege(&self, table: &str, privilege: Privilege) -> Result<(), StorageError> {
+        if self.is_superuser() || table.starts_with("information_schema.") {
+            return Ok(());
+        }
+        let user = self.current_session_user();
+        let allowed = self.list_grants().iter().any(|(t, g, p)| {
+            t.eq_ignore_ascii_case(table)
+                && *p == privilege
+                && (g.eq_ignore_ascii_case(&user) || g.eq_ignore_ascii_case("PUBLIC"))
+        });
+        if allowed {
+            Ok(())
+        } else {
+            Err(StorageError::PermissionDenied {
+                user,
+                table: table.to_string(),
+                privilege: privilege.as_sql().to_string(),
+            })
+        }
     }
 
     /// All namespaces: the built-in "public" plus any created with CREATE SCHEMA
@@ -489,6 +589,7 @@ fn decode_check_text(text: &str) -> String {
     /// Insert row(s) into a table. Returns (rows_inserted, returning_rows).
     pub fn insert_row(&self, stmt: &InsertStatement) -> Result<(usize, Option<Vec<Vec<Value>>>), StorageError> {
         self.check_writable()?;
+        self.check_privilege(&stmt.table_name, Privilege::Insert)?;
         // INSERT through an updatable view: rewrite against the base table
         if let Some(view_sql) = self.load_view(&stmt.table_name)? {
             let (base, view_cols, view_where, check_option) = self.view_dml_target(&stmt.table_name, &view_sql)?;
@@ -899,6 +1000,7 @@ fn decode_check_text(text: &str) -> String {
     /// Update rows in a table matching the WHERE condition. Returns (count, returning_rows).
     pub fn update_rows(&self, stmt: &UpdateStatement) -> Result<(usize, Option<Vec<Vec<Value>>>), StorageError> {
         self.check_writable()?;
+        self.check_privilege(&stmt.table_name, Privilege::Update)?;
         // UPDATE through an updatable view: rewrite against the base table
         if let Some(view_sql) = self.load_view(&stmt.table_name)? {
             let (base, view_cols, view_where, check_option) = self.view_dml_target(&stmt.table_name, &view_sql)?;
@@ -1087,6 +1189,7 @@ fn decode_check_text(text: &str) -> String {
     /// Delete rows from a table matching the WHERE condition. Returns (count, returning_rows).
     pub fn delete_rows(&self, stmt: &DeleteStatement) -> Result<(usize, Option<Vec<Vec<Value>>>), StorageError> {
         self.check_writable()?;
+        self.check_privilege(&stmt.table_name, Privilege::Delete)?;
         // DELETE through an updatable view: rewrite against the base table,
         // restricted to rows visible through the view
         if let Some(view_sql) = self.load_view(&stmt.table_name)? {
@@ -3594,7 +3697,7 @@ fn resolve_expression(expr: &Expression, row: &[Value], schema: &[ColumnDefiniti
         Expression::CurrentDate => Some(Value::Date(crate::parser::current_epoch_days())),
         Expression::CurrentTimestamp => Some(Value::Timestamp(crate::parser::current_epoch_secs())),
         Expression::CurrentTime => Some(Value::String(crate::parser::current_time_string())),
-        Expression::CurrentUser => Some(Value::String(crate::parser::current_user_name())),
+        Expression::CurrentUser => Some(Value::String(storage.current_session_user())),
         Expression::AtTimeZone(inner, offset) => {
             match resolve_expression(inner, row, schema, storage)? {
                 Value::Timestamp(ts) => Some(Value::Timestamp(ts + offset)),
@@ -4184,6 +4287,7 @@ const METADATA_TABLES: &[&str] = &[
     "information_schema.referential_constraints",
     "information_schema.check_constraints",
     "information_schema.routines",
+    "information_schema.table_privileges",
 ];
 
 impl Storage {
@@ -4264,6 +4368,15 @@ impl Storage {
                 ColumnDefinition { name: "routine_type".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
                 ColumnDefinition { name: "data_type".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
                 ColumnDefinition { name: "created".into(), data_type: DataType::Timestamp, auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+            ],
+            "information_schema.table_privileges" => vec![
+                ColumnDefinition { name: "grantor".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "grantee".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "table_catalog".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "table_schema".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "table_name".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "privilege_type".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: true, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                ColumnDefinition { name: "is_grantable".into(), data_type: DataType::Varchar(None), auto_increment: false, primary_key: false, not_null: false, unique: false, references: None, check_constraint: None, check_constraint_text: None, default: None, default_text: None },
             ],
             _ => return None,
         };
@@ -4565,6 +4678,18 @@ impl Storage {
                     }
                 }
                 Some(rows)
+            }
+            "information_schema.table_privileges" => {
+                let grantor = crate::parser::current_user_name();
+                Some(self.list_grants().into_iter().map(|(table, grantee, p)| vec![
+                    Value::String(grantor.clone()),
+                    Value::String(grantee),
+                    Value::String("default".into()),
+                    Value::String("public".into()),
+                    Value::String(table),
+                    Value::String(p.as_sql().to_string()),
+                    Value::String("NO".into()),
+                ]).collect())
             }
             _ => None,
         }

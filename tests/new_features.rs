@@ -2990,3 +2990,95 @@ fn test_lateral_join_still_works() {
     let r = with_db(&setup, "SELECT a.id, latest.v FROM a LEFT JOIN LATERAL (SELECT v FROM b WHERE aid = a.id LIMIT 1) AS latest ON true");
     assert!(r.as_ref().unwrap().contains("2 rows"), "LATERAL regressed: {:?}", r);
 }
+
+// ---- GRANT / REVOKE + SET SESSION AUTHORIZATION ----
+
+#[test]
+fn test_grant_and_privilege_enforcement() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (id INT)").unwrap();
+    execute(&db.storage, "INSERT INTO t VALUES (1)").unwrap();
+    execute(&db.storage, "GRANT SELECT ON t TO alice").unwrap();
+    execute(&db.storage, "SET SESSION AUTHORIZATION alice").unwrap();
+    // alice can select but not write
+    execute(&db.storage, "SELECT * FROM t").unwrap();
+    assert!(execute(&db.storage, "INSERT INTO t VALUES (2)").is_err(), "alice should lack INSERT");
+    assert!(execute(&db.storage, "DELETE FROM t").is_err(), "alice should lack DELETE");
+    // back to superuser: everything works
+    execute(&db.storage, "SET SESSION AUTHORIZATION DEFAULT").unwrap();
+    execute(&db.storage, "INSERT INTO t VALUES (2)").unwrap();
+}
+
+#[test]
+fn test_unprivileged_user_cannot_select() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (id INT)").unwrap();
+    execute(&db.storage, "SET SESSION AUTHORIZATION mallory").unwrap();
+    assert!(execute(&db.storage, "SELECT * FROM t").is_err(), "mallory should lack SELECT");
+}
+
+#[test]
+fn test_grant_all_and_revoke() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (id INT)").unwrap();
+    execute(&db.storage, "GRANT ALL PRIVILEGES ON t TO bob").unwrap();
+    execute(&db.storage, "SET SESSION AUTHORIZATION bob").unwrap();
+    execute(&db.storage, "INSERT INTO t VALUES (1)").unwrap();
+    execute(&db.storage, "UPDATE t SET id = 2").unwrap();
+    execute(&db.storage, "SELECT * FROM t").unwrap();
+    execute(&db.storage, "SET SESSION AUTHORIZATION DEFAULT").unwrap();
+    execute(&db.storage, "REVOKE INSERT, UPDATE ON t FROM bob").unwrap();
+    execute(&db.storage, "SET SESSION AUTHORIZATION bob").unwrap();
+    assert!(execute(&db.storage, "INSERT INTO t VALUES (3)").is_err(), "INSERT should be revoked");
+    execute(&db.storage, "SELECT * FROM t").unwrap();
+}
+
+#[test]
+fn test_grant_to_public() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (id INT)").unwrap();
+    execute(&db.storage, "GRANT SELECT ON t TO PUBLIC").unwrap();
+    execute(&db.storage, "SET SESSION AUTHORIZATION anyone").unwrap();
+    execute(&db.storage, "SELECT * FROM t").unwrap();
+}
+
+#[test]
+fn test_grant_unknown_table_fails() {
+    let db = TestDb::new();
+    assert!(execute(&db.storage, "GRANT SELECT ON nosuch TO alice").is_err());
+}
+
+#[test]
+fn test_current_user_reflects_session_authorization() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (id INT, who VARCHAR)").unwrap();
+    execute(&db.storage, "GRANT ALL ON t TO alice").unwrap();
+    execute(&db.storage, "INSERT INTO t VALUES (1, 'nobody')").unwrap();
+    execute(&db.storage, "SET SESSION AUTHORIZATION alice").unwrap();
+    execute(&db.storage, "UPDATE t SET who = CURRENT_USER").unwrap();
+    let r = execute(&db.storage, "SELECT id FROM t WHERE who = 'alice'").unwrap();
+    assert!(r.contains("1 rows"), "CURRENT_USER should be alice: {}", r);
+}
+
+#[test]
+fn test_table_privileges_metadata() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (id INT)").unwrap();
+    execute(&db.storage, "GRANT SELECT, INSERT ON t TO carol").unwrap();
+    let r = execute(&db.storage, "SELECT privilege_type FROM information_schema.table_privileges WHERE grantee = 'carol'").unwrap();
+    assert!(r.contains("2 rows"), "table_privileges missing grants: {}", r);
+}
+
+#[test]
+fn test_grants_survive_reload() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE t (id INT)").unwrap();
+    execute(&db.storage, "GRANT SELECT ON t TO dave").unwrap();
+    // grants live in a file, re-read on every check
+    execute(&db.storage, "SET SESSION AUTHORIZATION dave").unwrap();
+    execute(&db.storage, "SELECT * FROM t").unwrap();
+    execute(&db.storage, "SET SESSION AUTHORIZATION DEFAULT").unwrap();
+    execute(&db.storage, "REVOKE ALL ON t FROM dave").unwrap();
+    execute(&db.storage, "SET SESSION AUTHORIZATION dave").unwrap();
+    assert!(execute(&db.storage, "SELECT * FROM t").is_err(), "revoke not persisted");
+}

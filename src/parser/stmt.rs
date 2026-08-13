@@ -22,6 +22,9 @@ pub fn parse_sql(input: &str) -> IResult<&str, SqlStatement> {
         parse_merge,
         parse_begin,
         parse_set_transaction,
+        parse_set_session_authorization,
+        parse_grant,
+        parse_revoke,
         parse_commit,
         parse_rollback,
         parse_savepoint,
@@ -1120,6 +1123,115 @@ pub fn parse_set_transaction(input: &str) -> IResult<&str, SqlStatement> {
     let (input, _) = multispace0(input)?;
     let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
     Ok((input, SqlStatement::SetTransaction(options)))
+}
+
+/// Parse SET SESSION AUTHORIZATION name | 'name' | DEFAULT
+pub fn parse_set_session_authorization(input: &str) -> IResult<&str, SqlStatement> {
+    let (input, _) = tag_no_case("SET")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, _) = tag_no_case("SESSION")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, _) = tag_no_case("AUTHORIZATION")(input)?;
+    let (input, _) = multispace1(input)?;
+    if let Ok((input, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("DEFAULT")(input) {
+        let (input, _) = multispace0(input)?;
+        let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
+        return Ok((input, SqlStatement::SetSessionAuthorization(None)));
+    }
+    let (input, name) = nom::branch::alt((
+        nom::combinator::map_opt(parse_value, |v| match v {
+            Value::String(s) => Some(s),
+            _ => None,
+        }),
+        nom::combinator::map(parse_identifier, |s: &str| s.to_string()),
+    ))(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
+    Ok((input, SqlStatement::SetSessionAuthorization(Some(name))))
+}
+
+/// Parse a privilege list: ALL [PRIVILEGES] or SELECT, INSERT, ...
+fn parse_privilege_list(input: &str) -> IResult<&str, Vec<Privilege>> {
+    if let Ok((input, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("ALL")(input) {
+        let (input, _) = nom::combinator::opt(nom::sequence::preceded(multispace1, tag_no_case("PRIVILEGES")))(input)?;
+        return Ok((input, Privilege::all()));
+    }
+    let (input, names) = nom::multi::separated_list1(
+        nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+        parse_identifier,
+    )(input)?;
+    let mut privs = Vec::new();
+    for n in names {
+        match Privilege::from_sql(n) {
+            Some(p) => privs.push(p),
+            None => return Err(nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Tag))),
+        }
+    }
+    Ok((input, privs))
+}
+
+/// Parse GRANT privileges ON [TABLE] table TO grantees [WITH GRANT OPTION]
+pub fn parse_grant(input: &str) -> IResult<&str, SqlStatement> {
+    let (input, _) = tag_no_case("GRANT")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, privileges) = parse_privilege_list(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, _) = tag_no_case("ON")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, _) = nom::combinator::opt(nom::sequence::terminated(tag_no_case("TABLE"), multispace1))(input)?;
+    let (input, table) = parse_table_name(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, _) = tag_no_case("TO")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, grantees) = nom::multi::separated_list1(
+        nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+        parse_identifier,
+    )(input)?;
+    let (input, _) = multispace0(input)?;
+    // WITH GRANT OPTION accepted (grant chains are not tracked)
+    let (input, _) = nom::combinator::opt(|i| {
+        let (i, _) = tag_no_case("WITH")(i)?;
+        let (i, _) = multispace1(i)?;
+        let (i, _) = tag_no_case("GRANT")(i)?;
+        let (i, _) = multispace1(i)?;
+        let (i, _) = tag_no_case("OPTION")(i)?;
+        Ok((i, ()))
+    })(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
+    Ok((input, SqlStatement::Grant {
+        privileges,
+        table,
+        grantees: grantees.into_iter().map(|s| s.to_string()).collect(),
+    }))
+}
+
+/// Parse REVOKE privileges ON [TABLE] table FROM grantees [CASCADE | RESTRICT]
+pub fn parse_revoke(input: &str) -> IResult<&str, SqlStatement> {
+    let (input, _) = tag_no_case("REVOKE")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, privileges) = parse_privilege_list(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, _) = tag_no_case("ON")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, _) = nom::combinator::opt(nom::sequence::terminated(tag_no_case("TABLE"), multispace1))(input)?;
+    let (input, table) = parse_table_name(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, _) = tag_no_case("FROM")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, grantees) = nom::multi::separated_list1(
+        nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+        parse_identifier,
+    )(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom::combinator::opt(nom::branch::alt((tag_no_case("CASCADE"), tag_no_case("RESTRICT"))))(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom::combinator::opt(nom_char(';'))(input)?;
+    Ok((input, SqlStatement::Revoke {
+        privileges,
+        table,
+        grantees: grantees.into_iter().map(|s| s.to_string()).collect(),
+    }))
 }
 
 /// Parse zero or more transaction modes, optionally comma-separated:

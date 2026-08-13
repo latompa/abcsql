@@ -366,6 +366,15 @@ fn parse_primary_condition(input: &str) -> IResult<&str, Condition> {
                 upper_bound: None,
             }));
         }
+        // IS [NOT] TRUE / FALSE / UNKNOWN boolean tests
+        if let Ok((input, op)) = parse_boolean_test_tail(input) {
+            return Ok((input, Condition::Comparison {
+                left,
+                operator: op,
+                right: Expression::Literal(Value::Null),
+                upper_bound: None,
+            }));
+        }
         let (input, _) = tag_no_case("NULL")(input)?;
         return Ok((input, Condition::Comparison {
             left,
@@ -1887,6 +1896,35 @@ fn parse_in_list(input: &str) -> IResult<&str, Expression> {
     let (input, _) = multispace0(input)?;
     let (input, _) = nom_char(')')(input)?;
     Ok((input, Expression::List(exprs)))
+}
+
+/// Parse the tail of a boolean test after IS: [NOT] TRUE | FALSE | UNKNOWN
+fn parse_boolean_test_tail(input: &str) -> IResult<&str, Operator> {
+    let (input, negated) = match nom::sequence::pair(
+        tag_no_case::<&str, &str, nom::error::Error<&str>>("NOT"),
+        multispace1::<&str, nom::error::Error<&str>>,
+    )(input) {
+        Ok((rest, _)) => (rest, true),
+        Err(_) => (input, false),
+    };
+    let (rest, word) = nom::branch::alt((
+        tag_no_case("TRUE"),
+        tag_no_case("FALSE"),
+        tag_no_case("UNKNOWN"),
+    ))(input)?;
+    if rest.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+        return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)));
+    }
+    let op = match (word.to_uppercase().as_str(), negated) {
+        ("TRUE", false) => Operator::IsTrue,
+        ("TRUE", true) => Operator::IsNotTrue,
+        ("FALSE", false) => Operator::IsFalse,
+        ("FALSE", true) => Operator::IsNotFalse,
+        ("UNKNOWN", false) => Operator::IsUnknown,
+        (_, false) => Operator::IsUnknown,
+        (_, true) => Operator::IsNotUnknown,
+    };
+    Ok((rest, op))
 }
 
 /// Parse optional ESCAPE clause for SIMILAR TO and LIKE patterns

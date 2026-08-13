@@ -2725,6 +2725,9 @@ fn evaluate_join_condition(
                 let is_null = matches!(left_val, Some(Value::Null) | None);
                 return if *operator == parser::Operator::IsNull { is_null } else { !is_null };
             }
+            if let Some(result) = parser::eval_boolean_test(operator, (resolve_join_expression(left, row, cols, storage)).as_ref()) {
+                return result;
+            }
 
             if *operator == parser::Operator::Between || *operator == parser::Operator::NotBetween {
                 let val = resolve_join_expression(left, row, cols, storage);
@@ -2819,6 +2822,9 @@ fn evaluate_having_condition(
                 let left_val = resolve_having_expression(left, group, cols, storage);
                 let is_null = matches!(left_val, Some(Value::Null) | None);
                 return if *operator == parser::Operator::IsNull { is_null } else { !is_null };
+            }
+            if let Some(result) = parser::eval_boolean_test(operator, (resolve_having_expression(left, group, cols, storage)).as_ref()) {
+                return result;
             }
 
             if *operator == parser::Operator::Between || *operator == parser::Operator::NotBetween {

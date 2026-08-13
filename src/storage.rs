@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::fmt;
 use std::collections::HashMap;
 use regex::Regex;
-use crate::parser::{RefAction, CreateTableStatement, CreateIndexStatement, CreateFunctionStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, InsertSource, OnConflict, UpdateStatement, DeleteStatement, TruncateStatement, MergeStatement, MergeSource, MergeAction, AlterTableStatement, AlterAction, Value, Condition, Expression, Operator, ArithOp, SelectStatement, SelectColumn, FromClause, TableConstraint, TableConstraintKind, apply_scalar_func, apply_round, apply_concat, apply_substr, apply_replace, apply_translate, apply_lpad, apply_rpad, apply_cast, apply_greatest, apply_least, apply_power, apply_position, apply_repeat, apply_json_typeof, apply_json_array_length, apply_json_build_object, apply_json_build_array};
+use crate::parser::{RefAction, CreateTableStatement, CreateIndexStatement, CreateFunctionStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, InsertSource, OnConflict, UpdateStatement, DeleteStatement, TruncateStatement, MergeStatement, MergeSource, MergeAction, AlterTableStatement, AlterAction, Value, Condition, Expression, Operator, ArithOp, SelectStatement, SelectColumn, FromClause, TableConstraint, TableConstraintKind, apply_scalar_func, apply_round, apply_concat, apply_substr, apply_replace, apply_translate, eval_boolean_test, apply_lpad, apply_rpad, apply_cast, apply_greatest, apply_least, apply_power, apply_position, apply_repeat, apply_json_typeof, apply_json_array_length, apply_json_build_object, apply_json_build_array};
 
 /// Before-image snapshot for a single transaction
 struct TransactionState {
@@ -2704,6 +2704,9 @@ fn evaluate_correlated_condition_storage(
                 let is_null = matches!(lv, Some(Value::Null) | None);
                 return if *operator == Operator::IsNull { is_null } else { !is_null };
             }
+            if let Some(result) = eval_boolean_test(operator, lv.as_ref()) {
+                return result;
+            }
             if *operator == Operator::Between || *operator == Operator::NotBetween {
                 let high = upper_bound.as_ref().and_then(|e| resolve_correlated_expr_storage(e, row, schema, storage, outer_row, outer_schema));
                 let in_range = matches!((&lv, &rv, &high), (Some(v), Some(l), Some(h))
@@ -2809,6 +2812,9 @@ fn eval_condition_cols(condition: &Condition, row: &[Value], cols: &[(String, St
                 let lv = resolve_expr_cols(left, row, cols, storage);
                 let is_null = matches!(lv, Some(Value::Null) | None);
                 return if *operator == Operator::IsNull { is_null } else { !is_null };
+            }
+            if let Some(result) = eval_boolean_test(operator, (resolve_expr_cols(left, row, cols, storage)).as_ref()) {
+                return result;
             }
             if *operator == Operator::Between || *operator == Operator::NotBetween {
                 let val = resolve_expr_cols(left, row, cols, storage);
@@ -2949,6 +2955,9 @@ fn evaluate_condition(condition: &Condition, row: &[Value], schema: &[ColumnDefi
                 let left_val = resolve_expression(left, row, schema, storage);
                 let is_null = matches!(left_val, Some(Value::Null) | None);
                 return if *operator == Operator::IsNull { is_null } else { !is_null };
+            }
+            if let Some(result) = eval_boolean_test(operator, (resolve_expression(left, row, schema, storage)).as_ref()) {
+                return result;
             }
 
             if *operator == Operator::Between || *operator == Operator::NotBetween {

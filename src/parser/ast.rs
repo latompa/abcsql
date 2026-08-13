@@ -627,6 +627,12 @@ pub enum Operator {
     NotExists,
     IsNull,
     IsNotNull,
+    IsTrue,
+    IsNotTrue,
+    IsFalse,
+    IsNotFalse,
+    IsUnknown,
+    IsNotUnknown,
     Between,
     NotBetween,
     JsonContains, // @>

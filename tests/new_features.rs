@@ -2657,3 +2657,54 @@ fn test_column_named_at_still_works() {
     let r = with_db(&setup, "SELECT at FROM t WHERE at = '10:00:00'");
     assert!(r.as_ref().unwrap().contains("1 rows"), "column named 'at' broken: {:?}", r);
 }
+
+// ---- IS TRUE / IS FALSE / IS UNKNOWN ----
+
+#[test]
+fn test_is_true_false() {
+    let setup = [
+        "CREATE TABLE t (id INT, active BOOLEAN)",
+        "INSERT INTO t VALUES (1, TRUE), (2, FALSE), (3, NULL)",
+    ];
+    let r = with_db(&setup, "SELECT id FROM t WHERE active IS TRUE");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "IS TRUE failed: {:?}", r);
+    let r2 = with_db(&setup, "SELECT id FROM t WHERE active IS FALSE");
+    assert!(r2.as_ref().unwrap().contains("1 rows"), "IS FALSE failed: {:?}", r2);
+}
+
+#[test]
+fn test_is_unknown() {
+    let setup = [
+        "CREATE TABLE t (id INT, active BOOLEAN)",
+        "INSERT INTO t VALUES (1, TRUE), (2, FALSE), (3, NULL)",
+    ];
+    let r = with_db(&setup, "SELECT id FROM t WHERE active IS UNKNOWN");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "IS UNKNOWN failed: {:?}", r);
+    let r2 = with_db(&setup, "SELECT id FROM t WHERE active IS NOT UNKNOWN");
+    assert!(r2.as_ref().unwrap().contains("2 rows"), "IS NOT UNKNOWN failed: {:?}", r2);
+}
+
+#[test]
+fn test_is_not_true() {
+    let setup = [
+        "CREATE TABLE t (id INT, active BOOLEAN)",
+        "INSERT INTO t VALUES (1, TRUE), (2, FALSE), (3, NULL)",
+    ];
+    // IS NOT TRUE matches FALSE and NULL
+    let r = with_db(&setup, "SELECT id FROM t WHERE active IS NOT TRUE");
+    assert!(r.as_ref().unwrap().contains("2 rows"), "IS NOT TRUE failed: {:?}", r);
+    let r2 = with_db(&setup, "SELECT id FROM t WHERE active IS NOT FALSE");
+    assert!(r2.as_ref().unwrap().contains("2 rows"), "IS NOT FALSE failed: {:?}", r2);
+}
+
+#[test]
+fn test_is_null_still_works() {
+    let setup = [
+        "CREATE TABLE t (id INT, active BOOLEAN)",
+        "INSERT INTO t VALUES (1, TRUE), (2, NULL)",
+    ];
+    let r = with_db(&setup, "SELECT id FROM t WHERE active IS NULL");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "IS NULL regressed: {:?}", r);
+    let r2 = with_db(&setup, "SELECT id FROM t WHERE active IS NOT NULL");
+    assert!(r2.as_ref().unwrap().contains("1 rows"), "IS NOT NULL regressed: {:?}", r2);
+}

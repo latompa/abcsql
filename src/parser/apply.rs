@@ -323,6 +323,24 @@ pub fn apply_replace(s: Value, from: Value, to: Value) -> Option<Value> {
     }
 }
 
+/// Evaluate IS [NOT] TRUE / FALSE / UNKNOWN boolean tests. NULL and non-boolean
+/// operands count as unknown. Returns None for operators that aren't boolean tests.
+pub fn eval_boolean_test(op: &Operator, val: Option<&Value>) -> Option<bool> {
+    let truth = match val {
+        Some(Value::Bool(b)) => Some(*b),
+        _ => None,
+    };
+    match op {
+        Operator::IsTrue => Some(truth == Some(true)),
+        Operator::IsNotTrue => Some(truth != Some(true)),
+        Operator::IsFalse => Some(truth == Some(false)),
+        Operator::IsNotFalse => Some(truth != Some(false)),
+        Operator::IsUnknown => Some(truth.is_none()),
+        Operator::IsNotUnknown => Some(truth.is_some()),
+        _ => None,
+    }
+}
+
 /// Evaluate TRANSLATE(str, from_chars, to_chars): each char found in from_chars is
 /// replaced by the char at the same position in to_chars, or dropped if to_chars is shorter.
 pub fn apply_translate(s: Value, from: Value, to: Value) -> Option<Value> {

@@ -872,6 +872,9 @@ fn eval_correlated_condition(
                 let is_null = matches!(lv, Some(Value::Null) | None);
                 return if *operator == parser::Operator::IsNull { is_null } else { !is_null };
             }
+            if let Some(result) = parser::eval_boolean_test(operator, (resolve_correlated_expr(left, row, cols, storage, outer_row, outer_cols)).as_ref()) {
+                return result;
+            }
             if *operator == parser::Operator::Between || *operator == parser::Operator::NotBetween {
                 let val = resolve_correlated_expr(left, row, cols, storage, outer_row, outer_cols);
                 let low = resolve_correlated_expr(right, row, cols, storage, outer_row, outer_cols);
@@ -979,6 +982,9 @@ fn eval_condition(cond: &parser::Condition, row: &[Value], cols: &[(String, Stri
                 let lv = resolve_expr(left, row, cols, storage);
                 let is_null = matches!(lv, Some(Value::Null) | None);
                 return if *operator == parser::Operator::IsNull { is_null } else { !is_null };
+            }
+            if let Some(result) = parser::eval_boolean_test(operator, (resolve_expr(left, row, cols, storage)).as_ref()) {
+                return result;
             }
             if *operator == parser::Operator::Between || *operator == parser::Operator::NotBetween {
                 let val = resolve_expr(left, row, cols, storage);

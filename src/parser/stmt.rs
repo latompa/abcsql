@@ -184,10 +184,13 @@ pub fn parse_table_constraint(input: &str) -> IResult<&str, TableConstraint> {
         let (i, _) = multispace1(i)?;
         let (i, ref_table) = parse_identifier(i)?;
         let (i, ref_cols) = nom::combinator::opt(parse_paren_column_list)(i)?;
+        let (i, (on_delete, on_update)) = parse_ref_actions(i)?;
         (i, TableConstraintKind::ForeignKey {
             columns: cols,
             ref_table: ref_table.to_string(),
             ref_columns: ref_cols.unwrap_or_default(),
+            on_delete,
+            on_update,
         })
     } else {
         // CHECK only matches when followed by '(' so a column named "check"
@@ -314,7 +317,7 @@ fn parse_default_clause(input: &str) -> IResult<&str, (Expression, String)> {
     Ok((input, (expr, text)))
 }
 
-// Parse REFERENCES table(column)
+// Parse REFERENCES table(column) [ON DELETE action] [ON UPDATE action]
 fn parse_references(input: &str) -> IResult<&str, ForeignKeyRef> {
     let (input, _) = tag_no_case("REFERENCES")(input)?;
     let (input, _) = multispace1(input)?;
@@ -322,7 +325,59 @@ fn parse_references(input: &str) -> IResult<&str, ForeignKeyRef> {
     let (input, _) = nom_char('(')(input)?;
     let (input, column) = parse_identifier(input)?;
     let (input, _) = nom_char(')')(input)?;
-    Ok((input, ForeignKeyRef { table: table.to_string(), column: column.to_string() }))
+    let (input, (on_delete, on_update)) = parse_ref_actions(input)?;
+    Ok((input, ForeignKeyRef {
+        table: table.to_string(),
+        column: column.to_string(),
+        on_delete,
+        on_update,
+    }))
+}
+
+/// Parse zero or more ON DELETE / ON UPDATE clauses in any order
+fn parse_ref_actions(input: &str) -> IResult<&str, (RefAction, RefAction)> {
+    let mut on_delete = RefAction::NoAction;
+    let mut on_update = RefAction::NoAction;
+    let mut input = input;
+    loop {
+        let parsed: IResult<&str, (bool, RefAction)> = (|| {
+            let (i, _) = multispace1(input)?;
+            let (i, _) = tag_no_case("ON")(i)?;
+            let (i, _) = multispace1(i)?;
+            let (i, which_delete) = nom::branch::alt((
+                nom::combinator::map(tag_no_case("DELETE"), |_| true),
+                nom::combinator::map(tag_no_case("UPDATE"), |_| false),
+            ))(i)?;
+            let (i, _) = multispace1(i)?;
+            let (i, action) = parse_ref_action(i)?;
+            Ok((i, (which_delete, action)))
+        })();
+        match parsed {
+            Ok((rest, (true, action))) => { on_delete = action; input = rest; }
+            Ok((rest, (false, action))) => { on_update = action; input = rest; }
+            Err(_) => break,
+        }
+    }
+    Ok((input, (on_delete, on_update)))
+}
+
+fn parse_ref_action(input: &str) -> IResult<&str, RefAction> {
+    nom::branch::alt((
+        nom::combinator::map(tag_no_case("CASCADE"), |_| RefAction::Cascade),
+        nom::combinator::map(
+            nom::sequence::separated_pair(tag_no_case("SET"), multispace1, tag_no_case("NULL")),
+            |_| RefAction::SetNull,
+        ),
+        nom::combinator::map(
+            nom::sequence::separated_pair(tag_no_case("SET"), multispace1, tag_no_case("DEFAULT")),
+            |_| RefAction::SetDefault,
+        ),
+        nom::combinator::map(tag_no_case("RESTRICT"), |_| RefAction::Restrict),
+        nom::combinator::map(
+            nom::sequence::separated_pair(tag_no_case("NO"), multispace1, tag_no_case("ACTION")),
+            |_| RefAction::NoAction,
+        ),
+    ))(input)
 }
 
 /// Parse CHECK (condition) — returns the parsed Condition and the raw inner SQL text.

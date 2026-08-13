@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::fmt;
 use std::collections::HashMap;
 use regex::Regex;
-use crate::parser::{CreateTableStatement, CreateIndexStatement, CreateFunctionStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, InsertSource, OnConflict, UpdateStatement, DeleteStatement, TruncateStatement, MergeStatement, MergeSource, MergeAction, AlterTableStatement, AlterAction, Value, Condition, Expression, Operator, ArithOp, SelectStatement, SelectColumn, FromClause, TableConstraint, TableConstraintKind, apply_scalar_func, apply_round, apply_concat, apply_substr, apply_replace, apply_lpad, apply_rpad, apply_cast, apply_greatest, apply_least, apply_power, apply_position, apply_repeat, apply_json_typeof, apply_json_array_length, apply_json_build_object, apply_json_build_array};
+use crate::parser::{RefAction, CreateTableStatement, CreateIndexStatement, CreateFunctionStatement, ColumnDefinition, DataType, ForeignKeyRef, InsertStatement, InsertSource, OnConflict, UpdateStatement, DeleteStatement, TruncateStatement, MergeStatement, MergeSource, MergeAction, AlterTableStatement, AlterAction, Value, Condition, Expression, Operator, ArithOp, SelectStatement, SelectColumn, FromClause, TableConstraint, TableConstraintKind, apply_scalar_func, apply_round, apply_concat, apply_substr, apply_replace, apply_lpad, apply_rpad, apply_cast, apply_greatest, apply_least, apply_power, apply_position, apply_repeat, apply_json_typeof, apply_json_array_length, apply_json_build_object, apply_json_build_array};
 
 /// Before-image snapshot for a single transaction
 struct TransactionState {
@@ -274,7 +274,16 @@ impl Storage {
             let ai = "AUTO_INCREMENT".to_string();
             let pk = "PRIMARY_KEY".to_string();
             let nn = "NOT_NULL".to_string();
-            let fk = col.references.as_ref().map(|r| format!("FK={}.{}", r.table, r.column));
+            let fk = col.references.as_ref().map(|r| {
+                let mut s = format!("FK={}.{}", r.table, r.column);
+                if r.on_delete != RefAction::NoAction {
+                    s.push_str(&format!("~OD={}", r.on_delete.as_sql()));
+                }
+                if r.on_update != RefAction::NoAction {
+                    s.push_str(&format!("~OU={}", r.on_update.as_sql()));
+                }
+                s
+            });
             let uq = "UNIQUE".to_string();
             if col.not_null { parts.push(&nn); }
             if col.unique { parts.push(&uq); }
@@ -306,12 +315,19 @@ fn constraint_to_sql(tc: &TableConstraint) -> String {
     let body = match &tc.kind {
         TableConstraintKind::PrimaryKey(c) => format!("PRIMARY KEY ({})", c.join(", ")),
         TableConstraintKind::Unique(c) => format!("UNIQUE ({})", c.join(", ")),
-        TableConstraintKind::ForeignKey { columns, ref_table, ref_columns } => {
-            if ref_columns.is_empty() {
+        TableConstraintKind::ForeignKey { columns, ref_table, ref_columns, on_delete, on_update } => {
+            let mut s = if ref_columns.is_empty() {
                 format!("FOREIGN KEY ({}) REFERENCES {}", columns.join(", "), ref_table)
             } else {
                 format!("FOREIGN KEY ({}) REFERENCES {} ({})", columns.join(", "), ref_table, ref_columns.join(", "))
+            };
+            if *on_delete != RefAction::NoAction {
+                s.push_str(&format!(" ON DELETE {}", on_delete.as_sql()));
             }
+            if *on_update != RefAction::NoAction {
+                s.push_str(&format!(" ON UPDATE {}", on_update.as_sql()));
+            }
+            s
         }
         TableConstraintKind::Check(_) => return tc.raw.clone(),
     };
@@ -563,7 +579,7 @@ fn decode_check_text(text: &str) -> String {
 
         // Enforce table-level FOREIGN KEY constraints (composite references)
         for tc in &schema.constraints {
-            if let TableConstraintKind::ForeignKey { columns, ref_table, ref_columns } = &tc.kind {
+            if let TableConstraintKind::ForeignKey { columns, ref_table, ref_columns, .. } = &tc.kind {
                 self.validate_composite_foreign_key(&final_values, schema, columns, ref_table, ref_columns)?;
             }
         }
@@ -770,8 +786,10 @@ fn decode_check_text(text: &str) -> String {
         }
 
         // Apply assignments to matched rows
+        let mut changed_pairs: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
         for (row_idx, row) in rows.iter_mut().enumerate() {
             if !rows_to_update[row_idx] { continue; }
+            let old_row = row.clone();
 
             // Build combined context using an empty from_row for expression resolution
             let mut combined_row: Vec<Value> = row.clone();
@@ -816,12 +834,32 @@ fn decode_check_text(text: &str) -> String {
                 }
             }
 
+            // Validate this table's own foreign keys against the new values
+            for (i, col_def) in schema.columns.iter().enumerate() {
+                if let Some(ref fk) = col_def.references {
+                    if row[i] != Value::Null && row[i] != old_row[i] {
+                        self.validate_foreign_key(&row[i], fk, &col_def.name)?;
+                    }
+                }
+            }
+            for tc in &schema.constraints {
+                if let TableConstraintKind::ForeignKey { columns, ref_table, ref_columns, .. } = &tc.kind {
+                    self.validate_composite_foreign_key(row, &schema, columns, ref_table, ref_columns)?;
+                }
+            }
+
             if stmt.returning.is_some() {
                 let ret_row = project_returning(row, stmt.returning.as_ref().unwrap(), &schema.columns);
                 returning_rows.push(ret_row);
             }
+            if *row != old_row {
+                changed_pairs.push((old_row, row.clone()));
+            }
             updated_count += 1;
         }
+
+        // Apply ON UPDATE referential actions in tables referencing this one
+        self.enforce_on_update(&stmt.table_name, &schema, &changed_pairs)?;
 
         // Write all rows back
         let data_path = self.data_path(&stmt.table_name);
@@ -888,15 +926,9 @@ fn decode_check_text(text: &str) -> String {
             }
         }
 
-        // Check FK constraints on deleted rows
-        for (i, col) in schema.columns.iter().enumerate() {
-            if col.primary_key {
-                let deleted_values: Vec<Value> = deleted_rows.iter().map(|r| r[i].clone()).collect();
-                if !deleted_values.is_empty() {
-                    self.check_fk_references(&stmt.table_name, &col.name, &deleted_values)?;
-                }
-            }
-        }
+        // Apply ON DELETE referential actions in tables referencing this one
+        let mut visited = std::collections::HashSet::new();
+        self.enforce_on_delete(&stmt.table_name, &schema, &deleted_rows, &mut visited)?;
 
         // Build RETURNING rows before writing
         let returning_rows: Vec<Vec<Value>> = if let Some(ref ret_cols) = stmt.returning {
@@ -1208,8 +1240,23 @@ fn decode_check_text(text: &str) -> String {
                 .find(|f| f.starts_with("FK="))
                 .map(|f| {
                     let fk = &f[3..];
-                    let dot = fk.find('.').unwrap();
-                    ForeignKeyRef { table: fk[..dot].to_string(), column: fk[dot+1..].to_string() }
+                    let mut parts = fk.split('~');
+                    let target = parts.next().unwrap_or("");
+                    let dot = target.find('.').unwrap();
+                    let mut fk_ref = ForeignKeyRef {
+                        table: target[..dot].to_string(),
+                        column: target[dot+1..].to_string(),
+                        on_delete: RefAction::NoAction,
+                        on_update: RefAction::NoAction,
+                    };
+                    for p in parts {
+                        if let Some(a) = p.strip_prefix("OD=").and_then(RefAction::from_sql) {
+                            fk_ref.on_delete = a;
+                        } else if let Some(a) = p.strip_prefix("OU=").and_then(RefAction::from_sql) {
+                            fk_ref.on_update = a;
+                        }
+                    }
+                    fk_ref
                 });
 
             let check_text = flags.iter()
@@ -1543,6 +1590,8 @@ fn decode_check_text(text: &str) -> String {
                             nc.references = Some(ForeignKeyRef {
                                 table: fk.table.clone(),
                                 column: to.to_string(),
+                                on_delete: fk.on_delete,
+                                on_update: fk.on_update,
                             });
                             changed = true;
                             return nc;
@@ -1634,6 +1683,8 @@ fn decode_check_text(text: &str) -> String {
                             nc.references = Some(ForeignKeyRef {
                                 table: new_name.to_string(),
                                 column: fk.column.clone(),
+                                on_delete: fk.on_delete,
+                                on_update: fk.on_update,
                             });
                             changed = true;
                             return nc;
@@ -1854,6 +1905,231 @@ fn decode_check_text(text: &str) -> String {
     }
 
     /// Check that a value exists in the referenced table's column
+    /// Collect all foreign keys in `child_schema` that reference `parent`:
+    /// (child column indices, parent column indices, on_delete, on_update)
+    fn referencing_fk_specs(
+        &self,
+        child_schema: &CreateTableStatement,
+        parent: &str,
+        parent_schema: &CreateTableStatement,
+    ) -> Vec<(Vec<usize>, Vec<usize>, RefAction, RefAction)> {
+        let mut specs = Vec::new();
+
+        // Column-level REFERENCES
+        for (i, col) in child_schema.columns.iter().enumerate() {
+            if let Some(fk) = &col.references {
+                if fk.table.eq_ignore_ascii_case(parent) {
+                    if let Some(pi) = parent_schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&fk.column)) {
+                        specs.push((vec![i], vec![pi], fk.on_delete, fk.on_update));
+                    }
+                }
+            }
+        }
+
+        // Table-level FOREIGN KEY constraints
+        for tc in &child_schema.constraints {
+            if let TableConstraintKind::ForeignKey { columns, ref_table, ref_columns, on_delete, on_update } = &tc.kind {
+                if !ref_table.eq_ignore_ascii_case(parent) { continue; }
+                let child_idxs: Vec<usize> = columns.iter()
+                    .filter_map(|c| child_schema.columns.iter().position(|col| col.name.eq_ignore_ascii_case(c)))
+                    .collect();
+                let parent_cols: Vec<String> = if ref_columns.is_empty() {
+                    let mut pk: Vec<String> = parent_schema.columns.iter()
+                        .filter(|c| c.primary_key)
+                        .map(|c| c.name.clone())
+                        .collect();
+                    for ptc in &parent_schema.constraints {
+                        if let TableConstraintKind::PrimaryKey(cols) = &ptc.kind {
+                            pk = cols.clone();
+                        }
+                    }
+                    pk
+                } else {
+                    ref_columns.clone()
+                };
+                let parent_idxs: Vec<usize> = parent_cols.iter()
+                    .filter_map(|c| parent_schema.columns.iter().position(|col| col.name.eq_ignore_ascii_case(c)))
+                    .collect();
+                if child_idxs.len() == parent_idxs.len() && !child_idxs.is_empty() {
+                    specs.push((child_idxs, parent_idxs, *on_delete, *on_update));
+                }
+            }
+        }
+
+        specs
+    }
+
+    /// Apply referential actions for rows being deleted from `parent`.
+    /// `visited` guards against cycles in cascading deletes.
+    fn enforce_on_delete(
+        &self,
+        parent: &str,
+        parent_schema: &CreateTableStatement,
+        deleted_rows: &[Vec<Value>],
+        visited: &mut std::collections::HashSet<String>,
+    ) -> Result<(), StorageError> {
+        if deleted_rows.is_empty() { return Ok(()); }
+        let tables = self.list_tables().map_err(StorageError::IoError)?;
+
+        for child in &tables {
+            if visited.contains(child) { continue; }
+            let is_self_ref = child.eq_ignore_ascii_case(parent);
+            let child_schema = match self.load_schema(child) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let specs = self.referencing_fk_specs(&child_schema, parent, parent_schema);
+            if specs.is_empty() { continue; }
+
+            let child_rows = self.read_rows(child)?;
+            for (child_idxs, parent_idxs, on_delete, _) in &specs {
+                // Self-referencing FKs: only the read-only RESTRICT/NO ACTION check is
+                // supported, evaluated against rows that survive the delete
+                if is_self_ref && !matches!(on_delete, RefAction::NoAction | RefAction::Restrict) {
+                    continue;
+                }
+                // Indices of child rows whose FK tuple matches any deleted parent key
+                let matching: Vec<usize> = child_rows.iter().enumerate()
+                    .filter(|(_, row)| {
+                        if child_idxs.iter().any(|&i| row[i] == Value::Null) { return false; }
+                        if is_self_ref && deleted_rows.iter().any(|del| del == *row) { return false; }
+                        deleted_rows.iter().any(|del| {
+                            child_idxs.iter().zip(parent_idxs.iter()).all(|(&ci, &pi)| row[ci] == del[pi])
+                        })
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                if matching.is_empty() { continue; }
+
+                match on_delete {
+                    RefAction::NoAction | RefAction::Restrict => {
+                        return Err(StorageError::ForeignKeyViolation {
+                            column: child_idxs.iter().map(|&i| child_schema.columns[i].name.clone()).collect::<Vec<_>>().join(", "),
+                            ref_table: format!("{} (still referenced by {})", parent, child),
+                            ref_column: parent_idxs.iter().map(|&i| parent_schema.columns[i].name.clone()).collect::<Vec<_>>().join(", "),
+                        });
+                    }
+                    RefAction::Cascade => {
+                        let victims: Vec<Vec<Value>> = matching.iter().map(|&i| child_rows[i].clone()).collect();
+                        visited.insert(parent.to_string());
+                        self.enforce_on_delete(child, &child_schema, &victims, visited)?;
+                        let remaining: Vec<Vec<Value>> = child_rows.iter().enumerate()
+                            .filter(|(i, _)| !matching.contains(i))
+                            .map(|(_, r)| r.clone())
+                            .collect();
+                        self.rewrite_table_rows(child, &remaining)?;
+                    }
+                    RefAction::SetNull | RefAction::SetDefault => {
+                        let mut updated = child_rows.clone();
+                        for &ri in &matching {
+                            for &ci in child_idxs {
+                                let new_val = if *on_delete == RefAction::SetNull {
+                                    Value::Null
+                                } else {
+                                    self.default_value_for(&child_schema.columns[ci])
+                                };
+                                if child_schema.columns[ci].not_null && new_val == Value::Null {
+                                    return Err(StorageError::NullConstraint {
+                                        column: child_schema.columns[ci].name.clone(),
+                                    });
+                                }
+                                updated[ri][ci] = new_val;
+                            }
+                        }
+                        self.rewrite_table_rows(child, &updated)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply referential actions when parent key columns change value.
+    /// `key_changes` maps old parent rows to their updated versions.
+    fn enforce_on_update(
+        &self,
+        parent: &str,
+        parent_schema: &CreateTableStatement,
+        key_changes: &[(Vec<Value>, Vec<Value>)],
+    ) -> Result<(), StorageError> {
+        if key_changes.is_empty() { return Ok(()); }
+        let tables = self.list_tables().map_err(StorageError::IoError)?;
+
+        for child in &tables {
+            let child_schema = match self.load_schema(child) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let specs = self.referencing_fk_specs(&child_schema, parent, parent_schema);
+            if specs.is_empty() { continue; }
+
+            let child_rows = self.read_rows(child)?;
+            for (child_idxs, parent_idxs, _, on_update) in &specs {
+                let mut updated = child_rows.clone();
+                let mut touched = false;
+                for (ri, row) in child_rows.iter().enumerate() {
+                    if child_idxs.iter().any(|&i| row[i] == Value::Null) { continue; }
+                    for (old, new) in key_changes {
+                        let matches_old = child_idxs.iter().zip(parent_idxs.iter()).all(|(&ci, &pi)| row[ci] == old[pi]);
+                        let key_changed = parent_idxs.iter().any(|&pi| old[pi] != new[pi]);
+                        if !matches_old || !key_changed { continue; }
+                        match on_update {
+                            RefAction::NoAction | RefAction::Restrict => {
+                                return Err(StorageError::ForeignKeyViolation {
+                                    column: child_idxs.iter().map(|&i| child_schema.columns[i].name.clone()).collect::<Vec<_>>().join(", "),
+                                    ref_table: format!("{} (still referenced by {})", parent, child),
+                                    ref_column: parent_idxs.iter().map(|&i| parent_schema.columns[i].name.clone()).collect::<Vec<_>>().join(", "),
+                                });
+                            }
+                            RefAction::Cascade => {
+                                for (&ci, &pi) in child_idxs.iter().zip(parent_idxs.iter()) {
+                                    updated[ri][ci] = new[pi].clone();
+                                }
+                                touched = true;
+                            }
+                            RefAction::SetNull | RefAction::SetDefault => {
+                                for &ci in child_idxs {
+                                    let new_val = if *on_update == RefAction::SetNull {
+                                        Value::Null
+                                    } else {
+                                        self.default_value_for(&child_schema.columns[ci])
+                                    };
+                                    if child_schema.columns[ci].not_null && new_val == Value::Null {
+                                        return Err(StorageError::NullConstraint {
+                                            column: child_schema.columns[ci].name.clone(),
+                                        });
+                                    }
+                                    updated[ri][ci] = new_val;
+                                }
+                                touched = true;
+                            }
+                        }
+                        break;
+                    }
+                }
+                if touched {
+                    self.rewrite_table_rows(child, &updated)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Overwrite a table's data file with the given rows
+    fn rewrite_table_rows(&self, table: &str, rows: &[Vec<Value>]) -> Result<(), StorageError> {
+        let data_path = self.data_path(table);
+        self.snapshot_before_write(&data_path);
+        self.snapshot_index_files(table);
+        let file = fs::File::create(&data_path)?;
+        let mut writer = BufWriter::new(file);
+        for row in rows {
+            writeln!(writer, "{}", serialize_row(row))?;
+        }
+        writer.flush()?;
+        self.rebuild_indexes_for_table(table)?;
+        Ok(())
+    }
+
     /// Validate a table-level FOREIGN KEY: the tuple of values must exist in the
     /// referenced table. Empty ref_columns means the referenced table's PRIMARY KEY.
     fn validate_composite_foreign_key(
@@ -1924,32 +2200,6 @@ fn decode_check_text(text: &str) -> String {
                 ref_table: fk.table.clone(),
                 ref_column: fk.column.clone(),
             });
-        }
-        Ok(())
-    }
-
-    /// Check if any table has a FK referencing the given table+column with the given values
-    fn check_fk_references(&self, table_name: &str, col_name: &str, values: &[Value]) -> Result<(), StorageError> {
-        let tables = self.list_tables().map_err(StorageError::IoError)?;
-        for t in &tables {
-            if t == table_name { continue; }
-            let schema = self.load_schema(t)?;
-            for (i, col) in schema.columns.iter().enumerate() {
-                if let Some(ref fk) = col.references {
-                    if fk.table == table_name && fk.column == col_name {
-                        let rows = self.read_rows(t)?;
-                        for val in values {
-                            if rows.iter().any(|row| row[i] == *val) {
-                                return Err(StorageError::ForeignKeyViolation {
-                                    column: col.name.clone(),
-                                    ref_table: table_name.to_string(),
-                                    ref_column: col_name.to_string(),
-                                });
-                            }
-                        }
-                    }
-                }
-            }
         }
         Ok(())
     }
@@ -3885,8 +4135,23 @@ impl Storage {
                                         Value::String("default".into()),
                                         Value::String("public".into()),
                                         Value::String(format!("{}_{}_fkey", fk.table, fk.column)),
-                                        Value::String("NO ACTION".into()),
-                                        Value::String("NO ACTION".into()),
+                                        Value::String(fk.on_delete.as_sql().into()),
+                                        Value::String(fk.on_update.as_sql().into()),
+                                    ]);
+                                }
+                            }
+                            for (i, tc) in schema.constraints.iter().enumerate() {
+                                if let TableConstraintKind::ForeignKey { ref_table, on_delete, on_update, .. } = &tc.kind {
+                                    let name = tc.name.clone().unwrap_or_else(|| format!("{}_constraint_{}", t, i + 1));
+                                    rows.push(vec![
+                                        Value::String("default".into()),
+                                        Value::String("public".into()),
+                                        Value::String(name),
+                                        Value::String("default".into()),
+                                        Value::String("public".into()),
+                                        Value::String(format!("{}_pkey", ref_table)),
+                                        Value::String(on_delete.as_sql().into()),
+                                        Value::String(on_update.as_sql().into()),
                                     ]);
                                 }
                             }
@@ -5084,7 +5349,7 @@ mod tests {
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition { name: "user_id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: false, not_null: false, unique: false,
-                    references: Some(ForeignKeyRef { table: "users".to_string(), column: "id".to_string() }), check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                    references: Some(ForeignKeyRef { table: "users".to_string(), column: "id".to_string(), on_delete: RefAction::NoAction, on_update: RefAction::NoAction }), check_constraint: None, check_constraint_text: None, default: None, default_text: None },
             ],
         };
         storage.create_table(&create_orders).unwrap();
@@ -5152,7 +5417,7 @@ mod tests {
             columns: vec![
                 ColumnDefinition::new("id", DataType::Int),
                 ColumnDefinition { name: "user_id".to_string(), data_type: DataType::Int, auto_increment: false, primary_key: false, not_null: false, unique: false,
-                    references: Some(ForeignKeyRef { table: "users".to_string(), column: "id".to_string() }), check_constraint: None, check_constraint_text: None, default: None, default_text: None },
+                    references: Some(ForeignKeyRef { table: "users".to_string(), column: "id".to_string(), on_delete: RefAction::NoAction, on_update: RefAction::NoAction }), check_constraint: None, check_constraint_text: None, default: None, default_text: None },
             ],
         };
         storage.create_table(&create_orders).unwrap();
@@ -5833,7 +6098,7 @@ mod tests {
         }).unwrap();
 
         let mut fk_col = ColumnDefinition::new("user_id", DataType::Int);
-        fk_col.references = Some(ForeignKeyRef { table: "users".to_string(), column: "id".to_string() });
+        fk_col.references = Some(ForeignKeyRef { table: "users".to_string(), column: "id".to_string(), on_delete: RefAction::NoAction, on_update: RefAction::NoAction });
         storage.create_table(&CreateTableStatement {
             table_name: "orders".to_string(),
             constraints: vec![],
@@ -5864,7 +6129,7 @@ mod tests {
         }).unwrap();
 
         let mut fk_col = ColumnDefinition::new("user_id", DataType::Int);
-        fk_col.references = Some(ForeignKeyRef { table: "users".to_string(), column: "id".to_string() });
+        fk_col.references = Some(ForeignKeyRef { table: "users".to_string(), column: "id".to_string(), on_delete: RefAction::NoAction, on_update: RefAction::NoAction });
         storage.create_table(&CreateTableStatement {
             table_name: "orders".to_string(),
             constraints: vec![],

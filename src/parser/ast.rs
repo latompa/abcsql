@@ -88,6 +88,8 @@ pub enum TableConstraintKind {
         ref_table: String,
         /// Empty means "the referenced table's PRIMARY KEY columns"
         ref_columns: Vec<String>,
+        on_delete: RefAction,
+        on_update: RefAction,
     },
     Check(Condition),
 }
@@ -174,6 +176,41 @@ pub struct ColumnDefinition {
 pub struct ForeignKeyRef {
     pub table: String,
     pub column: String,
+    pub on_delete: RefAction,
+    pub on_update: RefAction,
+}
+
+/// Referential action for ON DELETE / ON UPDATE
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum RefAction {
+    NoAction,
+    Restrict,
+    Cascade,
+    SetNull,
+    SetDefault,
+}
+
+impl RefAction {
+    pub fn as_sql(&self) -> &'static str {
+        match self {
+            RefAction::NoAction => "NO ACTION",
+            RefAction::Restrict => "RESTRICT",
+            RefAction::Cascade => "CASCADE",
+            RefAction::SetNull => "SET NULL",
+            RefAction::SetDefault => "SET DEFAULT",
+        }
+    }
+
+    pub fn from_sql(s: &str) -> Option<RefAction> {
+        match s.to_uppercase().as_str() {
+            "NO ACTION" => Some(RefAction::NoAction),
+            "RESTRICT" => Some(RefAction::Restrict),
+            "CASCADE" => Some(RefAction::Cascade),
+            "SET NULL" => Some(RefAction::SetNull),
+            "SET DEFAULT" => Some(RefAction::SetDefault),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]

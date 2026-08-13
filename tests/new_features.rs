@@ -2107,3 +2107,149 @@ fn test_on_conflict_do_nothing_with_composite_unique() {
     let r = execute(&db.storage, "SELECT a FROM t").unwrap();
     assert!(r.contains("1 rows"), "DO NOTHING should skip composite conflict: {}", r);
 }
+
+// ---- Referential actions (ON DELETE / ON UPDATE) ----
+
+#[test]
+fn test_ref_action_parse() {
+    use abcsql::{parse_sql, SqlStatement, parser::RefAction};
+    let (_, stmt) = parse_sql("CREATE TABLE c (uid INT REFERENCES u(id) ON DELETE CASCADE ON UPDATE SET NULL)").expect("parse failed");
+    if let SqlStatement::CreateTable(ct) = stmt {
+        let fk = ct.columns[0].references.as_ref().expect("fk");
+        assert_eq!(fk.on_delete, RefAction::Cascade);
+        assert_eq!(fk.on_update, RefAction::SetNull);
+    } else {
+        panic!("expected CreateTable");
+    }
+}
+
+#[test]
+fn test_delete_restrict_default() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE u (id INT PRIMARY KEY)").unwrap();
+    execute(&db.storage, "CREATE TABLE c (uid INT REFERENCES u(id))").unwrap();
+    execute(&db.storage, "INSERT INTO u VALUES (1)").unwrap();
+    execute(&db.storage, "INSERT INTO c VALUES (1)").unwrap();
+    let r = execute(&db.storage, "DELETE FROM u WHERE id = 1");
+    assert!(r.is_err(), "expected NO ACTION to block delete of referenced row");
+}
+
+#[test]
+fn test_on_delete_cascade() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE u (id INT PRIMARY KEY)").unwrap();
+    execute(&db.storage, "CREATE TABLE c (uid INT REFERENCES u(id) ON DELETE CASCADE)").unwrap();
+    execute(&db.storage, "INSERT INTO u VALUES (1), (2)").unwrap();
+    execute(&db.storage, "INSERT INTO c VALUES (1), (1), (2)").unwrap();
+    execute(&db.storage, "DELETE FROM u WHERE id = 1").unwrap();
+    let r = execute(&db.storage, "SELECT uid FROM c").unwrap();
+    assert!(r.contains("1 rows"), "cascade should delete children: {}", r);
+}
+
+#[test]
+fn test_on_delete_cascade_recursive() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE a (id INT PRIMARY KEY)").unwrap();
+    execute(&db.storage, "CREATE TABLE b (id INT PRIMARY KEY, aid INT REFERENCES a(id) ON DELETE CASCADE)").unwrap();
+    execute(&db.storage, "CREATE TABLE c (bid INT REFERENCES b(id) ON DELETE CASCADE)").unwrap();
+    execute(&db.storage, "INSERT INTO a VALUES (1)").unwrap();
+    execute(&db.storage, "INSERT INTO b VALUES (10, 1)").unwrap();
+    execute(&db.storage, "INSERT INTO c VALUES (10)").unwrap();
+    execute(&db.storage, "DELETE FROM a WHERE id = 1").unwrap();
+    let rb = execute(&db.storage, "SELECT id FROM b").unwrap();
+    let rc = execute(&db.storage, "SELECT bid FROM c").unwrap();
+    assert!(rb.contains("0 rows"), "grandparent cascade should empty b: {}", rb);
+    assert!(rc.contains("0 rows"), "grandparent cascade should empty c: {}", rc);
+}
+
+#[test]
+fn test_on_delete_set_null() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE u (id INT PRIMARY KEY)").unwrap();
+    execute(&db.storage, "CREATE TABLE c (uid INT REFERENCES u(id) ON DELETE SET NULL)").unwrap();
+    execute(&db.storage, "INSERT INTO u VALUES (1)").unwrap();
+    execute(&db.storage, "INSERT INTO c VALUES (1)").unwrap();
+    execute(&db.storage, "DELETE FROM u WHERE id = 1").unwrap();
+    let r = execute(&db.storage, "SELECT uid FROM c WHERE uid IS NULL").unwrap();
+    assert!(r.contains("1 rows"), "SET NULL should null child fk: {}", r);
+}
+
+#[test]
+fn test_on_delete_set_default() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE u (id INT PRIMARY KEY)").unwrap();
+    execute(&db.storage, "INSERT INTO u VALUES (1), (99)").unwrap();
+    execute(&db.storage, "CREATE TABLE c (uid INT DEFAULT 99 REFERENCES u(id) ON DELETE SET DEFAULT)").unwrap();
+    execute(&db.storage, "INSERT INTO c VALUES (1)").unwrap();
+    execute(&db.storage, "DELETE FROM u WHERE id = 1").unwrap();
+    let r = execute(&db.storage, "SELECT uid FROM c WHERE uid = 99").unwrap();
+    assert!(r.contains("1 rows"), "SET DEFAULT should reset child fk: {}", r);
+}
+
+#[test]
+fn test_on_update_cascade() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE u (id INT PRIMARY KEY)").unwrap();
+    execute(&db.storage, "CREATE TABLE c (uid INT REFERENCES u(id) ON UPDATE CASCADE)").unwrap();
+    execute(&db.storage, "INSERT INTO u VALUES (1)").unwrap();
+    execute(&db.storage, "INSERT INTO c VALUES (1)").unwrap();
+    execute(&db.storage, "UPDATE u SET id = 5 WHERE id = 1").unwrap();
+    let r = execute(&db.storage, "SELECT uid FROM c WHERE uid = 5").unwrap();
+    assert!(r.contains("1 rows"), "ON UPDATE CASCADE should follow key change: {}", r);
+}
+
+#[test]
+fn test_on_update_restrict_default() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE u (id INT PRIMARY KEY)").unwrap();
+    execute(&db.storage, "CREATE TABLE c (uid INT REFERENCES u(id))").unwrap();
+    execute(&db.storage, "INSERT INTO u VALUES (1)").unwrap();
+    execute(&db.storage, "INSERT INTO c VALUES (1)").unwrap();
+    let r = execute(&db.storage, "UPDATE u SET id = 5 WHERE id = 1");
+    assert!(r.is_err(), "expected NO ACTION to block update of referenced key");
+}
+
+#[test]
+fn test_update_child_fk_validated() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE u (id INT PRIMARY KEY)").unwrap();
+    execute(&db.storage, "CREATE TABLE c (uid INT REFERENCES u(id))").unwrap();
+    execute(&db.storage, "INSERT INTO u VALUES (1)").unwrap();
+    execute(&db.storage, "INSERT INTO c VALUES (1)").unwrap();
+    let r = execute(&db.storage, "UPDATE c SET uid = 42");
+    assert!(r.is_err(), "expected FK violation updating child to unknown key");
+}
+
+#[test]
+fn test_composite_fk_on_delete_cascade() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE p (a INT, b INT, PRIMARY KEY (a, b))").unwrap();
+    execute(&db.storage, "CREATE TABLE c (x INT, y INT, FOREIGN KEY (x, y) REFERENCES p (a, b) ON DELETE CASCADE)").unwrap();
+    execute(&db.storage, "INSERT INTO p VALUES (1, 2), (3, 4)").unwrap();
+    execute(&db.storage, "INSERT INTO c VALUES (1, 2), (3, 4)").unwrap();
+    execute(&db.storage, "DELETE FROM p WHERE a = 1").unwrap();
+    let r = execute(&db.storage, "SELECT x FROM c").unwrap();
+    assert!(r.contains("1 rows"), "composite cascade failed: {}", r);
+}
+
+#[test]
+fn test_ref_action_survives_reload() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE u (id INT PRIMARY KEY)").unwrap();
+    execute(&db.storage, "CREATE TABLE c (uid INT REFERENCES u(id) ON DELETE CASCADE)").unwrap();
+    execute(&db.storage, "INSERT INTO u VALUES (1)").unwrap();
+    execute(&db.storage, "INSERT INTO c VALUES (1)").unwrap();
+    // load_schema re-reads the schema file per statement (FK~OD= round-trip)
+    execute(&db.storage, "DELETE FROM u WHERE id = 1").unwrap();
+    let r = execute(&db.storage, "SELECT uid FROM c").unwrap();
+    assert!(r.contains("0 rows"), "action lost after reload: {}", r);
+}
+
+#[test]
+fn test_delete_rule_in_information_schema() {
+    let db = TestDb::new();
+    execute(&db.storage, "CREATE TABLE u (id INT PRIMARY KEY)").unwrap();
+    execute(&db.storage, "CREATE TABLE c (uid INT REFERENCES u(id) ON DELETE CASCADE)").unwrap();
+    let r = execute(&db.storage, "SELECT constraint_name FROM information_schema.referential_constraints WHERE delete_rule = 'CASCADE'").unwrap();
+    assert!(r.contains("1 rows"), "delete_rule not exposed: {}", r);
+}

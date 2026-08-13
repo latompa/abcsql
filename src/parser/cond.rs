@@ -1423,6 +1423,20 @@ fn parse_expression_case(input: &str) -> IResult<&str, Expression> {
     let (input, _) = tag_no_case("CASE")(input)?;
     let (input, _) = multispace1(input)?;
 
+    // Simple CASE: an operand before the first WHEN. Each branch desugars into
+    // an equality comparison against the operand.
+    let starts_with_when = match tag_no_case::<&str, &str, nom::error::Error<&str>>("WHEN")(input) {
+        Ok((rest, _)) => !rest.chars().next().is_some_and(|c| c.is_alphanumeric() || c == '_'),
+        Err(_) => false,
+    };
+    let (input, operand) = if starts_with_when {
+        (input, None)
+    } else {
+        let (i, expr) = parse_expression(input)?;
+        let (i, _) = multispace1(i)?;
+        (i, Some(expr))
+    };
+
     let mut branches: Vec<(Condition, Expression)> = Vec::new();
     let mut input = input;
     loop {
@@ -1431,7 +1445,18 @@ fn parse_expression_case(input: &str) -> IResult<&str, Expression> {
             Err(_) => break,
         };
         let (input_after_when, _) = multispace1(input_after_when)?;
-        let (input_after_when, condition) = parse_condition(input_after_when)?;
+        let (input_after_when, condition) = match &operand {
+            Some(op_expr) => {
+                let (i, comparand) = parse_expression(input_after_when)?;
+                (i, Condition::Comparison {
+                    left: op_expr.clone(),
+                    operator: Operator::Equals,
+                    right: comparand,
+                    upper_bound: None,
+                })
+            }
+            None => parse_condition(input_after_when)?,
+        };
         let (input_after_when, _) = multispace1(input_after_when)?;
         let (input_after_when, _) = tag_no_case("THEN")(input_after_when)?;
         let (input_after_when, _) = multispace1(input_after_when)?;

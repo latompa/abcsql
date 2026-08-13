@@ -2253,3 +2253,56 @@ fn test_delete_rule_in_information_schema() {
     let r = execute(&db.storage, "SELECT constraint_name FROM information_schema.referential_constraints WHERE delete_rule = 'CASCADE'").unwrap();
     assert!(r.contains("1 rows"), "delete_rule not exposed: {}", r);
 }
+
+// ---- Simple CASE (CASE operand WHEN value THEN ...) ----
+
+#[test]
+fn test_simple_case_execute() {
+    let setup = [
+        "CREATE TABLE t (id INT, status INT)",
+        "INSERT INTO t VALUES (1, 1), (2, 2), (3, 9)",
+    ];
+    let r = with_db(&setup, "SELECT id FROM t WHERE CASE status WHEN 1 THEN 'a' WHEN 2 THEN 'b' ELSE 'z' END = 'b'");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "simple CASE failed: {:?}", r);
+}
+
+#[test]
+fn test_simple_case_else_branch() {
+    let setup = [
+        "CREATE TABLE t (id INT, status INT)",
+        "INSERT INTO t VALUES (1, 7), (2, 8)",
+    ];
+    let r = with_db(&setup, "SELECT id FROM t WHERE CASE status WHEN 1 THEN 'a' ELSE 'z' END = 'z'");
+    assert!(r.as_ref().unwrap().contains("2 rows"), "simple CASE ELSE failed: {:?}", r);
+}
+
+#[test]
+fn test_simple_case_string_operand() {
+    let setup = [
+        "CREATE TABLE t (id INT, kind VARCHAR)",
+        "INSERT INTO t VALUES (1, 'gold'), (2, 'silver')",
+    ];
+    let r = with_db(&setup, "SELECT id FROM t WHERE CASE kind WHEN 'gold' THEN 10 WHEN 'silver' THEN 5 END = 10");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "simple CASE with strings failed: {:?}", r);
+}
+
+#[test]
+fn test_searched_case_still_works() {
+    let setup = [
+        "CREATE TABLE t (id INT, n INT)",
+        "INSERT INTO t VALUES (1, 5), (2, 50)",
+    ];
+    let r = with_db(&setup, "SELECT id FROM t WHERE CASE WHEN n > 10 THEN 'big' ELSE 'small' END = 'big'");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "searched CASE regressed: {:?}", r);
+}
+
+#[test]
+fn test_simple_case_expression_operand() {
+    let setup = [
+        "CREATE TABLE t (id INT, n INT)",
+        "INSERT INTO t VALUES (1, 4), (2, 5)",
+    ];
+    // operand is an expression: n % 2
+    let r = with_db(&setup, "SELECT id FROM t WHERE CASE n % 2 WHEN 0 THEN 'even' ELSE 'odd' END = 'even'");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "simple CASE expr operand failed: {:?}", r);
+}

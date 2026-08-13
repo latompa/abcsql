@@ -2075,9 +2075,15 @@ pub fn parse_join(input: &str) -> IResult<&str, JoinClause> {
     ))(input)?;
     let (input, _) = multispace1(input)?;
 
-    // Check for LATERAL (SELECT ...) subquery
-    if let Ok((input, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("LATERAL")(input) {
-        let (input, _) = multispace1(input)?;
+    // Check for a subquery join target: [LATERAL] (SELECT ...).
+    // Plain derived tables reuse the LATERAL execution path — they cannot
+    // reference outer columns, so per-row evaluation yields the same rows.
+    let (after_lateral, lateral_kw) = nom::combinator::opt(nom::sequence::terminated(
+        tag_no_case::<&str, &str, nom::error::Error<&str>>("LATERAL"),
+        multispace1::<&str, nom::error::Error<&str>>,
+    ))(input)?;
+    if lateral_kw.is_some() || after_lateral.starts_with('(') {
+        let input = after_lateral;
         let (input, _) = nom_char('(')(input)?;
         let (input, _) = multispace0(input)?;
         let (input, lateral_query) = parse_select_statement(input)?;

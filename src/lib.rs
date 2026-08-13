@@ -646,27 +646,33 @@ fn execute_select_to_string(
                     lat_rows.into_iter().take(n as usize).collect()
                 } else { lat_rows };
 
-                if lat_rows.is_empty() {
-                    if join.join_type == parser::JoinType::Left {
-                        let mut row = outer_row.clone();
-                        row.extend(std::iter::repeat(Value::Null).take(lat_ncols));
-                        new_rows.push(row);
-                    }
-                    // INNER/CROSS: omit outer row if no match
-                } else {
-                    for lat_row in &lat_rows {
-                        // Project lateral columns from inner row
-                        let lat_vals: Vec<Value> = lateral_query.columns.iter().filter_map(|c| match c {
-                            parser::SelectColumn::Column(n) | parser::SelectColumn::QualifiedColumn(_, n) => {
-                                inner_cols.iter().position(|(_, cn)| cn == n).and_then(|i| lat_row.get(i).cloned())
-                            }
-                            _ => lat_row.first().cloned(),
-                        }).collect();
-                        let lat_vals = if lat_vals.is_empty() { lat_row.clone() } else { lat_vals };
-                        let mut new_row = outer_row.clone();
-                        new_row.extend(lat_vals);
+                let mut cols_with_lat = combined_cols.clone();
+                cols_with_lat.extend(new_lat_cols.iter().cloned());
+                let mut matched_any = false;
+                for lat_row in &lat_rows {
+                    // Project lateral columns from inner row
+                    let lat_vals: Vec<Value> = lateral_query.columns.iter().filter_map(|c| match c {
+                        parser::SelectColumn::Column(n) | parser::SelectColumn::QualifiedColumn(_, n) => {
+                            inner_cols.iter().position(|(_, cn)| cn == n).and_then(|i| lat_row.get(i).cloned())
+                        }
+                        _ => lat_row.first().cloned(),
+                    }).collect();
+                    let lat_vals = if lat_vals.is_empty() { lat_row.clone() } else { lat_vals };
+                    let mut new_row = outer_row.clone();
+                    new_row.extend(lat_vals);
+                    let keep = match &join.on {
+                        Some(cond) => eval_condition(cond, &new_row, &cols_with_lat, storage),
+                        None => true,
+                    };
+                    if keep {
+                        matched_any = true;
                         new_rows.push(new_row);
                     }
+                }
+                if !matched_any && join.join_type == parser::JoinType::Left {
+                    let mut row = outer_row.clone();
+                    row.extend(std::iter::repeat(Value::Null).take(lat_ncols));
+                    new_rows.push(row);
                 }
             }
             combined_cols.extend(new_lat_cols);

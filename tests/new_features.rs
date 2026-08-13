@@ -2952,3 +2952,41 @@ fn test_set_transaction_inside_transaction() {
     assert!(execute(&db.storage, "INSERT INTO t VALUES (1)").is_err(), "in-txn READ ONLY not applied");
     execute(&db.storage, "ROLLBACK").unwrap();
 }
+
+// ---- Derived tables in joins ----
+
+#[test]
+fn test_join_derived_table() {
+    let setup = [
+        "CREATE TABLE orders (id INT, cust INT, total INT)",
+        "CREATE TABLE customers (id INT, name VARCHAR)",
+        "INSERT INTO customers VALUES (1, 'Ann'), (2, 'Bob')",
+        "INSERT INTO orders VALUES (10, 1, 100), (11, 1, 50), (12, 2, 5)",
+    ];
+    let r = with_db(&setup, "SELECT customers.name FROM customers JOIN (SELECT cust, total FROM orders WHERE total > 20) big ON customers.id = big.cust");
+    assert!(r.as_ref().unwrap().contains("2 rows"), "derived table join failed: {:?}", r);
+}
+
+#[test]
+fn test_left_join_derived_table() {
+    let setup = [
+        "CREATE TABLE a (id INT)",
+        "CREATE TABLE b (id INT, v INT)",
+        "INSERT INTO a VALUES (1), (2)",
+        "INSERT INTO b VALUES (1, 10)",
+    ];
+    let r = with_db(&setup, "SELECT a.id FROM a LEFT JOIN (SELECT id, v FROM b) bb ON a.id = bb.id");
+    assert!(r.as_ref().unwrap().contains("2 rows"), "left join derived failed: {:?}", r);
+}
+
+#[test]
+fn test_lateral_join_still_works() {
+    let setup = [
+        "CREATE TABLE a (id INT)",
+        "CREATE TABLE b (aid INT, v INT)",
+        "INSERT INTO a VALUES (1), (2)",
+        "INSERT INTO b VALUES (1, 10), (2, 20)",
+    ];
+    let r = with_db(&setup, "SELECT a.id, latest.v FROM a LEFT JOIN LATERAL (SELECT v FROM b WHERE aid = a.id LIMIT 1) AS latest ON true");
+    assert!(r.as_ref().unwrap().contains("2 rows"), "LATERAL regressed: {:?}", r);
+}

@@ -2306,3 +2306,98 @@ fn test_simple_case_expression_operand() {
     let r = with_db(&setup, "SELECT id FROM t WHERE CASE n % 2 WHEN 0 THEN 'even' ELSE 'odd' END = 'even'");
     assert!(r.as_ref().unwrap().contains("1 rows"), "simple CASE expr operand failed: {:?}", r);
 }
+
+// ---- Row value constructors ----
+
+#[test]
+fn test_row_equality() {
+    let setup = [
+        "CREATE TABLE t (a INT, b INT)",
+        "INSERT INTO t VALUES (1, 2), (1, 3), (2, 2)",
+    ];
+    let r = with_db(&setup, "SELECT a FROM t WHERE (a, b) = (1, 2)");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "row equality failed: {:?}", r);
+}
+
+#[test]
+fn test_row_inequality() {
+    let setup = [
+        "CREATE TABLE t (a INT, b INT)",
+        "INSERT INTO t VALUES (1, 2), (1, 3)",
+    ];
+    let r = with_db(&setup, "SELECT a FROM t WHERE (a, b) <> (1, 2)");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "row inequality failed: {:?}", r);
+}
+
+#[test]
+fn test_row_lexicographic_lt() {
+    let setup = [
+        "CREATE TABLE t (a INT, b INT)",
+        "INSERT INTO t VALUES (1, 9), (2, 1), (2, 5), (3, 0)",
+    ];
+    // (a,b) < (2,5) → (1,9) and (2,1)
+    let r = with_db(&setup, "SELECT a FROM t WHERE (a, b) < (2, 5)");
+    assert!(r.as_ref().unwrap().contains("2 rows"), "row < failed: {:?}", r);
+}
+
+#[test]
+fn test_row_lexicographic_le() {
+    let setup = [
+        "CREATE TABLE t (a INT, b INT)",
+        "INSERT INTO t VALUES (1, 9), (2, 5), (3, 0)",
+    ];
+    let r = with_db(&setup, "SELECT a FROM t WHERE (a, b) <= (2, 5)");
+    assert!(r.as_ref().unwrap().contains("2 rows"), "row <= failed: {:?}", r);
+}
+
+#[test]
+fn test_row_in_list() {
+    let setup = [
+        "CREATE TABLE t (a INT, b INT)",
+        "INSERT INTO t VALUES (1, 2), (3, 4), (5, 6)",
+    ];
+    let r = with_db(&setup, "SELECT a FROM t WHERE (a, b) IN ((1, 2), (5, 6))");
+    assert!(r.as_ref().unwrap().contains("2 rows"), "row IN failed: {:?}", r);
+}
+
+#[test]
+fn test_row_not_in_list() {
+    let setup = [
+        "CREATE TABLE t (a INT, b INT)",
+        "INSERT INTO t VALUES (1, 2), (3, 4)",
+    ];
+    let r = with_db(&setup, "SELECT a FROM t WHERE (a, b) NOT IN ((1, 2))");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "row NOT IN failed: {:?}", r);
+}
+
+#[test]
+fn test_update_row_assignment() {
+    let setup = [
+        "CREATE TABLE t (a INT, b INT, c INT)",
+        "INSERT INTO t VALUES (1, 2, 3)",
+        "UPDATE t SET (a, b) = (10, 20)",
+    ];
+    let r = with_db(&setup, "SELECT c FROM t WHERE a = 10 AND b = 20 AND c = 3");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "row assignment failed: {:?}", r);
+}
+
+#[test]
+fn test_update_row_assignment_with_default() {
+    let setup = [
+        "CREATE TABLE t (a INT, b INT DEFAULT 7)",
+        "INSERT INTO t VALUES (1, 2)",
+        "UPDATE t SET (a, b) = (5, DEFAULT)",
+    ];
+    let r = with_db(&setup, "SELECT a FROM t WHERE a = 5 AND b = 7");
+    assert!(r.as_ref().unwrap().contains("1 rows"), "row assignment DEFAULT failed: {:?}", r);
+}
+
+#[test]
+fn test_paren_condition_not_broken_by_rows() {
+    let setup = [
+        "CREATE TABLE t (a INT, b INT)",
+        "INSERT INTO t VALUES (1, 2), (3, 4)",
+    ];
+    let r = with_db(&setup, "SELECT a FROM t WHERE (a = 1 OR b = 4) AND b > 0");
+    assert!(r.as_ref().unwrap().contains("2 rows"), "paren conditions regressed: {:?}", r);
+}

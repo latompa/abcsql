@@ -64,6 +64,126 @@ fn parse_not_condition(input: &str) -> IResult<&str, Condition> {
     parse_primary_condition(input)
 }
 
+/// Parse a parenthesized row of >= 2 expressions: (expr, expr, ...)
+fn parse_row_constructor(input: &str) -> IResult<&str, Vec<Expression>> {
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, exprs) = nom::multi::separated_list1(
+        nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+        parse_expression,
+    )(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = nom_char(')')(input)?;
+    if exprs.len() < 2 {
+        return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Verify)));
+    }
+    Ok((input, exprs))
+}
+
+/// Build the AND chain of pairwise equalities for row equality
+fn row_equality(left: &[Expression], right: &[Expression]) -> Condition {
+    let mut iter = left.iter().zip(right.iter()).map(|(l, r)| Condition::Comparison {
+        left: l.clone(),
+        operator: Operator::Equals,
+        right: r.clone(),
+        upper_bound: None,
+    });
+    let first = iter.next().expect("row constructors are non-empty");
+    iter.fold(first, |acc, c| Condition::And(Box::new(acc), Box::new(c)))
+}
+
+/// Build the lexicographic ordering condition for row comparisons.
+/// (a, b) < (x, y)  =>  a < x OR (a = x AND b < y)
+fn row_lexicographic(left: &[Expression], right: &[Expression], op: &Operator, or_equal: bool) -> Condition {
+    let strict = Condition::Comparison {
+        left: left[0].clone(),
+        operator: op.clone(),
+        right: right[0].clone(),
+        upper_bound: None,
+    };
+    if left.len() == 1 {
+        if or_equal {
+            let eq = Condition::Comparison {
+                left: left[0].clone(),
+                operator: Operator::Equals,
+                right: right[0].clone(),
+                upper_bound: None,
+            };
+            return Condition::Or(Box::new(strict), Box::new(eq));
+        }
+        return strict;
+    }
+    let head_eq = Condition::Comparison {
+        left: left[0].clone(),
+        operator: Operator::Equals,
+        right: right[0].clone(),
+        upper_bound: None,
+    };
+    let tail = row_lexicographic(&left[1..], &right[1..], op, or_equal);
+    Condition::Or(
+        Box::new(strict),
+        Box::new(Condition::And(Box::new(head_eq), Box::new(tail))),
+    )
+}
+
+/// Parse row-constructor comparisons and IN lists, desugaring to column-wise conditions
+fn parse_row_comparison(input: &str) -> IResult<&str, Condition> {
+    let (input, left) = parse_row_constructor(input)?;
+    let (input, _) = multispace0(input)?;
+
+    // (a, b) [NOT] IN ((1, 2), (3, 4))
+    let (input, negated) = match tag_no_case::<&str, &str, nom::error::Error<&str>>("NOT")(input) {
+        Ok((i, _)) => {
+            let (i, _) = multispace1(i)?;
+            (i, true)
+        }
+        Err(_) => (input, false),
+    };
+    if let Ok((i, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("IN")(input) {
+        let (i, _) = multispace0(i)?;
+        let (i, _) = nom_char('(')(i)?;
+        let (i, rows) = nom::multi::separated_list1(
+            nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+            parse_row_constructor,
+        )(i)?;
+        let (i, _) = multispace0(i)?;
+        let (i, _) = nom_char(')')(i)?;
+        for row in &rows {
+            if row.len() != left.len() {
+                return Err(nom::Err::Failure(nom::error::Error::new(i, nom::error::ErrorKind::Verify)));
+            }
+        }
+        let mut iter = rows.iter().map(|row| row_equality(&left, row));
+        let first = iter.next().expect("separated_list1 yields at least one row");
+        let cond = iter.fold(first, |acc, c| Condition::Or(Box::new(acc), Box::new(c)));
+        let cond = if negated { Condition::Not(Box::new(cond)) } else { cond };
+        return Ok((i, cond));
+    }
+    if negated {
+        return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)));
+    }
+
+    // (a, b) <op> (x, y)
+    let (input, op_str) = nom::branch::alt((
+        tag("<>"), tag("!="), tag("<="), tag(">="), tag("="), tag("<"), tag(">"),
+    ))(input)?;
+    let (input, right) = parse_row_constructor(input)?;
+    if right.len() != left.len() {
+        return Err(nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Verify)));
+    }
+    let cond = match op_str {
+        "=" => row_equality(&left, &right),
+        "<>" | "!=" => Condition::Not(Box::new(row_equality(&left, &right))),
+        "<" => row_lexicographic(&left, &right, &Operator::LessThan, false),
+        ">" => row_lexicographic(&left, &right, &Operator::GreaterThan, false),
+        "<=" => row_lexicographic(&left, &right, &Operator::LessThan, true),
+        ">=" => row_lexicographic(&left, &right, &Operator::GreaterThan, true),
+        _ => unreachable!(),
+    };
+    Ok((input, cond))
+}
+
 /// Parse a single comparison or a parenthesized condition group
 fn parse_primary_condition(input: &str) -> IResult<&str, Condition> {
     let (input, _) = multispace0(input)?;
@@ -123,6 +243,13 @@ fn parse_primary_condition(input: &str) -> IResult<&str, Condition> {
                 }
             }
         }
+    }
+
+    // Row value constructor comparisons: (a, b) = (1, 2), (a, b) < (x, y),
+    // (a, b) IN ((1, 2), (3, 4)). Requires >= 2 elements so ordinary
+    // parenthesized expressions/conditions are unaffected.
+    if let Ok((rest, cond)) = parse_row_comparison(input) {
+        return Ok((rest, cond));
     }
 
     // Parenthesized sub-condition: (cond AND/OR cond ...)

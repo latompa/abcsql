@@ -674,10 +674,11 @@ fn parse_on_conflict(input: &str) -> IResult<&str, Option<OnConflict>> {
         let (input, _) = multispace1(input)?;
         let (input, _) = tag_no_case("SET")(input)?;
         let (input, _) = multispace1(input)?;
-        let (input, assignments) = nom::multi::separated_list1(
+        let (input, groups) = nom::multi::separated_list1(
             nom::sequence::delimited(multispace0, nom_char(','), multispace0),
-            parse_assignment,
+            parse_assignment_group,
         )(input)?;
+        let assignments = groups.into_iter().flatten().collect();
         Ok((input, OnConflict::DoUpdate { conflict_columns, assignments }))
     })(input)
 }
@@ -703,10 +704,11 @@ pub fn parse_update(input: &str) -> IResult<&str, SqlStatement> {
     let (input, _) = multispace1(input)?;
     let (input, _) = tag_no_case("SET")(input)?;
     let (input, _) = multispace1(input)?;
-    let (input, assignments) = separated_list0(
+    let (input, groups) = separated_list0(
         delimited(multispace0, nom_char(','), multispace0),
-        parse_assignment
+        parse_assignment_group
     )(input)?;
+    let assignments: Vec<Assignment> = groups.into_iter().flatten().collect();
     // Optional FROM clause for join-based updates
     let (input, from) = nom::combinator::opt(|input| {
         let (input, _) = multispace1(input)?;
@@ -739,6 +741,32 @@ fn parse_default_marker(input: &str) -> IResult<&str, Value> {
         return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)));
     }
     Ok((input, Value::Default))
+}
+
+/// Parse one SET item: a single assignment or the row form (a, b) = (expr, expr)
+pub fn parse_assignment_group(input: &str) -> IResult<&str, Vec<Assignment>> {
+    let (input, _) = multispace0(input)?;
+    if let Ok((i, cols)) = parse_paren_column_list(input) {
+        let (i, _) = multispace0(i)?;
+        let (i, _) = nom_char('=')(i)?;
+        let (i, _) = multispace0(i)?;
+        let (i, _) = nom_char('(')(i)?;
+        let (i, exprs) = nom::multi::separated_list1(
+            nom::sequence::delimited(multispace0, nom_char(','), multispace0),
+            nom::branch::alt((
+                nom::combinator::map(parse_default_marker, Expression::Literal),
+                parse_expression,
+            )),
+        )(i)?;
+        let (i, _) = multispace0(i)?;
+        let (i, _) = nom_char(')')(i)?;
+        if cols.len() != exprs.len() {
+            return Err(nom::Err::Failure(nom::error::Error::new(i, nom::error::ErrorKind::Verify)));
+        }
+        let assignments = cols.into_iter().zip(exprs).map(|(column, value)| Assignment { column, value }).collect();
+        return Ok((i, assignments));
+    }
+    nom::combinator::map(parse_assignment, |a| vec![a])(input)
 }
 
 /// Parse assignment: column = expression (or the DEFAULT keyword)
@@ -908,10 +936,11 @@ fn parse_merge_when_clause(input: &str) -> IResult<&str, WhenClause> {
         let (input, _) = multispace1(input)?;
         let (input, _) = tag_no_case("SET")(input)?;
         let (input, _) = multispace1(input)?;
-        let (input, assignments) = nom::multi::separated_list1(
+        let (input, groups) = nom::multi::separated_list1(
             nom::sequence::delimited(multispace0, nom_char(','), multispace0),
-            parse_assignment,
+            parse_assignment_group,
         )(input)?;
+        let assignments = groups.into_iter().flatten().collect();
         (input, MergeAction::Update(assignments))
     } else if let Ok((input, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("DELETE")(input) {
         (input, MergeAction::Delete)
